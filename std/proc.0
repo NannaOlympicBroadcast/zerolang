@@ -5,3 +5,13 @@ fn __zero_std_proc_succeeded(status: ProcStatus) -> Bool {
 fn __zero_std_proc_failed(status: ProcStatus) -> Bool {
     return std.proc.exitCode(status) != 0
 }
+
+fn __zero_std_proc_run_ok(command: String) -> Bool {
+    let status: ProcStatus = std.proc.spawnInherit(command)
+    return std.proc.succeeded(status)
+}
+
+fn __zero_std_proc_run_code(command: String) -> i32 {
+    let status: ProcStatus = std.proc.spawnInherit(command)
+    return std.proc.exitCode(status)
+}

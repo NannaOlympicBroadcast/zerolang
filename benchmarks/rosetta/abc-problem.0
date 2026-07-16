@@ -1,24 +1,83 @@
-fn blockFor(c: u8) -> i32 {
-    if c == 66 || c == 79 {
-        return 0
+fn blockMatches(index: usize, c: u8) -> Bool {
+    if index == 0 {
+        return c == 66 || c == 79
     }
-    if c == 88 || c == 75 {
-        return 1
+    if index == 1 {
+        return c == 88 || c == 75
     }
-    if c == 78 || c == 65 {
-        return 2
+    if index == 2 {
+        return c == 68 || c == 81
     }
-    if c == 82 || c == 69 {
-        return 3
+    if index == 3 {
+        return c == 67 || c == 80
+    }
+    if index == 4 {
+        return c == 78 || c == 65
+    }
+    if index == 5 {
+        return c == 71 || c == 84
+    }
+    if index == 6 {
+        return c == 82 || c == 69
+    }
+    if index == 7 {
+        return c == 84 || c == 71
+    }
+    if index == 8 {
+        return c == 81 || c == 68
+    }
+    if index == 9 {
+        return c == 70 || c == 83
+    }
+    if index == 10 {
+        return c == 74 || c == 87
+    }
+    if index == 11 {
+        return c == 72 || c == 85
+    }
+    if index == 12 {
+        return c == 86 || c == 73
+    }
+    if index == 13 {
+        return c == 65 || c == 78
+    }
+    if index == 14 {
+        return c == 79 || c == 66
+    }
+    if index == 15 {
+        return c == 69 || c == 82
+    }
+    if index == 16 {
+        return c == 70 || c == 83
+    }
+    if index == 17 {
+        return c == 76 || c == 89
+    }
+    if index == 18 {
+        return c == 80 || c == 67
+    }
+    if index == 19 {
+        return c == 90 || c == 77
+    }
+    return false
+}
+
+fn chooseBlock(c: u8, used: Span<Bool>) -> i32 {
+    var index: usize = 0
+    while index < 20 {
+        if !used[index] && blockMatches(index, c) {
+            return index as i32
+        }
+        index = index + 1
     }
     return -1
 }
 
 fn canSpell(word: Span<u8>) -> Bool {
-    var used: [4]Bool = [false; 4]
+    var used: [20]Bool = [false; 20]
     var i: usize = 0
     while i < std.mem.len(word) {
-        let block: i32 = blockFor(word[i])
+        let block: i32 = chooseBlock(word[i], used)
         if block < 0 {
             return false
         }
@@ -32,7 +91,7 @@ fn canSpell(word: Span<u8>) -> Bool {
 }
 
 pub fn main(world: World) -> Void raises {
-    if canSpell(std.mem.span("BARK")) && !canSpell(std.mem.span("BOOK")) {
+    if canSpell(std.mem.span("A")) && canSpell(std.mem.span("BARK")) && (!canSpell(std.mem.span("BOOK")) && canSpell(std.mem.span("TREAT"))) && (!canSpell(std.mem.span("COMMON")) && canSpell(std.mem.span("SQUAD")) && canSpell(std.mem.span("CONFUSE"))) {
         check world.out.write("abc blocks ok\n")
     }
 }

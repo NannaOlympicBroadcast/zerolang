@@ -1,4 +1,7 @@
-## Status
+## When To Use std.ascii
+
+In Zerolang, use `std.ascii` when a program needs byte-level ASCII predicates, case
+conversion, or digit values without Unicode normalization.
 
 Runnable today:
 

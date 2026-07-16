@@ -1,4 +1,6 @@
-## Status
+## When To Use std.text
+
+In Zerolang, use `std.text` for ASCII and UTF-8 byte-backed validation.
 
 Runnable today:
 

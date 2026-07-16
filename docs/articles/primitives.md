@@ -1,17 +1,27 @@
+## The Pieces The Graph Stores
+
+Zerolang exposes language pieces as graph facts and as `.0`
+projection syntax. The graph stores the type and layout facts. The projection
+lets humans read them.
+
 ## Scalar Values
 
-| Primitive | Purpose | Current status |
-| --- | --- | --- |
-| `Bool` | Conditions and logical results. Only `Bool` is accepted in `if` and `while` conditions. | Runnable |
-| `i8` `i16` `i32` `i64` | Signed fixed-width integers. | Runnable |
-| `u8` `u16` `u32` `u64` | Unsigned fixed-width integers. | Runnable |
-| `usize` `isize` | Pointer-sized integers. | Runnable |
-| `f32` `f64` | Floating-point values. | Runnable |
-| `char` | Byte-sized character value for ASCII/parser/codec-style work. | Runnable |
-| `String` | Text value used by string literals and current I/O examples. | Runnable |
-| `Void` | Return type for functions that produce no useful value. | Runnable |
+| Type | Purpose |
+| --- | --- |
+| `Bool` | Conditions and logical results. |
+| `i8` `i16` `i32` `i64` | Signed fixed-width integers. |
+| `u8` `u16` `u32` `u64` | Unsigned fixed-width integers. |
+| `usize` `isize` | Pointer-sized integers. |
+| `f32` `f64` | Floating-point values. |
+| `char` | Byte-sized character value for ASCII/parser/codec work. |
+| `String` | Text value used by string literals and current I/O examples. |
+| `Void` | Return type for functions that produce no useful value. |
 
-Integer literals support decimal, hexadecimal, binary, octal, `_` separators, and optional suffixes such as `_u8` or `_usize`.
+Integer literals support decimal, hexadecimal, binary, octal, `_` separators,
+and optional suffixes such as `_u8` or `_usize`. An unsuffixed integer literal
+adopts the type of a typed integer operand in arithmetic and comparisons when
+the value fits, so `index + 1` and `index < 10` work when `index` is `usize`.
+Out-of-range literals are rejected, so `byte > 300` fails for a `u8` operand.
 
 ```zero
 let count: u32 = 0x12c_u32
@@ -19,30 +29,98 @@ let byte: u8 = 255
 let page: usize = 4_096
 ```
 
-Primitive numeric types do not implicitly narrow, widen, or change signedness. Use an explicit cast when the conversion is intentional.
+Primitive numeric types do not implicitly narrow, widen, or change signedness.
+Use an explicit cast when the conversion is intentional.
 
 ```zero
 let count: u32 = 300
 let byte: u8 = count as u8
-let whole: i32 = 7.9 as i32
-let marker: u8 = 'A' as u8
 ```
 
-## Absence And Fallibility
+## Absence
 
-`Maybe<T>` represents an optional value. `null` is accepted only when the expected type is known to be `Maybe<T>`, and `.value` reads require a visible `.has` guard or explicit `check` / `rescue` handling.
+`Maybe<T>` represents an optional value:
 
 ```zero
-let name: Maybe<String> = null
-let fallback: String = name else "world"
+let parsed: Maybe<u32> = std.args.parseU32(1)
+if parsed.has {
+    return parsed.value
+}
+return 0
 ```
 
-Fallible functions are marked with `raises` or `raises [...]`, and `check` propagates the current
-error. Fallibility is part of a function signature rather than a runtime exception
-mechanism.
+`.value` reads require a visible `.has` guard or fallible handling. That rule is
+part of the graph semantics, not a formatter convention.
 
-The native compiler accepts explicit error sets for user-defined fallible
-functions.
+## Fixed Storage And Views
+
+| Type form | Meaning |
+| --- | --- |
+| `[N]T` | Fixed-size array with `N` elements of `T`. |
+| `Span<T>` | Read-only borrowed pointer plus length. |
+| `MutSpan<T>` | Mutable borrowed pointer plus length. |
+| `ref<T>` | Immutable reference. |
+| `mutref<T>` | Mutable reference. |
+
+```zero
+var scratch: [16]u8 = [0_u8; 16]
+let bytes: Span<u8> = std.mem.span("hello")
+let copied: usize = std.mem.copy(scratch, bytes)
+```
+
+These types are central to Zero's size and memory model. Helpers generally
+write into caller-owned storage so allocation behavior remains visible.
+
+Fixed-size locals live in one stack frame per function, and a single function
+may declare at most 131072 bytes of locals. `zero check` reports `MEM003` when
+a frame exceeds that limit; split the buffer into smaller buffers in helper
+functions so each frame stays within the limit, or process the data in
+fixed-size chunks. `PageAlloc` and `GeneralAlloc` handles type-check but do
+not lower to the direct backends yet, so they cannot replace frame-sized
+buffers today.
+
+## Ownership
+
+Owned values use explicit ownership forms:
+
+```zero
+fn drop(self: mutref<Self>) -> Void {
+    return
+}
+```
+
+The canonical non-raising `fn drop(self: mutref<Self>) -> Void` shape lets the
+graph model cleanup without a hidden runtime cleanup registry. Owned resources,
+allocators, and cleanup behavior should be visible through graph inspection.
+
+## User Types
+
+```zero
+type Point {
+    x: i32,
+    y: i32,
+}
+```
+
+Fields, defaults, and constructor-like projections are graph declarations and
+edges. Public type surfaces should stay explicit because agents rely on stable
+field and type facts.
+
+## Enums And Choices
+
+```zero
+enum Status {
+    Pending,
+    Ready,
+}
+```
+
+Enums are named value sets. Choices and payload-bearing cases are represented
+as graph facts so `match` can be checked semantically.
+
+## Fallibility
+
+Fallible functions use `raises`:
 
 ```zero
 fn validate(ok: Bool) -> i32 raises [InvalidInput] {
@@ -51,152 +129,49 @@ fn validate(ok: Bool) -> i32 raises [InvalidInput] {
     }
     return 42
 }
-
-fn run() -> Void raises [InvalidInput] {
-    check validate(true)
-}
 ```
 
-The native compiler lowers `check` on `Maybe<T>` to a direct branch for the
-first recoverable helper slice. A failed `Maybe` check returns the function's
-default failure value without exceptions or unwinding.
+`check` propagates failure explicitly. There is no hidden exception system.
 
-User-defined error flow lowers to small status/result structs only when a
-function actually raises named errors.
+## Compile-Time Values
 
-## Memory And Ownership
+Compile-time facts currently cover bounded integer, `Bool`, and enum static
+values. The metadata surface includes facts such as `compileTime`,
+`target.pointerWidth`, `fieldType`, and `hasEnumCase`.
 
-Zero makes memory layout visible in types. These forms are primitive type constructors because they affect ownership, borrowing, layout, and cleanup.
+Use `zero inspect --json` or `zero check --json` when an agent needs those facts
+for a patch.
 
-| Primitive | Purpose |
-| --- | --- |
-| `[N]T` | Fixed-size array with `N` elements of `T`. |
-| `Span<T>` | Non-owning pointer plus length. |
-| `ref<T>` | Non-owning shared reference. |
-| `mutref<T>` | Non-owning mutable reference. |
-| `owned<T>` | Move-only value that owns cleanup responsibility. |
-| `const T` | Read-only view of `T`. |
+## Projection Examples
 
-`Span<T>` and `MutSpan<T>` do not own their backing storage. Returning a span
-derived from local fixed-array storage is rejected; return an owned value or keep
-the view inside the current function.
+Projection syntax is for humans. The graph stores the same facts directly.
 
-```zero
-type BufferView {
-    bytes: Span<u8>,
-    owner: Maybe<mutref<Alloc>>,
-}
-
-pub fn len(view: BufferView) -> usize {
-    return std.mem.len(view.bytes)
-}
-```
-
-`Alloc` is a capability type used by allocation APIs. Heap allocation should be
-visible in function parameters and documentation; there is no hidden global
-allocator.
-
-Allocator primitives are explicit handles:
-
-| Primitive | Behavior |
-| --- | --- |
-| `NullAlloc` | Always reports allocation failure, useful for proving a path does not allocate. |
-| `FixedBufAlloc` | Allocates from caller-owned mutable bytes and returns borrowed `MutSpan<u8>` views. |
-| `std.mem.arena(buffer)` | Arena-style fixed-buffer allocation over caller storage. |
-| `PageAlloc`, `GeneralAlloc` | Explicit handles, not ambient global heaps. |
-| `std.mem.byteBuf(alloc, len)` | Returns `Maybe<owned<ByteBuf>>` backed by explicit caller storage. |
-
-Borrow expressions create references without allocation or runtime metadata. Use `&value` for `ref<T>` and `&mut value` for `mutref<T>`.
-
-```zero
-fn read_x(point: ref<Point>) -> i32 {
-    return point.x
-}
-
-fn write_x(point: mutref<Point>, value: i32) -> Void {
-    point.x = value
-}
-
-let shared: ref<Point> = &point
-write_x(&mut point, 5)
-```
-
-An `owned<T>` local is automatically cleaned up at lexical scope exit when `T`
-defines the canonical non-raising method
-`fn drop(self: mutref<Self>) -> Void`.
-
-Cleanup is lowered to a direct call and skipped once the owned binding has
-moved.
-
-```zero
-type Temp {
-    bytes: MutSpan<u8>,
-    fn drop(self: mutref<Self>) -> Void {
-        self.bytes[0] = 0
+```json-render
+{
+  "messages": [
+    {
+      "role": "user",
+      "text": "what types does this helper use?"
+    },
+    {
+      "role": "assistant",
+      "text": "I’ll inspect the function facts and summarize the types."
+    },
+    {
+      "role": "tools",
+      "calls": [
+        {
+          "command": "zero query --fn add",
+          "output": "fn add(x: i32, y: i32) -> i32\n  return x + y"
+        }
+      ]
     }
+  ]
 }
 ```
 
-## Layout Primitives
+For manual review, export the projection:
 
-User-defined types are not primitives, but some layout markers are primitive because they define how values cross ABI or binary boundaries.
-
-| Form | Purpose |
-| --- | --- |
-| `type` | Default Zero aggregate layout. Not ABI-stable by default. |
-| `extern type` | C ABI-compatible aggregate layout for the selected target. |
-| `packed type` | Bit-exact layout with declared field widths. |
-| `enum Name : uN` | Enum with an explicit integer backing type. |
-| `choice` | Tagged choice value. Exhaustive matching is required. |
-
-```zero
-extern type CPoint {
-    x: i32,
-    y: i32,
-}
-
-enum Color: u8 {
-    red,
-    green,
-    blue,
-}
+```sh
+zero export
 ```
-
-## Capability Names Are Not Primitives
-
-Names such as `World`, `Fs`, `Net`, `Env`, `Args`, `Clock`, `Rand`, and `Proc`
-are capability surfaces.
-
-They are foundational to Zero's effect model, but they are not primitive values
-in the same sense as `Bool`, `u32`, `Maybe<T>`, or `Span<T>`.
-
-```zero
-pub fn main(world: World) -> Void raises {
-    check world.out.write("hello\n")
-}
-```
-
-## Current Native Status
-
-The native compiler currently supports:
-
-- checked primitive integer widths and exact C integer types
-- explicit casts among primitive integers, floats, and byte `char`
-- memory-oriented generic forms
-- `Maybe<T>` and native layouts for span views
-- source-level `ref<T>` and `mutref<T>` borrows
-- lexical moves for `owned<T>`
-- direct `drop` cleanup calls for live owned locals
-- compiler-known `owned<File>` cleanup
-- allocation through `NullAlloc`, mutable `FixedBufAlloc`, and `ByteBuf`
-
-None of these ownership features add runtime ownership machinery.
-
-Not part of the current native status:
-
-- `f16`
-- Unicode scalar character handling
-- fuller borrow and alias analysis
-- `Arena` and general allocator behavior
-- drop glue for generic containers
-- more exhaustive layout conformance across target ABIs

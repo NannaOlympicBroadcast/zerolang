@@ -5,7 +5,11 @@ use validate
 pub fn main(world: World) -> Void raises [NotFound, TooLarge, Io] {
     let fs: Fs = std.fs.host()
     var path_storage: [64]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    let path: String = check std.path.join(path_storage, ".zero", inputName())
+    let joined: Maybe<String> = std.path.join(path_storage, ".zero", inputName())
+    if !joined.has {
+        raise TooLarge
+    }
+    let path: String = joined.value
     let created: Maybe<owned<File>> = std.fs.create(fs, path)
     if created.has {
         var file: owned<File> = created.value

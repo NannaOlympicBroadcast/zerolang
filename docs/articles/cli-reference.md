@@ -1,284 +1,290 @@
-## CLI Reference
+## Use Commands By Workflow
 
-`zero` checks, formats, runs, tests, builds, inspects, and repairs Zero programs.
+The Zerolang CLI is organized around graph-first agent work. Humans ask for a task;
+agents inspect and patch the graph; projections are exported only for review or
+manual edits.
 
-Most commands accept the same input forms:
-
-| Input | Meaning |
-| --- | --- |
-| `file.0` | Canonical Zero source text. |
-| `project/` | A package directory containing `zero.json`. |
-| `zero.json` | A package manifest. |
-
-## Daily Commands
-
-| Command | Use it for |
-| --- | --- |
-| `zero check <input>` | Parse, typecheck, and report diagnostics. |
-| `zero run <input>` | Build and run a host executable with the selected backend. |
-| `zero test <input>` | Run inline `test` blocks. |
-| `zero fmt <input>` | Print formatted source. Add `--check` in CI. |
-| `zero build <input>` | Emit an executable or object file. |
-| `zero ship <input>` | Produce a release preview with checksums and metadata. |
-| `zero graph <input>` | Inspect modules, symbols, capabilities, helper use, and ProgramGraph facts. |
-| `zero size <input>` | Explain artifact size, retained helpers, and profile budgets. |
-| `zero doc <input>` | Emit public API documentation facts. |
-| `zero fix --plan --json <input>` | Ask for a typed repair plan. |
-| `zero doctor` | Check host and target readiness. |
-
-Copyable examples:
+Most commands default to the current directory:
 
 ```sh
-zero check examples/hello.0
-zero run examples/add.0
-zero test conformance/native/pass/test-blocks.0
-zero build --emit exe --target linux-musl-x64 examples/add.0 --out .zero/out/add
-zero graph --json examples/systems-package
-zero graph dump examples/hello.0
-zero graph dump --out .zero/out/hello.program-graph examples/hello.0
-zero graph import --out .zero/out/hello.program-graph examples/hello.0
-zero graph inspect --json examples/hello.0
-zero graph validate .zero/out/hello.program-graph
-zero graph view examples/hello.0
-zero graph view --out .zero/out/hello.view.0 .zero/out/hello.program-graph
-zero graph source-map --json examples/hello.0
-zero graph reconcile --json .zero/out/hello.program-graph --source examples/hello.0
-zero graph check --json .zero/out/hello.program-graph
-zero graph size --json .zero/out/hello.program-graph
-zero graph build --json --emit obj --target linux-musl-x64 --out .zero/out/hello.o .zero/out/hello.program-graph
-zero graph run .zero/out/hello.program-graph
-zero graph test --json .zero/out/hello.program-graph
-zero graph patch examples/hello.0 --expect-graph-hash graph:a7f7e6899a73f3b4 --op 'set node="#expr_653eeb6e" field="value" expect="hello from zero\n" value="hello patched\n"'
-zero graph roundtrip examples/hello.0
-zero graph roundtrip .zero/out/hello.program-graph
-zero size --json examples/point.0
-zero ship --json --target linux-musl-x64 examples/hello.0 --out .zero/ship/hello
-zero doctor --json
+zero status
+zero query
+zero patch --op help
+zero check
+zero run -- <args>
 ```
 
-## Run
-
-`zero run` builds a host executable, runs it, passes through program
-stdout/stderr, and exits with the program status. Direct output is the default;
-pass `--backend llvm` for explicit LLVM host execution when `clang` is ready.
-
-Pass program arguments after `--`:
+Pass an explicit graph input or package when you are outside the project:
 
 ```sh
-zero run examples/cli-file.0 -- input.txt
-zero graph run .zero/out/cli-file.program-graph -- input.txt
+zero check examples/hello.graph
+zero query examples/crm-api
+zero run examples/json-api-router.graph -- $'GET /health\n\n'
 ```
 
-## JSON Output
+## Create A Project
 
-Normal command output is designed to be readable by agents. Use `--json` when
-another tool needs stable fields.
-
-| Command | Useful JSON fields |
-| --- | --- |
-| `zero check --json` | Diagnostics with code, span, expected/actual details, help, repair metadata, `graph` identity for canonical source, `targetReadiness`, and `safetyFacts` for the selected target/emit kind. |
-| `zero graph --json` | Modules, public symbols, capabilities, static facts, safety facts, helper use, and nested `programGraph`. |
-| `zero graph dump --json` | The bare deterministic ProgramGraph with `moduleIdentity`, `graphHash`, validation, counts, nodes, and edges. Use `--out <program-graph-artifact>` to also write a derived graph artifact. |
-| `zero graph import --json` | Source-to-ProgramGraph import with graph identity and validation. With `--out <program-graph-artifact>`, writes a derived graph artifact and reports `saved.path`. |
-| `zero graph validate --json` | A derived ProgramGraph artifact readback check with `moduleIdentity`, `graphHash`, counts, validation state, and optional normalized artifact output path. |
-| `zero graph view --json` | Canonical source text rendered from source or a ProgramGraph artifact with `moduleIdentity`, `graphHash`, and optional output path. |
-| `zero graph source-map --json` | Graph node IDs mapped to source ranges with node hashes, symbol/type/effect IDs, and file hash facts. |
-| `zero graph reconcile --json` | Identity decisions when edited source is compared with a prior graph, including ambiguous-match diagnostics and simple graph patch text when available. |
-| `zero graph check --json` | Typecheck source or a ProgramGraph artifact through direct graph lowering with graph identity, target, `check.lowering: "direct-program-graph"`, target readiness, safety facts, and graph-mapped diagnostics. |
-| `zero graph size --json` | Size, helper, runtime, profile, safety, and backend facts for a ProgramGraph artifact lowered through typed graph MIR, with graph identity. |
-| `zero graph build --json` | Build a ProgramGraph artifact through typed graph MIR when supported, including graph identity, selected `emit` kind, target, artifact path and size, safety facts, compiler cache facts, and graph-aware incremental invalidation. |
-| `zero graph patch --json` | Checked graph edits with graph-hash preconditions, per-operation node/field results, the changed graph hash, and the saved source or artifact path. |
-| `zero graph roundtrip --json` | Source or ProgramGraph artifact stability through direct graph lowering with `semanticStable`, lowering mode, original and roundtripped graph hashes, raw counts, normalized semantic counts, and optional ProgramGraph output. |
-| `zero dev --json` | A watch plan for changed source, manifest, package-lock, and generated-binding inputs. |
-| `zero dev --json --trace` | Adds phase timing, cache hit/miss facts, diagnostics passthrough, and `interfaceFingerprints`. |
-| `zero time --json` | Compiler phase timing plus `interfaceFingerprints` and incremental invalidation facts. |
-| `zero build --json` | Artifact path, size, selected `toolchain`, target triple, linker flavor, sysroot status, `graph` identity, `safetyFacts`, and runtime provider facts when a helper such as hosted HTTP is linked. |
-| `zero size --json` | `graph` identity, `profileSemantics`, `profileCatalog`, `profileBudget`, `safetyFacts`, `backendProfile`, `backendComparison`, `sizeBreakdown`, `retentionReasons`, and `optimizationHints`. |
-| `zero ship --json` | A release preview with artifact names, hashes, graph identity, safety facts, a checksum file, debug-symbol metadata, size report, and SBOM placeholder. |
-| `zero test --json` | Graph identity for canonical source, test discovery mode, selected fixtures, result counts, output, and per-test locations/failures. |
-| `zero doctor --json` | Host checks plus `targetToolchains`, the per-target readiness matrix. |
-
-Canonical `.0` source JSON for `zero check`, `zero build`, `zero size`,
-`zero ship`, `zero mem`, and `zero test` reports a top-level `graph` object
-with `artifact`, `canonicalSource`, `moduleIdentity`, `graphHash`, and
-`lowering`. Their compiler cache and incremental invalidation facts use
-`sourceKind: "program-graph"` and include the graph input that keyed the
-compile. Planning and introspection commands such as `zero dev`, `zero time`,
-`zero doc`, and `zero abi` continue to report canonical source cache facts.
-Derived ProgramGraph artifact commands report the same identity fields for the
-artifact being inspected or built.
-
-`zero check --json` and `zero graph --json` also include `compileTime`.
-That object records bounded `meta` evaluation, sandbox denials, cache key
-inputs, typed reflection facts, and integer/Bool/enum static values.
-
-`zero check --json --target <target> --emit <kind>` keeps language validity
-separate from target buildability. Top-level `ok` and `diagnostics` describe
-parse/typecheck results; `targetReadiness.ok`, `buildable`, and nested
-diagnostics describe predictable backend blockers without writing artifacts.
-
-Build and ship JSON include `releaseTargetContract`. It records artifact kind,
-object format, direct linker flavor, target libc mode, sysroot requirements,
-emitter readiness, target capability facts, and the repeat-build hash policy.
-Host builds that retain runtime-backed helpers can also include `objectBackend`
-linking facts such as retained runtime objects, provider libraries, and
-`httpRuntime` TLS/provider metadata.
-`zero ship --json` nests the same contract under
-`releasePreview.targetContract`.
-
-`.0` files are source text. ProgramGraph commands that write graph artifacts
-must use a non-source output path, such as `.zero/out/app.program-graph`.
-Agents can inspect source through ProgramGraph commands and can patch canonical
-`.0` source through `zero graph patch`. ProgramGraph artifacts remain optional
-debug and interchange files.
-
-## ProgramGraph Patches
-
-`zero graph patch` applies checked edits to a graph. When the input is
-canonical `.0` source without comments, the command rewrites that source after
-lowering, formatting, re-parsing, and semantic graph comparison succeeds. For
-small edits, pass one or more operations inline:
+Use `zero init` for all project creation.
 
 ```sh
-zero graph patch \
-  examples/hello.0 \
-  --expect-graph-hash graph:a7f7e6899a73f3b4 \
-  --op 'set node="#expr_653eeb6e" field="value" expect="hello from zero\n" value="hello patched\n"'
+zero init
+zero init --template cli crm-tool
+zero init --manifest toml --format binary --template package api-server
 ```
 
-For larger edits, patch files are line-oriented text:
+If no path is given, `zero init` creates the package in the current directory.
+For `.` or an omitted path, the package name comes from the directory name.
+
+```json-render
+{
+  "messages": [
+    {
+      "role": "user",
+      "text": "start a cli here"
+    },
+    {
+      "role": "assistant",
+      "text": "I’ll initialize this directory and add the starting CLI shape."
+    },
+    {
+      "role": "tools",
+      "calls": [
+        {
+          "command": "zero init --template cli",
+          "output": "graph project init ok\nwrote: ./zero.toml\nwrote: ./zero.graph"
+        },
+        {
+          "command": "zero patch --op 'addMain'",
+          "output": "program graph patch ok"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Inspect Before Editing
+
+Agents should query for the exact thing they need instead of dumping the whole
+program.
+
+```sh
+zero status
+zero query --fn main
+zero query --find customer
+zero query --refs handle
+zero query --calls write
+zero inspect --json
+zero size --json
+zero mem --json
+```
+
+Use plain text first. Use `--json` when a tool needs exact fields such as node
+ids, graph hashes, `interfaceFingerprints`, `targetToolchains`,
+`usedStdlibHelpers`, `memoryBudgets`, or `releaseTargetContract`.
+
+## Patch The Graph
+
+Patch commands are checked graph edits:
+
+```sh
+zero patch --op 'addFunction name="add" ret="i32"'
+zero patch --op 'addParam fn="add" name="x" type="i32"'
+zero patch --op 'addParam fn="add" name="y" type="i32"'
+zero patch --op 'addReturnBinary fn="add" name="+" left="x" right="y" type="i32"'
+```
+
+For larger edits, use a patch file under `/tmp`:
 
 ```text
 zero-program-graph-patch v1
 expect graphHash "graph:a7f7e6899a73f3b4"
-set node="#expr_653eeb6e" field="value" expect="hello from zero\n" value="hello patched\n"
-insert node="#patch001" kind="Literal" parent="#expr_c403020c" edge="arg" order="1" type="String" value="again\n"
-rename node="#decl_ad8d9028" expect="main" value="start"
-delete node="#patch001"
+replaceFunctionBody main
+  check world.out.write "hello\n"
+end
 ```
 
-Use `--patch-text <text>` when a tool already has a complete patch document in
-memory and should not create a temporary file.
+Dry-run a repository graph patch without writing:
 
-The header is required. `expect graphHash` is optional but recommended; it
-rejects edits against a different artifact. `set` requires `node`, `field`, and
-`value`; `expect` is optional and rejects the operation when the current field
-value differs.
+```sh
+zero patch --check-only /tmp/main.patch
+zero patch --dry-run --json /tmp/main.patch
+```
 
-Supported operations are `set`, `insert`, `insertEdge`, `replace`, `delete`,
-and `rename`. `insert` creates a node and connects it to a parent node with an
-ordered node edge. `insertEdge` connects existing graph facts across `node`,
-`symbol`, `type`, or `effect` target domains. `replace` updates a node in
-place and can require the current node hash through `expect`. `delete` removes
-an owned subtree and rejects external references into that subtree. `rename`
-updates a node name with an optional current-name precondition.
+Apply it:
 
-Editable scalar fields are `name`, `type`, `value`, `public`, `mutable`,
-`static`, `fallible`, and `exportC`. Boolean fields accept only `true` or
-`false`. `name` values must be identifier paths or supported operator tokens.
-`type` values must be valid Zero type syntax. Strings support `\\`, `\"`,
-`\n`, `\r`, `\t`, and `\u00XX` escapes for non-NUL bytes. NUL bytes are not
-valid ProgramGraph patch text.
+```sh
+zero patch /tmp/main.patch
+```
 
-## Build Outputs
+To replace one function body without patch syntax, pass only the new body rows
+(exactly what `zero view --fn <name>` prints between the signature braces).
+`--body-file -` reads them from stdin, so a heredoc does the whole edit in one
+call:
 
-| Emit mode | Command |
+```sh
+zero patch --replace-fn main --body-file - <<'EOF'
+  check world.out.write("hello agent\n")
+EOF
+```
+
+A file path works as the alternative:
+
+```sh
+zero patch --replace-fn main --body-file /tmp/main.body
+```
+
+To change a few characters inside a function without retyping the body,
+`--replace-in-fn` replaces one unique literal occurrence of `--old` in the
+function's canonical body text (what `zero view --fn <name>` prints) with
+`--new`, then revalidates exactly like `--replace-fn`:
+
+```sh
+zero patch --replace-in-fn main --old 'limit + 1' --new 'limit + 2'
+```
+
+A missing or non-unique `--old` fails with the occurrence count. Inline
+`--old`/`--new` accept `\n` escapes for multi-line text; `--old-file` and
+`--new-file <file|->` read the text from a file or stdin.
+
+The patch step validates graph shape and repository metadata. A stale graph
+hash, missing required edge, sparse ordered child group, or invalid row body
+fails before the package store is updated.
+
+## Validate Only What You Need
+
+Do not run every command after every patch. `zero patch` already reports whether
+the edit applied. Run the next command that proves the user-visible behavior.
+
+```sh
+zero check
+zero test
+zero test --json --filter add
+zero run -- add 40 2
+```
+
+Use `zero check --json` when an editor, CI job, or agent needs stable
+diagnostic fields. Test JSON includes `expectedFailures`, `fixtures`,
+`snapshotKey`, and per-test results.
+
+## Run And Build
+
+Use `zero run` for local behavior:
+
+```sh
+zero run -- help
+zero run examples/hello.graph
+```
+
+Use `zero build` for artifacts:
+
+```sh
+zero build --emit exe --target linux-musl-x64 --out .zero/out/app
+zero build --emit obj --target darwin-arm64 examples/direct-call-add.graph --out .zero/out/add.o
+zero build --emit llvm-ir examples/hello.graph --out .zero/out/hello.ll
+```
+
+Build JSON reports profile and target readiness:
+
+```sh
+zero build --json --profile tiny --target linux-musl-x64 examples/hello.graph --out .zero/out/hello
+```
+
+Important fields include `profileSemantics`, `profileBudget`,
+`releaseTargetContract`, `targetToolchains`, `compileTime`, and repeat-build
+hash policy data for artifact determinism.
+
+## Review Projections
+
+Projection commands are for humans:
+
+```sh
+zero export
+zero verify-projection
+zero import
+zero diff
+zero view
+```
+
+Use `zero export` when a human wants the current `.0` projection. Use
+`zero import` after a human intentionally edits projection text. Use
+`zero verify-projection` to catch drift without writing.
+
+```json-render
+{
+  "messages": [
+    {
+      "role": "user",
+      "text": "show me the projection before we keep going"
+    },
+    {
+      "role": "assistant",
+      "text": "I’ll export the current projection and verify it matches the graph."
+    },
+    {
+      "role": "tools",
+      "calls": [
+        {
+          "command": "zero export",
+          "output": "repository graph export ok\nwrote: ./src/main.0"
+        },
+        {
+          "command": "zero verify-projection",
+          "output": "repository graph verify-projection ok"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Diagnose And Repair
+
+```sh
+zero explain NAM003
+zero fix --plan --json
+zero doctor
+zero dev --json
+zero dev --json --trace
+```
+
+`zero dev --json` is the editor-facing snapshot. It includes diagnostics,
+document symbols, hover data, completions, definition targets, and
+`interfaceFingerprints`.
+
+## Command Groups
+
+| Workflow | Commands |
 | --- | --- |
-| Native executable | `zero build --emit exe --target linux-musl-x64 <input>` |
-| Native object | `zero build --emit obj --target linux-musl-x64 <input>` |
-| LLVM IR | `zero build --emit llvm-ir --backend llvm --target linux-musl-x64 <input>` |
-| LLVM host executable | `zero build --backend llvm --emit exe --target host <input>` |
+| create | `init` |
+| inspect | `status`, `query`, `inspect`, `size`, `mem`, `doc`, `source-map` |
+| edit graph | `patch`, `reconcile`, `merge` |
+| validate | `check`, `test`, `verify-projection`, `validate`, `roundtrip` |
+| run/build | `run`, `build`, `targets`, `abi` |
+| projection review | `export`, `import`, `view`, `diff`, `fmt`, `tokens`, `parse` |
+| support | `skills`, `explain`, `fix`, `doctor`, `clean`, `dev`, `time` |
 
-Removed backend flags report `BLD003`. Use direct emitters; the removed C
-backend is not a compatibility path.
+## Input Forms
 
-`direct` is the default backend family. `llvm` is an explicit experimental
-backend family. It is not default eligible, release eligible, or accepted by
-`zero ship`; direct emitters remain the supported release path. Use
-`--backend llvm --emit llvm-ir` to write a `.ll` artifact. On a supported host
-with `clang`, `zero build --backend llvm --emit exe` and
-`zero run --backend llvm` compile that IR into a native executable through an
-external LLVM toolchain plan. LLVM lowering currently supports scalar code,
-direct calls, branches, loops, primitive fixed arrays, byte views, readonly
-strings, and primitive `std.mem` helpers. Native LLVM object output,
-unsupported targets, unsupported MIR constructs, and `zero ship --backend llvm`
-report `BLD004` with `backendBlocker.backend: "llvm"` and do not fall back to
-direct emitters. If the LLVM artifact references Zero runtime helpers, the JSON
-build report lists the required runtime object in `objectBackend`.
-`zero size --json --backend llvm` reports LLVM size/profile metadata, including
-target triple, optimization level, retained runtime/helper facts, toolchain
-readiness, and direct-vs-LLVM comparison rows without writing a native artifact.
+| Input | Meaning |
+| --- | --- |
+| `project/` | A package directory. Normal package commands compile from `zero.graph`. |
+| `zero.toml` | Preferred package manifest. Takes precedence over `zero.json` for directory inputs. |
+| `zero.json` | Compatibility manifest. Prefer `zero.toml` for new packages. |
+| `file.graph` | Binary or text graph store/artifact. |
+| `file.0` | Human-readable projection for formatting, import/export, and review workflows. It is not the normal compiler input. |
 
-## Tests
+## JSON Rule
 
-`zero test --json` is shaped for CI and editors. It reports:
-
-- discovery: `testDiscovery`, `fixtures`, `snapshotKey`
-- counts: `discoveredTests`, `selectedTests`, `passedTests`, `failedTests`
-- expected failures: `expectedFailures`, `unexpectedPasses`
-- execution: `targetFacts`, `results`, `durationMs`, `stdout`, `stderr`
-
-Expected-fail tests use `xfail:`, `expected fail:`, or `[xfail]` in the test
-name. A test marked this way must fail; an unexpected pass fails the command.
-
-## Skills
-
-`zero skills` serves bundled skill content for agents:
+Humans and interactive agents should start with concise text output. Use JSON
+when a program needs exact structured data:
 
 ```sh
-zero skills list
-zero skills get zero
-zero skills get language
-zero skills get zero --full
+zero check --json
+zero test --json
+zero inspect --json
+zero size --json
+zero doctor --json
 ```
 
-Add `--json` for automation. Skill content is bundled with the compiler so
-agents can load the workflow that matches the Zero binary they are using.
-
-## Language Server Smoke
-
-Run the editor smoke path with:
-
-```sh
-pnpm run zls -- --self-test
-```
-
-The smoke covers diagnostics, hover docs, completions, go-to definition,
-document symbols, and quick-fix code actions surfaced from `zero fix` for
-`TAR002`, `TYP009`, `ERR002`, `ERR003`, and `PUB001`.
-
-## Utility Commands
-
-```sh
-zero --version [--json]
-zero new cli|lib|package <path>
-zero doctor [--json]
-zero check [--json] [--target <target>] [--emit exe|obj|llvm-ir] [--backend direct|llvm|<direct-emitter>] <input>
-zero dev [--json] [--trace] [--target <target>] <input>
-zero run [--backend direct|llvm|<direct-emitter>] [--target <target>] [--profile dev|release] [--out <file>] <input> [-- args...]
-zero build [--emit exe|obj|llvm-ir] [--backend direct|llvm|<direct-emitter>] [--target <target>] [--profile dev|release] [--out <file>] <input>
-zero ship [--json] [--target <target>] [--profile release-small|tiny|audit] [--out <file>] <input>
-zero test [--json] [--filter <name>] [--target <target>] [--cc <path>] [--out <file>] <input>
-zero fmt [--check] <input>
-zero graph [dump|import|inspect|validate|view|source-map|reconcile|check|size|build|run|test|patch|roundtrip] [--json] [--target <target>] <input> [patch]
-zero graph [dump|import|validate|roundtrip] [--json] --out <program-graph-artifact> <input>
-zero graph view [--json] [--out <file.0>] <program-graph-or-source>
-zero graph source-map --json <program-graph-or-source>
-zero graph reconcile [--json] <base-program-graph-or-source> --source <edited-file.0|project|zero.json>
-zero graph size [--json] [--target <target>] --out <artifact> <program-graph-or-package>
-zero graph patch [--json] [--out <program-graph-artifact>] <program-graph-or-source> (<patch-file>|--op <operation>)
-zero graph build [--json] [--emit exe|obj|llvm-ir] [--backend direct|llvm|<direct-emitter>] [--target <target>] [--profile debug|dev|release-fast|release-small|tiny|audit] [--release <profile>] [--out <file>] <program-graph-or-package>
-zero graph run [--target <host-target>] [--profile debug|dev|release-fast|release-small|tiny|audit] [--release <profile>] [--out <file>] <program-graph-or-package> [-- args...]
-zero graph test [--json] [--filter <name>] [--target <target>] <program-graph-or-package>
-zero doc [--json] [--target <target>] <input>
-zero size [--json] [--backend direct|llvm|<direct-emitter>] [--target <target>] [--out <artifact>] <input>
-zero explain [--json] <diagnostic-code>
-zero fix --plan --json [--target <target>] <input>
-zero targets
-zero clean [--all]
-zero mem [--json] [--target <target>] <input>
-zero time --json [--target <target>] <input>
-zero abi check|dump [--json] [--target <target>] <input>
-zero tokens --json <input>
-zero parse --json <input>
-```
+JSON is a contract for tools, not the default reading experience for humans.

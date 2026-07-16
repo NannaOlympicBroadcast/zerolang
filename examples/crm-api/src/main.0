@@ -1,0 +1,16 @@
+use router
+
+pub fn main(world: World) -> Void raises {
+    let maybe_request: Maybe<String> = std.args.get(1)
+    if !maybe_request.has {
+        check world.err.write("usage: pass one HTTP request envelope\n")
+        return
+    }
+    var response: [1024]u8 = [0_u8; 1024]
+    let output: Maybe<Span<u8>> = handleCrm(std.mem.span(maybe_request.value), response)
+    if output.has {
+        check world.out.write(output.value)
+        return
+    }
+    check world.err.write("crm api router failed\n")
+}

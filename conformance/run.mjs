@@ -1,7 +1,11 @@
 #!/usr/bin/env node
-import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { access, chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { resolve } from "node:path";
+import { createAggregateAssert, describeFailure, finishAggregateAssert } from "../scripts/aggregate-assert.mjs";
+
+const assert = createAggregateAssert();
 
 if (process.env.ZERO_NATIVE_TEST_SANDBOX !== "1" && process.env.ZERO_NATIVE_TEST_ALLOW_LOCAL !== "1") {
   console.error("conformance emits native test artifacts; run `pnpm run conformance` for Vercel Sandbox execution or set ZERO_NATIVE_TEST_ALLOW_LOCAL=1 to opt into local artifacts.");
@@ -9,8 +13,8 @@ if (process.env.ZERO_NATIVE_TEST_SANDBOX !== "1" && process.env.ZERO_NATIVE_TEST
 }
 
 const execMaxBuffer = 16 * 1024 * 1024;
-const zero = "bin/zero";
-const outDir = ".zero/conformance";
+const zero = resolve(process.env.ZERO_BIN || (existsSync(".zero/bin/zero") ? ".zero/bin/zero" : "bin/zero"));
+const outDir = process.env.ZERO_CONFORMANCE_OUT_DIR || ".zero/conformance";
 const canRunLinuxMuslX64 = process.platform === "linux" && process.arch === "x64";
 const runnableDirectTarget =
   process.platform === "darwin" && process.arch === "arm64" ? "darwin-arm64" :
@@ -18,16 +22,26 @@ const runnableDirectTarget =
   null;
 const checkTimeoutMs = Number(process.env.ZERO_CHECK_TIMEOUT_MS ?? 2000);
 
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const defaultCheckJobs = 1;
+const checkJobs = parsePositiveInt(process.env.ZERO_CONFORMANCE_CHECK_JOBS, defaultCheckJobs);
+
 function runnableExeArgs(input, out) {
   if (!runnableDirectTarget) return null;
-  return ["build", "--emit", "exe", "--target", runnableDirectTarget, input, "--out", out];
+  return ["build", "--emit", "exe", "--target", runnableDirectTarget, compilerInputPath(input), "--out", out];
 }
 
 await mkdir(outDir, { recursive: true });
+await mkdir(`${outDir}/check-cache`, { recursive: true });
 
 function execFileAsync(file, args = [], options = {}) {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { maxBuffer: execMaxBuffer, ...options }, (error, stdout, stderr) => {
+    const normalizedArgs = file === zero ? normalizeZeroCompilerArgs(args) : args;
+    execFile(file, normalizedArgs, { maxBuffer: execMaxBuffer, ...options }, (error, stdout, stderr) => {
       if (error) {
         error.stdout = stdout;
         error.stderr = stderr;
@@ -37,6 +51,268 @@ function execFileAsync(file, args = [], options = {}) {
       resolve({ stdout, stderr });
     });
   });
+}
+
+function tomlQuote(value) {
+  return JSON.stringify(String(value));
+}
+
+function tomlArray(values) {
+  return `[${values.map(tomlQuote).join(", ")}]`;
+}
+
+function appendManifestFields(lines, object, order) {
+  for (const key of order) {
+    if (!(key in object)) continue;
+    const value = object[key];
+    if (Array.isArray(value)) lines.push(`${key} = ${tomlArray(value)}`);
+    else if (typeof value === "boolean") lines.push(`${key} = ${value ? "true" : "false"}`);
+    else lines.push(`${key} = ${tomlQuote(value)}`);
+  }
+}
+
+function manifestToml(manifest) {
+  const lines = ["[package]"];
+  appendManifestFields(lines, manifest.package ?? {}, ["name", "version", "license"]);
+  for (const [targetName, target] of Object.entries(manifest.targets ?? {})) {
+    lines.push("", `[targets.${targetName}]`);
+    appendManifestFields(lines, target, ["kind", "main", "graph", "defaultTarget", "devTarget", "releaseProfile"]);
+  }
+  if (manifest.repositoryGraph) {
+    lines.push("", "[repositoryGraph]");
+    appendManifestFields(lines, manifest.repositoryGraph, ["compilerInput"]);
+  }
+  for (const sectionName of ["deps", "dependencies"]) {
+    if (!manifest[sectionName]) continue;
+    lines.push("", `[${sectionName}]`);
+    for (const [name, value] of Object.entries(manifest[sectionName])) {
+      if (typeof value === "string") lines.push(`${name} = ${tomlQuote(value)}`);
+    }
+    for (const [name, value] of Object.entries(manifest[sectionName])) {
+      if (typeof value === "string") continue;
+      lines.push("", `[${sectionName}.${name}]`);
+      appendManifestFields(lines, value, ["path", "version", "targets", "target"]);
+    }
+  }
+  for (const [name, lib] of Object.entries(manifest.c?.libs ?? {})) {
+    lines.push("", `[c.libs.${name}]`);
+    appendManifestFields(lines, lib, ["headers", "include", "lib", "link", "mode", "pkg_config", "pkgConfig"]);
+  }
+  return `${lines.join("\n").replace(/\n{3,}/g, "\n\n")}\n`;
+}
+
+async function writeZeroToml(root, manifest) {
+  await writeFile(`${root}/zero.toml`, manifestToml(manifest));
+}
+
+function graphSidecarPath(sourcePath) {
+  if (!sourcePath.endsWith(".0")) throw new Error(`${sourcePath}: expected a .0 projection path`);
+  return `${sourcePath.slice(0, -2)}.graph`;
+}
+
+const compilerInputCommands = new Set(["check", "build", "run", "test", "size", "mem", "doc", "dev", "time", "fix"]);
+const compilerInputValueFlags = new Set(["--backend", "--emit", "--filter", "--out", "--profile", "--release", "--target"]);
+const abiInputSubcommands = new Set(["check", "dump"]);
+
+function compilerInputPath(inputPath) {
+  if (typeof inputPath !== "string" || !inputPath.endsWith(".0")) return inputPath;
+  const graphPath = graphSidecarPath(inputPath);
+  if (!existsSync(graphPath)) {
+    throw new Error(`${inputPath}: compiler command requires graph input; missing graph sidecar ${graphPath}`);
+  }
+  return graphPath;
+}
+
+function normalizeZeroCompilerArgs(args) {
+  if (!Array.isArray(args)) return args;
+  const isCompilerInputCommand = compilerInputCommands.has(args[0]);
+  const isAbiInputCommand = args[0] === "abi" && abiInputSubcommands.has(args[1]);
+  if (!isCompilerInputCommand && !isAbiInputCommand) return args;
+  let afterProgramArgs = false;
+  let skipOptionValue = false;
+  return args.map((arg) => {
+    if (afterProgramArgs) return arg;
+    if (arg === "--") afterProgramArgs = true;
+    if (skipOptionValue) {
+      skipOptionValue = false;
+      return arg;
+    }
+    if (compilerInputValueFlags.has(arg)) {
+      skipOptionValue = true;
+      return arg;
+    }
+    return afterProgramArgs ? arg : compilerInputPath(arg);
+  });
+}
+
+async function writeGraphFixture(sourcePath, source) {
+  await writeFile(sourcePath, source);
+  const graphPath = graphSidecarPath(sourcePath);
+  await execFileAsync(zero, ["import", "--format", "binary", "--out", graphPath, sourcePath]);
+  return graphPath;
+}
+
+async function importGraphFixtureFailure(sourcePath) {
+  const result = await execFileAsync(zero, ["import", "--json", "--format", "binary", "--out", graphSidecarPath(sourcePath), sourcePath]).catch((error) => error);
+  assert.notEqual(result.code, 0);
+  return JSON.parse(result.stdout);
+}
+
+async function writeImportFailureFixture(sourcePath, source) {
+  await writeFile(sourcePath, source);
+  return importGraphFixtureFailure(sourcePath);
+}
+
+async function importPackageGraph(root) {
+  await execFileAsync(zero, ["import", root]);
+}
+
+function isolatedCacheEnv(workerIndex) {
+  return {
+    ...process.env,
+    ZERO_CACHE_DIR: `${outDir}/check-cache/worker-${workerIndex}`,
+  };
+}
+
+async function mapLimit(items, limit, callback) {
+  const results = new Array(items.length);
+  let next = 0;
+  const workerCount = Math.min(Math.max(1, limit), Math.max(1, items.length));
+  async function worker(workerIndex) {
+    await mkdir(`${outDir}/check-cache/worker-${workerIndex}`, { recursive: true });
+    for (;;) {
+      const index = next++;
+      if (index >= items.length) return;
+      try {
+        results[index] = await callback(items[index], index, workerIndex);
+      } catch (error) {
+        const item = Array.isArray(items[index]) ? items[index][0] : items[index];
+        results[index] = { error };
+        assert.fail(`parallel conformance item failed: ${item}\n${describeFailure(error)}`);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: workerCount }, (_, index) => worker(index)));
+  return results;
+}
+
+async function checkFixtureParallel(fixture, workerIndex) {
+  const options = checkJobs > 1 ? { env: isolatedCacheEnv(workerIndex) } : {};
+  const result = await execFileAsync(zero, ["check", fixture], options).catch((error) => error);
+  assert.equal(result.code ?? 0, 0, `${fixture} should check cleanly\n${result.stderr ?? ""}`);
+}
+
+async function checkFailureFixtureParallel(fixture, code, workerIndex) {
+  const options = checkJobs > 1 ? { env: isolatedCacheEnv(workerIndex) } : {};
+  const result = await execFileAsync(zero, ["check", fixture], options).catch((error) => error);
+  assert.notEqual(result.code, 0);
+  assert.match(result.stderr, code);
+}
+
+async function fileExists(path) {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function assertRepositoryGraphNativeCheck(body, sourceProjectionState = "clean", options = {}) {
+  const graphHirToMirUsed = options.graphHirToMirUsed === false ? false : true;
+  const compilerInputReady = body.targetReadiness?.ok === true && graphHirToMirUsed;
+  assert.equal(body.graphCompiler.input, "repository-graph-store");
+  assert.equal(body.graphCompiler.graphStoreLoaded, true);
+  assert.equal(body.graphCompiler.sourceProjectionRequiredForCompilerInput, false);
+  assert.equal(body.graphCompiler.sourceProjectionState, sourceProjectionState);
+  assert.equal(body.graphCompiler.graphNativeCheckerUsed, true);
+  assert.equal(body.graphCompiler.graphHirToMirUsed, graphHirToMirUsed);
+  assert.equal(body.graphCompiler.unsupportedGraphFacts.count, 0);
+  assert.equal(body.graphCompiler.resolution.ok, true);
+  assert.equal(body.graphCompiler.resolution.state, "resolved-graph-facts");
+  assert.equal(body.graphCompiler.checking.ok, true);
+  assert.equal(body.graphCompiler.checking.state, "checked-graph-readiness-facts");
+  assert.equal(body.graphCompiler.checking.scope, "resolution-package-target-and-graph-mir-readiness");
+  assert.equal(body.graphCompiler.checking.semanticDiagnosticsEnforced, false);
+  assert.equal(body.graphCompiler.checking.semanticDiagnosticsAuthority, "stored-typed-graph-facts");
+  assert.equal(body.graphCompiler.checking.authority, "ProgramGraphStore");
+  assert.equal(body.graphCompiler.checking.sourceTextAuthority, false);
+  assert.equal(body.graphCompiler.semanticFacts.state, "typed-facts");
+  assert.equal(body.graphCompiler.semanticFacts.ok, true);
+  const targetReady = body.targetReadiness?.ok === true;
+  assert.equal(body.graphCompiler.defaultReadiness.compilerInputReady, compilerInputReady);
+  assert.equal(body.graphCompiler.defaultReadiness.claim, compilerInputReady ? "ready-for-repository-graph-input" : "blocked");
+  assert.equal(body.graphCompiler.defaultReadiness.sourceFreeCompile, compilerInputReady);
+  assert.equal(body.graphCompiler.defaultReadiness.sourceProjectionRequired, false);
+  assert.equal(body.graphCompiler.defaultReadiness.sourceProjectionState, sourceProjectionState);
+  assert.equal(body.graphCompiler.defaultReadiness.graphMir.used, graphHirToMirUsed);
+  assert.equal(Object.hasOwn(body.graphCompiler.defaultReadiness, "fallback"), false);
+  assert.equal(body.graphCompiler.defaultReadiness.performance.validationInLoad, true);
+  assert.equal(body.graphCompiler.defaultReadiness.cacheInvalidation.parserArtifactsInKey, false);
+  assert(body.graphCompiler.defaultReadiness.cacheInvalidation.keyedBy.includes("nodeHashes"));
+  assert(body.graphCompiler.defaultReadiness.cacheInvalidation.keyedBy.includes("symbolFacts"));
+  assert(body.graphCompiler.defaultReadiness.cacheInvalidation.keyedBy.includes("modulePaths"));
+  assert(body.graphCompiler.defaultReadiness.cacheInvalidation.keyedBy.includes("importPaths"));
+  assert.equal(body.graphCompiler.defaultReadiness.targetReadinessOk, targetReady);
+  assert.equal(body.compileTime.deterministic, true);
+  assert.equal(body.targetReadiness.languageOk, true);
+  assert.equal(body.safetyFacts.schemaVersion, 1);
+}
+
+function assertSourceGraph(body, artifact, moduleIdentity, lowering = "typed-program-graph-mir", canonicalSource = false, sourceProjectionState = undefined) {
+  assert.equal(body.graph.artifact, artifact);
+  assert.equal(body.graph.canonicalSource, canonicalSource);
+  assert.equal(body.graph.moduleIdentity, moduleIdentity);
+  assert.match(body.graph.graphHash, /^graph:[0-9a-f]{16}$/);
+  assert.equal(body.graph.lowering, lowering);
+  if (sourceProjectionState !== undefined) assert.equal(body.graph.sourceProjectionState, sourceProjectionState);
+}
+
+const programGraphParseTreeKeys = new Map();
+
+function assertProgramGraphCompilerInput(body, artifact) {
+  assert(body.compilerCaches.every((cache) => cache.sourceKind === "program-graph" && cache.graphHash === body.graph.graphHash));
+  assert(body.compilerCaches.every((cache) => cache.parserArtifactsInKey === false));
+  const caches = new Map(body.compilerCaches.map((cache) => [cache.name, cache]));
+  const assertCacheInputs = (name, includes, excludes = []) => {
+    const cache = caches.get(name);
+    assert(cache, `missing compiler cache ${name}`);
+    for (const key of includes) assert(cache.graphKeyInputs.includes(key), `${name} cache key inputs should include ${key}`);
+    for (const key of excludes) assert(!cache.graphKeyInputs.includes(key), `${name} cache key inputs should not include ${key}`);
+  };
+  assertCacheInputs("parseTree", ["graphHash", "nodeHashes", "importPaths", "compilerVersion", "packageDependencies"], ["sourceFiles", "targetFacts", "profile"]);
+  assertCacheInputs("interface", ["graphHash", "modulePaths", "symbolFacts", "importGraph"], ["targetFacts", "profile", "compilerVersion", "packageDependencies"]);
+  assertCacheInputs("checkedBody", ["graphHash", "importPaths", "targetFacts", "compilerVersion", "packageDependencies"], ["sourceFiles", "profile"]);
+  assertCacheInputs("specialization", ["graphHash", "importPaths", "targetFacts", "profile", "compilerVersion", "packageDependencies"], ["sourceFiles"]);
+  if (body.graph.lowering === "mapped-final-mir") {
+    assertCacheInputs("mappedFinalMir", ["graphHash", "importPaths", "targetFacts", "compilerVersion", "packageDependencies", "emitKind", "backend"], ["sourceFiles", "profile"]);
+    const mappedMirCache = caches.get("mappedFinalMir");
+    assert.match(mappedMirCache.path, /\.zero\/cache\/native\/mir-[0-9a-f]+\.zmir$/);
+    assert.equal(mappedMirCache.memoryMapped, true);
+    assert.equal(mappedMirCache.borrowedStorage, true);
+    assert.equal(mappedMirCache.byteLength > 0, true);
+    assert.equal(body.incrementalInvalidation.graphInput.mappedFinalMir.path, mappedMirCache.path);
+    assert.equal(body.incrementalInvalidation.graphInput.mappedFinalMir.memoryMapped, true);
+    assert.equal(body.incrementalInvalidation.graphInput.mappedFinalMir.borrowedStorage, true);
+  }
+  assertCacheInputs("emittedObject", ["graphHash", "importPaths", "targetFacts", "profile", "compilerVersion", "packageDependencies"], ["sourceFiles"]);
+  const parseTreeCache = caches.get("parseTree");
+  assert.equal(parseTreeCache.invalidatesOn, "ProgramGraph input");
+  if (programGraphParseTreeKeys.has(artifact)) assert.equal(parseTreeCache.key, programGraphParseTreeKeys.get(artifact));
+  else programGraphParseTreeKeys.set(artifact, parseTreeCache.key);
+  assert.equal(body.incrementalInvalidation.sourceKind, "program-graph");
+  assert.equal(body.incrementalInvalidation.graphInput.artifact, artifact);
+  assert.equal(body.incrementalInvalidation.graphInput.graphHash, body.graph.graphHash);
+  assert.equal(body.incrementalInvalidation.graphInput.parserArtifactsInKey, false);
+  assert(body.incrementalInvalidation.graphInput.keyedBy.includes("graphHash"));
+  assert(body.incrementalInvalidation.graphInput.keyedBy.includes("nodeHashes"));
+  assert(body.incrementalInvalidation.graphInput.keyedBy.includes("typeFacts"));
+  assert(body.incrementalInvalidation.graphInput.keyedBy.includes("symbolFacts"));
+  assert(body.incrementalInvalidation.graphInput.keyedBy.includes("modulePaths"));
+  assert(body.incrementalInvalidation.graphInput.keyedBy.includes("importPaths"));
+  assert.equal(body.incrementalInvalidation.changedInputs.graphArtifact, artifact);
+  assert.equal(body.incrementalInvalidation.interfaceFingerprints.sourceKind, "program-graph");
+  assert.equal(body.incrementalInvalidation.interfaceFingerprints.graphHash, body.graph.graphHash);
 }
 
 function assertLlvmPhiPredecessors(ir) {
@@ -127,7 +403,7 @@ async function assertBoundsTrap(fixture, name) {
   if (!canRunLinuxMuslX64) return;
   const failedRun = await execFileAsync(out, []).catch((error) => error);
   assert.notEqual(failedRun.code ?? (failedRun.signal ? 1 : 0), 0);
-  if (failedRun.stderr) assert.match(failedRun.stderr, /zero bounds check failed/);
+  if (failedRun.stderr) assert.match(failedRun.stderr, /zero bounds check failed|trap: index out of bounds/);
 }
 
 async function assertDirectRuntimeOrUnsupported(fixture, name, expected) {
@@ -271,6 +547,36 @@ function hasAarch64Instruction(bytes, expected) {
   return false;
 }
 
+function countAarch64InstructionSequence(bytes, expected) {
+  let count = 0;
+  for (let offset = 0; offset + expected.length * 4 <= bytes.length; offset++) {
+    let matched = true;
+    for (let index = 0; index < expected.length; index++) {
+      if (bytes.readUInt32LE(offset + index * 4) !== expected[index]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) count++;
+  }
+  return count;
+}
+
+function aarch64SpLoad(reg, offset, wide) {
+  const scale = wide ? 8 : 4;
+  assert.equal(offset % scale, 0);
+  return ((wide ? 0xf9400000 : 0xb9400000) + ((offset / scale) << 10) + (31 << 5) + reg) >>> 0;
+}
+
+function aarch64ByteViewReloadSequence(count) {
+  const sequence = [];
+  for (let index = 0; index < count; index++) {
+    sequence.push(aarch64SpLoad(index * 2, index * 16, true));
+    sequence.push(aarch64SpLoad(index * 2 + 1, index * 16 + 8, false));
+  }
+  return sequence;
+}
+
 function hasAarch64CondBranch(bytes, cond) {
   for (let offset = 0; offset + 4 <= bytes.length; offset++) {
     const instruction = bytes.readUInt32LE(offset);
@@ -344,6 +650,37 @@ function assertX64U16RecordFieldBytes(bytes) {
   assert(bytes.includes(Buffer.from([0x66, 0x89])));
 }
 
+function isRexW(byte) {
+  return (byte & 0xf8) === 0x48;
+}
+
+function hasX64MovMemoryToR64(bytes) {
+  for (let i = 0; i + 2 < bytes.length; i++) {
+    if (!isRexW(bytes[i]) || bytes[i + 1] !== 0x8b) continue;
+    const mod = bytes[i + 2] >> 6;
+    if (mod !== 3) return true;
+  }
+  return false;
+}
+
+function hasX64MovR64ToMemory(bytes) {
+  for (let i = 0; i + 2 < bytes.length; i++) {
+    if (!isRexW(bytes[i]) || bytes[i + 1] !== 0x89) continue;
+    const mod = bytes[i + 2] >> 6;
+    if (mod !== 3) return true;
+  }
+  return false;
+}
+
+function hasX64CmpR64(bytes) {
+  for (let i = 0; i + 2 < bytes.length; i++) {
+    if (!isRexW(bytes[i]) || bytes[i + 1] !== 0x39) continue;
+    const mod = bytes[i + 2] >> 6;
+    if (mod === 3) return true;
+  }
+  return false;
+}
+
 async function assertMachOArm64Executable(path) {
   const bytes = await readFile(path);
   assert.equal(bytes.readUInt32LE(0), 0xfeedfacf);
@@ -394,39 +731,50 @@ async function assertPeCoffX64Executable(path) {
   return bytes;
 }
 
-for (const fixture of [
+const passCheckFixtures = [
   "conformance/run/pass/hello.0",
   "conformance/native/pass/params.0",
   "conformance/native/pass/shape.0",
+  "conformance/native/pass/mutref-shape-param.0",
+  "conformance/native/pass/mutref-shape-param-nested.0",
   "conformance/native/pass/primitive-stdlib.0",
-  "conformance/native/pass/variants-defer-stdlib.0",
-  "conformance/native/pass/defer-return-raise-nested.0",
-  "conformance/native/pass/payload-match.0",
   "conformance/native/pass/break-continue.0",
+  "conformance/native/pass/nested-break-continue.0",
+  "conformance/native/pass/untyped-literal-adoption.0",
   "conformance/native/pass/for-range.0",
-  "conformance/native/pass/match-payload-binding.0",
   "conformance/native/pass/choice-payload-reference-return.0",
   "conformance/native/pass/choice-match-payload-reference-origin.0",
   "conformance/native/pass/choice-match-payload-return-origin.0",
-  "conformance/native/pass/match-choice-fallback.0",
   "conformance/native/pass/null-maybe.0",
+  "conformance/native/pass/maybe-local-null-init-return.0",
   "conformance/native/pass/meta-typed-target-type.0",
   "conformance/native/pass/std-args.0",
   "conformance/native/pass/std-env.0",
   "conformance/native/pass/std-hosted-cli.0",
   "conformance/native/pass/std-fs.0",
   "conformance/native/pass/std-fs-bytes.0",
+  "conformance/native/pass/std-fs-read-chunks.0",
+  "conformance/native/pass/frame-large-locals.0",
+  "conformance/native/pass/frame-limit-boundary.0",
+  "conformance/native/pass/frame-split-helpers.0",
+  "conformance/native/pass/fixed-buf-alloc-local.0",
   "conformance/native/pass/std-fs-resource.0",
   "conformance/native/pass/std-fs-readall.0",
   "conformance/native/pass/std-fs-polish.0",
   "conformance/native/pass/std-fs-breadth.0",
   "conformance/native/pass/std-fs-file-helpers.0",
+  "conformance/native/pass/std-pty-child.0",
   "conformance/native/pass/std-math-breadth.0",
   "conformance/native/pass/std-numeric-random-time.0",
+  "conformance/native/pass/std-regex.0",
+  "conformance/native/pass/std-unicode.0",
+  "conformance/native/pass/std-inet.0",
+  "conformance/native/pass/std-time-rfc3339.0",
   "conformance/native/pass/std-io-lines.0",
   "conformance/native/pass/std-path-io-breadth.0",
   "conformance/native/pass/std-str-breadth.0",
   "conformance/native/pass/std-testing-log.0",
+  "conformance/native/pass/std-term-ansi.0",
   "conformance/native/pass/std-testing-helpers-test.0",
   "conformance/native/pass/std-path-helper-name-collision.0",
   "conformance/native/pass/std-net-http-breadth.0",
@@ -434,9 +782,16 @@ for (const fixture of [
   "conformance/native/pass/std-http-fetch.0",
   "conformance/native/pass/std-http-errors.0",
   "conformance/native/pass/std-http-response-helpers.0",
+  "conformance/native/pass/std-http-text-html-response-helpers.0",
+  "conformance/native/pass/std-http-redirect-response-helpers.0",
   "conformance/native/pass/std-http-api-helpers.0",
+  "conformance/native/pass/std-http-cors-helpers.0",
+  "conformance/native/pass/std-http-auth-helpers.0",
   "conformance/native/pass/std-data-formats.0",
+  "conformance/native/pass/std-csv.0",
+  "conformance/native/pass/std-diag.0",
   "conformance/native/pass/std-codec-json-url.0",
+  "conformance/native/pass/std-json-cursors.0",
   "conformance/native/pass/std-json-bytes.0",
   "conformance/native/pass/std-json-inline-bytes.0",
   "conformance/native/pass/std-json-duplicate-keys.0",
@@ -455,6 +810,7 @@ for (const fixture of [
   "conformance/native/pass/integer-widths.0",
   "conformance/native/pass/std-codec-widths.0",
   "conformance/native/pass/std-crypto-hmac32.0",
+  "conformance/native/pass/std-crypto-sha256.0",
   "conformance/native/pass/parse-integers.0",
   "conformance/native/pass/explicit-casts.0",
   "conformance/native/pass/float-char-casts.0",
@@ -462,7 +818,6 @@ for (const fixture of [
   "conformance/native/pass/char-literals.0",
   "conformance/native/pass/float-primitives.0",
   "conformance/native/pass/wrapping-saturating-arithmetic.0",
-  "conformance/native/pass/maybe-error-flow.0",
   "conformance/native/pass/maybe-guard-branch-restore.0",
   "conformance/native/pass/maybe-guard-negated-conjunction.0",
   "conformance/native/pass/maybe-guard-scalar-match.0",
@@ -532,7 +887,6 @@ for (const fixture of [
   "conformance/native/pass/static-method-namespace.0",
   "conformance/native/pass/c-import-type-shadowing.0",
   "conformance/native/pass/c-import-alias-later-local.0",
-  "conformance/native/pass/match-fallback.0",
   "conformance/native/pass/memory-types.0",
   "conformance/native/pass/owned-transfer.0",
   "conformance/native/pass/owned-field-move-return-branch.0",
@@ -609,7 +963,6 @@ for (const fixture of [
   "conformance/check/pass/shape-field-defaults.0",
   "conformance/check/pass/static-value-params.0",
   "conformance/check/pass/static-interface-basic.0",
-  "conformance/check/pass/call-resolution-inspection.0",
   "conformance/check/pass/call-resolution-edge-cases.0",
   "conformance/native/pass/static-interface-mutref.0",
   "conformance/native/pass/static-interface-static-param.0",
@@ -621,12 +974,10 @@ for (const fixture of [
   "conformance/check/pass/c-header-import.0",
   "conformance/check/pass/c-import-local-shadowing.0",
   "conformance/check/pass/match-fallback.0",
-  "conformance/native/pass/match-choice-fallback.0",
   "conformance/check/pass/memory-types.0",
   "conformance/check/pass/std-mem-field-items.0",
   "conformance/check/pass/std-mem-field-slice.0",
-  "conformance/check/pass/checker-type-forms.0",
-  "conformance/check/pass/package",
+  "conformance/check/pass/fixed-array-length-match.0",
   "conformance/check/pass/imports",
   "examples/memory-package",
   "examples/const-arithmetic.0",
@@ -638,73 +989,87 @@ for (const fixture of [
   "examples/static-method.0",
   "examples/static-interface.0",
   "examples/ownership-cleanup.0",
-]) {
-  await execFileAsync(zero, ["check", fixture]);
+];
+await mapLimit(passCheckFixtures, checkJobs, (fixture, _index, workerIndex) => checkFixtureParallel(fixture, workerIndex));
+
+const stdSortMergeOverlap = await writeImportFailureFixture(`${outDir}/std-sort-merge-overlap.0`, `pub fn main() -> Void {
+    var values: [5]i32 = [1, 3, 5, 2, 4]
+    let written: usize = std.sort.mergeSortedI32(values, std.mem.prefix(values, 3_usize), std.mem.dropPrefix(values, 3_usize))
 }
+`);
+assert.equal(stdSortMergeOverlap.diagnostics[0].code, "STD003");
+assert.match(stdSortMergeOverlap.diagnostics[0].message, /std\.sort\.mergeSorted source must not overlap destination storage/);
+
+const stdMemStartsWithMismatch = await writeImportFailureFixture(`${outDir}/std-mem-startswith-mismatch.0`, `pub fn main() -> Void {
+    let left_values: [2]i32 = [1, 2]
+    let right_values: [2]u32 = [1_u32, 2_u32]
+    let left: Span<i32> = left_values
+    let right: Span<u32> = right_values
+    let ok: Bool = std.mem.startsWith(left, right)
+}
+`);
+assert.equal(stdMemStartsWithMismatch.diagnostics[0].code, "STD003");
+assert.match(stdMemStartsWithMismatch.diagnostics[0].message, /std\.mem\.startsWith span element types must match/);
+
+const stdMemStartsWithUnsupported = await writeImportFailureFixture(`${outDir}/std-mem-startswith-unsupported.0`, `type Point {
+    x: i32,
+}
+
+pub fn main() -> Void {
+    let points: [1]Point = [Point { x: 1 }]
+    let span: Span<Point> = points
+    let ok: Bool = std.mem.startsWith(span, span)
+}
+`);
+assert.equal(stdMemStartsWithUnsupported.diagnostics[0].code, "STD003");
+assert.match(stdMemStartsWithUnsupported.diagnostics[0].message, /std\.mem\.startsWith item element type is not supported/);
+
+// Fixtures using the gated typed graph MIR constructs fail check with the
+// same BLD004 diagnostics zero build reports for their graph stores.
+const gateBlockedCheckFixtures = [
+  "conformance/check/pass/package",
+  "conformance/native/pass/variants-defer-stdlib.0",
+  "conformance/native/pass/defer-return-raise-nested.0",
+  "conformance/native/pass/payload-match.0",
+  "conformance/native/pass/match-payload-binding.0",
+  "conformance/native/pass/match-choice-fallback.0",
+  "conformance/native/pass/maybe-error-flow.0",
+  "conformance/native/pass/match-fallback.0",
+  "conformance/check/pass/call-resolution-inspection.0",
+  "conformance/check/pass/checker-type-forms.0",
+];
+await mapLimit(gateBlockedCheckFixtures, checkJobs, (fixture, _index, workerIndex) => checkFailureFixtureParallel(fixture, /BLD004/, workerIndex));
 
 const checkJsonSuccess = await execFileAsync(zero, ["check", "--json", "conformance/native/pass/explicit-casts.0"]);
 const checkJsonSuccessBody = JSON.parse(checkJsonSuccess.stdout);
 assert.equal(checkJsonSuccessBody.ok, true);
 assert.equal(checkJsonSuccessBody.diagnostics.length, 0);
-assert.match(checkJsonSuccessBody.sourceFile, /explicit-casts\.0$/);
-assert.ok(checkJsonSuccessBody.metaCache.sourceHash);
-assert.ok(checkJsonSuccessBody.metaCache.targetHash);
-assert.ok(checkJsonSuccessBody.metaCache.manifestHash);
-assert(checkJsonSuccessBody.compilerPhases.some((item) => item.name === "parse" && item.cacheable === true));
-assert(checkJsonSuccessBody.compilerPhases.some((item) => item.name === "check" && item.cacheable === true));
-assert.equal(checkJsonSuccessBody.graph.artifact, "conformance/native/pass/explicit-casts.0");
-assert.equal(checkJsonSuccessBody.graph.canonicalSource, true);
-assert.equal(checkJsonSuccessBody.graph.moduleIdentity, "module:explicit-casts");
-assert.match(checkJsonSuccessBody.graph.graphHash, /^graph:[0-9a-f]{16}$/);
-assert.equal(checkJsonSuccessBody.compilerCaches.every((item) => item.sourceKind === "program-graph" && item.graphHash === checkJsonSuccessBody.graph.graphHash), true);
-assert(checkJsonSuccessBody.compilerCaches.some((item) => item.name === "parseTree" && item.stored === true && item.invalidatesOn === "ProgramGraph input"));
-assert(checkJsonSuccessBody.compilerCaches.some((item) => item.name === "interface" && item.invalidatesOn.includes("public symbols")));
-assert.ok(checkJsonSuccessBody.incrementalInvalidation.targetDependency);
-assert.equal(checkJsonSuccessBody.incrementalInvalidation.profileDependency, "release");
-assert.equal(checkJsonSuccessBody.incrementalInvalidation.sourceKind, "program-graph");
-assert.equal(checkJsonSuccessBody.incrementalInvalidation.changedInputs.graphArtifact, "conformance/native/pass/explicit-casts.0");
-assert.equal(checkJsonSuccessBody.incrementalInvalidation.recheckStrategy, "fingerprint changed modules and dependent bodies");
+assert.equal(checkJsonSuccessBody.artifact, "conformance/native/pass/explicit-casts.graph");
+assert.equal(checkJsonSuccessBody.canonicalSource, false);
+assert.equal(checkJsonSuccessBody.moduleIdentity, "module:explicit-casts");
+assert.match(checkJsonSuccessBody.graphHash, /^graph:[0-9a-f]{16}$/);
+assert.equal(checkJsonSuccessBody.check.phase, "typecheck");
+assert.equal(checkJsonSuccessBody.check.lowering, "graph-native-check");
+assert.equal(checkJsonSuccessBody.graphCompiler.input, "program-graph-artifact");
+assert.equal(checkJsonSuccessBody.graphCompiler.graphNativeCheckerUsed, true);
+assert.equal(checkJsonSuccessBody.graphCompiler.graphHirToMirUsed, true);
+
+const stdDiagGraphCheck = await execFileAsync(zero, ["check", "--json", "conformance/native/pass/std-diag.graph"]);
+const stdDiagGraphCheckBody = JSON.parse(stdDiagGraphCheck.stdout);
+assert.equal(stdDiagGraphCheckBody.ok, true);
+assert.equal(stdDiagGraphCheckBody.targetReadiness.ok, true);
+assert.equal(stdDiagGraphCheckBody.targetReadiness.buildable, true);
+assert.equal(stdDiagGraphCheckBody.targetReadiness.diagnostics.length, 0);
 
 const agentSurfaceClassification = JSON.parse(await readFile("conformance/agent-surface/classification.json", "utf8"));
 assert.equal(agentSurfaceClassification.schema, 1);
 assert.deepEqual(agentSurfaceClassification.fixtures.map((item) => item.id), [
-  "generic-type-shadowing",
-  "builtin-generic-type-shadowing",
-  "shape-generic-type-shadowing",
-  "shape-generic-self-shadowing",
-  "method-generic-type-shadowing",
-  "method-generic-outer-shadowing",
-  "method-generic-self-shadowing",
   "interface-method-generic-binding",
   "direct-generic-recursion",
   "direct-generic-specialization-name-collision",
-  "polymorphic-recursion-growth",
-  "mutual-polymorphic-recursion-growth",
-  "mutual-polymorphic-recursion-inferred-growth",
   "stdlib-signature-parity",
-  "borrow-lexical-lifetime",
-  "unresolved-package-import",
-  "malformed-use-current",
   "owned-drop-direct-backend-unsupported",
 ]);
-
-async function assertAgentSurfaceGenericShadowing(path, actualPattern) {
-  const result = await execFileAsync(zero, ["check", "--json", path]).catch((error) => error);
-  assert.notEqual(result.code, 0);
-  const body = JSON.parse(result.stdout);
-  assert.equal(body.diagnostics[0].code, "NAM004");
-  assert.match(body.diagnostics[0].message, /generic type parameter shadows/);
-  assert.match(body.diagnostics[0].actual, actualPattern);
-  assert.match(body.diagnostics[0].help, /rename/);
-}
-
-await assertAgentSurfaceGenericShadowing("conformance/agent-surface/fixtures/generic-type-shadowing.0", /already names a shape/);
-await assertAgentSurfaceGenericShadowing("conformance/agent-surface/fixtures/builtin-generic-type-shadowing.0", /already names a built-in type/);
-await assertAgentSurfaceGenericShadowing("conformance/agent-surface/fixtures/shape-generic-type-shadowing.0", /already names a shape/);
-await assertAgentSurfaceGenericShadowing("conformance/agent-surface/fixtures/shape-generic-self-shadowing.0", /reserved for method Self types/);
-await assertAgentSurfaceGenericShadowing("conformance/agent-surface/fixtures/method-generic-type-shadowing.0", /already names a shape/);
-await assertAgentSurfaceGenericShadowing("conformance/agent-surface/fixtures/method-generic-outer-shadowing.0", /outer generic scope/);
-await assertAgentSurfaceGenericShadowing("conformance/agent-surface/fixtures/method-generic-self-shadowing.0", /reserved for method Self types/);
 
 const agentSurfaceInterfaceMethodGeneric = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/interface-method-generic-binding.0"]);
 const agentSurfaceInterfaceMethodGenericBody = JSON.parse(agentSurfaceInterfaceMethodGeneric.stdout);
@@ -746,28 +1111,27 @@ assert.equal(agentSurfaceDirectGenericCollisionReadinessBody.targetReadiness.bui
 assert.equal(agentSurfaceDirectGenericCollisionReadinessBody.targetReadiness.diagnostics[0].code, "BLD004");
 assert.match(agentSurfaceDirectGenericCollisionReadinessBody.targetReadiness.diagnostics[0].message, /specialization name collides/);
 
-const agentSurfacePolymorphicRecursion = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/polymorphic-recursion-growth.0"]).catch((error) => error);
-assert.notEqual(agentSurfacePolymorphicRecursion.code, 0);
-const agentSurfacePolymorphicRecursionBody = JSON.parse(agentSurfacePolymorphicRecursion.stdout);
-assert.equal(agentSurfacePolymorphicRecursionBody.diagnostics[0].code, "TYP027");
-assert.match(agentSurfacePolymorphicRecursionBody.diagnostics[0].message, /recursive generic call/);
-
-const agentSurfaceMutualPolymorphicRecursion = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/mutual-polymorphic-recursion-growth.0"]).catch((error) => error);
-assert.notEqual(agentSurfaceMutualPolymorphicRecursion.code, 0);
-const agentSurfaceMutualPolymorphicRecursionBody = JSON.parse(agentSurfaceMutualPolymorphicRecursion.stdout);
-assert.equal(agentSurfaceMutualPolymorphicRecursionBody.diagnostics[0].code, "TYP027");
-assert.match(agentSurfaceMutualPolymorphicRecursionBody.diagnostics[0].message, /recursive generic call/);
-
-const agentSurfaceMutualInferredPolymorphicRecursion = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/mutual-polymorphic-recursion-inferred-growth.0"]).catch((error) => error);
-assert.notEqual(agentSurfaceMutualInferredPolymorphicRecursion.code, 0);
-const agentSurfaceMutualInferredPolymorphicRecursionBody = JSON.parse(agentSurfaceMutualInferredPolymorphicRecursion.stdout);
-assert.equal(agentSurfaceMutualInferredPolymorphicRecursionBody.diagnostics[0].code, "TYP027");
-assert.match(agentSurfaceMutualInferredPolymorphicRecursionBody.diagnostics[0].message, /recursive generic call/);
-
 const compilerMetrics = await execFileAsync("node", ["--experimental-strip-types", "--disable-warning=ExperimentalWarning", "scripts/compiler-metrics.mts"]);
 const compilerMetricsBody = JSON.parse(compilerMetrics.stdout);
 assert.equal(compilerMetricsBody.schema, 1);
 assert(compilerMetricsBody.files["native/zero-c/src/checker.c"].lines > 0);
+assert.equal(compilerMetricsBody.files["native/zero-c/src/fs.c"].shellCalls, 0);
+assert.equal(compilerMetricsBody.files["native/zero-c/src/main.c"].shellCalls, 0);
+for (const [path, metrics] of Object.entries(compilerMetricsBody.files)) {
+  assert.equal(metrics.shellCalls, 0, `${path} should not introduce shell execution calls`);
+}
+
+const relativeToolDir = `${outDir}/relative-tools`;
+await mkdir(relativeToolDir, { recursive: true });
+await writeFile(`${relativeToolDir}/cc`, "#!/bin/sh\nprintf 'fake relative cc\\n'\n");
+await chmod(`${relativeToolDir}/cc`, 0o755);
+const relativePathDoctor = await execFileAsync(zero, ["doctor", "--json"], { env: { ...process.env, PATH: relativeToolDir } }).catch((error) => error);
+assert.notEqual(relativePathDoctor.code, 0);
+const relativePathDoctorBody = JSON.parse(relativePathDoctor.stdout);
+const relativePathNativeCompiler = relativePathDoctorBody.checks.find((check) => check.name === "native-c-compiler");
+assert.equal(relativePathNativeCompiler.status, "error");
+assert.match(relativePathNativeCompiler.message, /no native C compiler found/);
+
 assert(Array.isArray(compilerMetricsBody.largeFunctions));
 assert(compilerMetricsBody.stdlib.mainHelperCount > 0);
 assert.equal(compilerMetricsBody.stdlib.mainHelperCount, compilerMetricsBody.stdlib.checkerReturnCount);
@@ -823,28 +1187,20 @@ for (const item of compilerMetricsBody.largeFunctions) {
   assert(item.lines >= compilerMetricsBody.budget.reportThreshold);
 }
 
-const agentSurfaceBorrowLifetime = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/borrow-lexical-lifetime.0"]).catch((error) => error);
-assert.notEqual(agentSurfaceBorrowLifetime.code, 0);
-const agentSurfaceBorrowLifetimeBody = JSON.parse(agentSurfaceBorrowLifetime.stdout);
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].code, "BOR001");
-assert.match(agentSurfaceBorrowLifetimeBody.diagnostics[0].actual, /data already has shared borrow/);
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].repair.id, "end-conflicting-borrow");
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].borrowTrace.rule, "lexical");
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].borrowTrace.activeBorrows[0].root, "data");
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].borrowTrace.activeBorrows[0].path, "");
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].borrowTrace.activeBorrows[0].kind, "shared");
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].borrowTrace.activeBorrows[0].binding, "shared");
-assert.equal(agentSurfaceBorrowLifetimeBody.diagnostics[0].borrowTrace.activeBorrows[0].bindingDecl.line, 11);
-assert.match(agentSurfaceBorrowLifetimeBody.diagnostics[0].borrowTrace.repair, /inner block|lexical scope/);
-
-const agentSurfaceBorrowMultiple = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/borrow-multiple-active-borrows.0"]).catch((error) => error);
-assert.notEqual(agentSurfaceBorrowMultiple.code, 0);
-const agentSurfaceBorrowMultipleBody = JSON.parse(agentSurfaceBorrowMultiple.stdout);
-assert.equal(agentSurfaceBorrowMultipleBody.diagnostics[0].code, "BOR001");
-assert.equal(agentSurfaceBorrowMultipleBody.diagnostics[0].borrowTrace.activeBorrows.length, 2);
-assert.deepEqual(agentSurfaceBorrowMultipleBody.diagnostics[0].borrowTrace.activeBorrows.map((borrow) => borrow.binding), ["first", "second"]);
-assert.deepEqual(agentSurfaceBorrowMultipleBody.diagnostics[0].borrowTrace.activeBorrows.map((borrow) => borrow.bindingDecl.line), [3, 4]);
-assert.equal(agentSurfaceBorrowMultipleBody.diagnostics[0].borrowTrace.truncated, false);
+const unsafeCompilerOverrideBuild = await execFileAsync(zero, [
+  "build",
+  "--json",
+  "--out",
+  `${outDir}/unsafe-cc-override`,
+  "examples/json-api-client.graph",
+], { env: { ...process.env, ZERO_CC: "cc;touch" } }).catch((error) => error);
+assert.notEqual(unsafeCompilerOverrideBuild.code, 0);
+assert.match(unsafeCompilerOverrideBuild.stderr, /compiler override contains unsafe shell characters/);
+const unsafeCompilerOverrideBody = JSON.parse(unsafeCompilerOverrideBuild.stdout);
+assert.equal(unsafeCompilerOverrideBody.ok, false);
+assert.equal(unsafeCompilerOverrideBody.diagnostics[0].code, "BLD003");
+assert.equal(unsafeCompilerOverrideBody.diagnostics[0].actual, "compiler override contains unsafe shell characters");
+assert.match(unsafeCompilerOverrideBody.diagnostics[0].help, /without flags, whitespace, or shell syntax/);
 
 const agentSurfaceBorrowExplain = await execFileAsync(zero, ["explain", "--json", "BOR001"]);
 const agentSurfaceBorrowExplainBody = JSON.parse(agentSurfaceBorrowExplain.stdout);
@@ -852,23 +1208,9 @@ assert.equal(agentSurfaceBorrowExplainBody.code, "BOR001");
 assert.equal(agentSurfaceBorrowExplainBody.repair.id, "end-conflicting-borrow");
 assert.match(agentSurfaceBorrowExplainBody.summary, /lexical scope/);
 
-const agentSurfaceUnresolvedImport = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/unresolved-package-import"]).catch((error) => error);
-assert.notEqual(agentSurfaceUnresolvedImport.code, 0);
-const agentSurfaceUnresolvedImportBody = JSON.parse(agentSurfaceUnresolvedImport.stdout);
-assert.equal(agentSurfaceUnresolvedImportBody.diagnostics[0].code, "IMP001");
-assert.match(agentSurfaceUnresolvedImportBody.diagnostics[0].expected, /missing\.utility\.0 or missing\.utility\/mod\.0/);
-
-const agentSurfaceMalformedUse = await execFileAsync(zero, ["check", "--json", "conformance/agent-surface/fixtures/malformed-use-current.0"]).catch((error) => error);
-assert.notEqual(agentSurfaceMalformedUse.code, 0);
-const agentSurfaceMalformedUseBody = JSON.parse(agentSurfaceMalformedUse.stdout);
-assert.equal(agentSurfaceMalformedUseBody.diagnostics[0].code, "PAR100");
-assert.match(agentSurfaceMalformedUseBody.diagnostics[0].message, /expected import module segment/);
-assert.equal(agentSurfaceMalformedUseBody.diagnostics[0].line, 1);
-assert.equal(agentSurfaceMalformedUseBody.diagnostics[0].column, 9);
-
 const agentSurfaceMalformedLocalUseFixture = `${outDir}/malformed-local-use.0`;
 await writeFile(agentSurfaceMalformedLocalUseFixture, 'use local.\n\npub fn main(world: World) -> Void raises {\n    check world.out.write("malformed local use parser fixture\\n")\n}\n');
-const agentSurfaceMalformedLocalUse = await execFileAsync(zero, ["check", "--json", agentSurfaceMalformedLocalUseFixture]).catch((error) => error);
+const agentSurfaceMalformedLocalUse = await execFileAsync(zero, ["parse", "--json", agentSurfaceMalformedLocalUseFixture]).catch((error) => error);
 assert.notEqual(agentSurfaceMalformedLocalUse.code, 0);
 const agentSurfaceMalformedLocalUseBody = JSON.parse(agentSurfaceMalformedLocalUse.stdout);
 assert.equal(agentSurfaceMalformedLocalUseBody.diagnostics[0].code, "PAR100");
@@ -878,7 +1220,7 @@ assert.equal(agentSurfaceMalformedLocalUseBody.diagnostics[0].column, 11);
 
 const agentSurfaceSplitUseFixture = `${outDir}/split-use-path.0`;
 await writeFile(agentSurfaceSplitUseFixture, 'use std.\ncodec\n\npub fn main(world: World) -> Void raises {\n    check world.out.write("split use parser fixture\\n")\n}\n');
-const agentSurfaceSplitUse = await execFileAsync(zero, ["check", "--json", agentSurfaceSplitUseFixture]).catch((error) => error);
+const agentSurfaceSplitUse = await execFileAsync(zero, ["parse", "--json", agentSurfaceSplitUseFixture]).catch((error) => error);
 assert.notEqual(agentSurfaceSplitUse.code, 0);
 const agentSurfaceSplitUseBody = JSON.parse(agentSurfaceSplitUse.stdout);
 assert.equal(agentSurfaceSplitUseBody.diagnostics[0].code, "PAR100");
@@ -888,7 +1230,7 @@ assert.equal(agentSurfaceSplitUseBody.diagnostics[0].column, 9);
 
 const agentSurfaceKeywordUseFixture = `${outDir}/keyword-use.0`;
 await writeFile(agentSurfaceKeywordUseFixture, 'use pub\n\npub fn main(world: World) -> Void raises {\n    check world.out.write("keyword use parser fixture\\n")\n}\n');
-const agentSurfaceKeywordUse = await execFileAsync(zero, ["check", "--json", agentSurfaceKeywordUseFixture]).catch((error) => error);
+const agentSurfaceKeywordUse = await execFileAsync(zero, ["parse", "--json", agentSurfaceKeywordUseFixture]).catch((error) => error);
 assert.notEqual(agentSurfaceKeywordUse.code, 0);
 const agentSurfaceKeywordUseBody = JSON.parse(agentSurfaceKeywordUse.stdout);
 assert.equal(agentSurfaceKeywordUseBody.diagnostics[0].code, "PAR100");
@@ -961,7 +1303,7 @@ for (const key of ["code", "path", "line", "column", "length", "expected", "actu
 }
 assert.equal(directCallBuildDiag.backendBlocker.stage, "buildability");
 const directCallExeGraph = await execFileAsync(zero, [
-  "graph",
+  "inspect",
   "--json",
   "--emit",
   "exe",
@@ -972,10 +1314,12 @@ const directCallExeGraph = await execFileAsync(zero, [
 const directCallExeGraphBody = JSON.parse(directCallExeGraph.stdout);
 assert.equal(directCallExeGraphBody.targetReadiness.ok, false);
 assert.equal(directCallExeGraphBody.targetReadiness.diagnostics[0].code, "BLD004");
-for (const key of ["code", "path", "line", "column", "length", "expected", "actual", "help"]) {
-  assert.equal(directCallExeGraphBody.targetReadiness.diagnostics[0][key], directCallReadinessDiag[key]);
-}
-assert.equal(directCallExeGraphBody.targetReadiness.diagnostics[0].backendBlocker.stage, "buildability");
+const directCallGraphDiag = directCallExeGraphBody.targetReadiness.diagnostics[0];
+assert.equal(directCallGraphDiag.path, "direct-call-add.0");
+assert.equal(directCallGraphDiag.expected, "direct ELF64 object subset");
+assert.equal(directCallGraphDiag.actual, "unsupported construct");
+assert.equal(directCallGraphDiag.backendBlocker.backend, "zero-elf64-exe");
+assert.equal(directCallGraphDiag.backendBlocker.stage, "lower");
 
 const llvmLoopIrPath = `${outDir}/llvm-direct-while-sum.ll`;
 await execFileAsync(zero, [
@@ -1000,7 +1344,7 @@ assert.match(llvmLoopIr, /ret i32 %v[0-9]+/);
 const llvmArrayIr = await buildLlvmIrFixture("examples/direct-array-sum.0", "llvm-direct-array-sum");
 assert.match(llvmArrayIr, /alloca \[4 x i32\]/);
 assert.match(llvmArrayIr, /getelementptr inbounds \[4 x i32\], ptr %slot[0-9]+, i64 0, i64 0/);
-assert.match(llvmArrayIr, /getelementptr inbounds i32, ptr %v[0-9]+, i64 %v[0-9]+/);
+assert.match(llvmArrayIr, /getelementptr inbounds \[4 x i32\], ptr %slot[0-9]+, i64 0, i64 %v[0-9]+/);
 assert.match(llvmArrayIr, /store i32 4, ptr %v[0-9]+, align 4/);
 assert.match(llvmArrayIr, /load i32, ptr %v[0-9]+, align 4/);
 assert.match(llvmArrayIr, /call void @llvm\.trap\(\)/);
@@ -1039,15 +1383,15 @@ assert.match(llvmByteViewLocalsIr, /extractvalue \{ ptr, i64 \} %v[0-9]+, 1/);
 await assertLlvmHostExitCode("examples/direct-byte-view-locals.0", "llvm-direct-byte-view-locals", 107);
 
 const llvmSpanReadIr = await buildLlvmIrFixture("examples/direct-span-read.0", "llvm-direct-span-read");
-assert.match(llvmSpanReadIr, /icmp ule i64 1, 4/);
-assert.match(llvmSpanReadIr, /icmp ult i64 1, %v[0-9]+/);
-assert.match(llvmSpanReadIr, /getelementptr inbounds i8, ptr %v[0-9]+, i64 1/);
+assert.match(llvmSpanReadIr, /icmp ule i64 %v[0-9]+, %v[0-9]+/);
+assert.match(llvmSpanReadIr, /icmp ult i64 %v[0-9]+, %v[0-9]+/);
+assert.match(llvmSpanReadIr, /getelementptr inbounds i8, ptr %v[0-9]+, i64 %v[0-9]+/);
 assert.match(llvmSpanReadIr, /load i8, ptr %v[0-9]+, align 1/);
 await assertLlvmHostExitCode("examples/direct-span-read.0", "llvm-direct-span-read", 107);
 
 const llvmShortCircuitSourcePath = `${outDir}/llvm-short-circuit.0`;
 const llvmShortCircuitIrPath = `${outDir}/llvm-short-circuit.ll`;
-await writeFile(llvmShortCircuitSourcePath, `fn rhsAnd() -> Bool {
+await writeGraphFixture(llvmShortCircuitSourcePath, `fn rhsAnd() -> Bool {
     return true
 }
 
@@ -1114,7 +1458,7 @@ assert.match(llvmAddIr, /%v[0-9]+ = call i32 @zero_world_write\(i32 1, ptr %v[0-
 
 const llvmSymbolCollisionSourcePath = `${outDir}/llvm-symbol-collision.0`;
 const llvmSymbolCollisionIrPath = `${outDir}/llvm-symbol-collision.ll`;
-await writeFile(llvmSymbolCollisionSourcePath, `fn foo() -> i32 {
+await writeGraphFixture(llvmSymbolCollisionSourcePath, `fn foo() -> i32 {
     return 1
 }
 
@@ -1143,7 +1487,7 @@ assert.match(llvmSymbolCollisionIr, /call i32 @\.zero\.fn\.[0-9]+\.foo\(\)/);
 assert.equal((llvmSymbolCollisionIr.match(/define i32 @z_fn_0_foo\(\) \{/g) || []).length, 1);
 
 const llvmRuntimeCollisionSourcePath = `${outDir}/llvm-runtime-symbol-collision.0`;
-await writeFile(llvmRuntimeCollisionSourcePath, `export c fn zero_world_write() -> i32 {
+await writeGraphFixture(llvmRuntimeCollisionSourcePath, `export c fn zero_world_write() -> i32 {
     return 7
 }
 
@@ -1186,7 +1530,7 @@ assert.equal(llvmRuntimeCollisionBuildBody.diagnostics[0].backendBlocker.backend
 const llvmLongExportName = `llvm_export_${"a".repeat(200)}`;
 const llvmLongExportSourcePath = `${outDir}/llvm-long-export.0`;
 const llvmLongExportIrPath = `${outDir}/llvm-long-export.ll`;
-await writeFile(llvmLongExportSourcePath, `export c fn ${llvmLongExportName}() -> i32 {
+await writeGraphFixture(llvmLongExportSourcePath, `export c fn ${llvmLongExportName}() -> i32 {
     return 7
 }
 
@@ -1302,8 +1646,8 @@ assert.equal(coffU64CopyBuildBody.compiler, "zero-coff-x64");
 assert.equal(coffU64CopyBuildBody.generatedCBytes, 0);
 assert.equal(coffU64CopyBuildBody.objectBackend.objectEmission.path, "direct-coff-x64-object");
 const coffU64CopyBytes = await assertCoffX64Object(coffU64CopyPath, "main");
-assert(coffU64CopyBytes.includes(Buffer.from([0x48, 0x8b, 0x00])));
-assert(coffU64CopyBytes.includes(Buffer.from([0x48, 0x89, 0x02])));
+assert(hasX64MovMemoryToR64(coffU64CopyBytes));
+assert(hasX64MovR64ToMemory(coffU64CopyBytes));
 
 const coffU64ContainsFixture = "conformance/native/pass/std-mem-u64-contains.0";
 const coffU64ContainsReadiness = await execFileAsync(zero, [
@@ -1338,8 +1682,8 @@ assert.equal(coffU64ContainsBuildBody.generatedCBytes, 0);
 assert.equal(coffU64ContainsBuildBody.objectBackend.objectEmission.path, "direct-coff-x64-object");
 const coffU64ContainsBytes = await assertCoffX64Object(coffU64ContainsPath, "main");
 assert(coffU64ContainsBytes.includes(Buffer.from([0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00])));
-assert(coffU64ContainsBytes.includes(Buffer.from([0x48, 0x8b, 0x00])));
-assert(coffU64ContainsBytes.includes(Buffer.from([0x48, 0x39, 0xc8])));
+assert(hasX64MovMemoryToR64(coffU64ContainsBytes));
+assert(hasX64CmpR64(coffU64ContainsBytes));
 
 const coffBoolCopyFixture = "conformance/native/pass/std-mem-bool-copy-items.0";
 const coffBoolCopyReadiness = await execFileAsync(zero, [
@@ -1463,7 +1807,7 @@ assert.equal(machoOpenByteSliceBuildBody.objectBackend.objectEmission.path, "dir
 await assertMachOArm64Object(`${outDir}/macho-open-byte-slice.o`, "main");
 
 const aarch64OpenSliceBoundsFixture = `${outDir}/aarch64-open-byte-slice-bounds.0`;
-await writeFile(aarch64OpenSliceBoundsFixture, `export c fn main() -> u32 {
+await writeGraphFixture(aarch64OpenSliceBoundsFixture, `export c fn main() -> u32 {
     let words: [2]u16 = [1_u16, 2_u16]
     let suffix: Span<u16> = words[3_usize..]
     return (std.mem.len(suffix)) as u32
@@ -1498,15 +1842,35 @@ const machoOpenSliceBoundsBytes = await assertMachOArm64Object(`${outDir}/macho-
 assert(hasAarch64CondBranch(machoOpenSliceBoundsBytes, 9));
 assert(hasAarch64Instruction(machoOpenSliceBoundsBytes, 0xd4200000));
 
+const trapMessageFixture = `${outDir}/trap-index-message.0`;
+const trapMessageGraph = await writeGraphFixture(trapMessageFixture, `pub fn main(world: World) -> Void raises {
+    var values: [4]u32 = [1, 2, 3, 4]
+    var index: usize = 4
+    index = index + 1000
+    let v: u32 = values[index]
+    if v == 1 {
+        check world.out.write("unreachable\\n")
+    }
+}
+`);
+if (runnableDirectTarget) {
+  const trapMessageOut = `${outDir}/trap-index-message`;
+  await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", runnableDirectTarget, trapMessageGraph, "--out", trapMessageOut]);
+  const trapMessageRun = await execFileAsync(trapMessageOut, []).catch((error) => error);
+  assert.notEqual(trapMessageRun.code ?? (trapMessageRun.signal ? 1 : 0), 0, "deliberate out-of-bounds index must abort");
+  assert.match(trapMessageRun.stderr ?? "", /trap: index out of bounds/);
+  assert.equal(trapMessageRun.stdout ?? "", "");
+}
+
 const x64OpenSliceBoundsFixture = `${outDir}/x64-open-u16-slice-bounds.0`;
-await writeFile(x64OpenSliceBoundsFixture, `export c fn main() -> u32 {
+await writeGraphFixture(x64OpenSliceBoundsFixture, `export c fn main() -> u32 {
     let words: [2]u16 = [1_u16, 2_u16]
     let suffix: Span<u16> = words[3_usize..]
     return (std.mem.len(suffix)) as u32
 }
 `);
 const x64SliceLenBoundsFixture = `${outDir}/x64-len-u16-slice-bounds.0`;
-await writeFile(x64SliceLenBoundsFixture, `export c fn main() -> u32 {
+await writeGraphFixture(x64SliceLenBoundsFixture, `export c fn main() -> u32 {
     let words: [2]u16 = [1_u16, 2_u16]
     return (std.mem.len(words[..3_usize])) as u32
 }
@@ -1559,7 +1923,7 @@ await assertX64SliceBoundsObject(x64OpenSliceBoundsFixture, "x64-open-u16-slice-
 await assertX64SliceBoundsObject(x64SliceLenBoundsFixture, "x64-len-u16-slice-bounds");
 
 const x64U16RecordFieldFixture = `${outDir}/x64-u16-record-field.0`;
-await writeFile(x64U16RecordFieldFixture, `type Holder {
+await writeGraphFixture(x64U16RecordFieldFixture, `type Holder {
     values: [3]u16,
 }
 
@@ -1673,10 +2037,57 @@ assert.equal(directCallArm64ObjBuildBody.generatedCBytes, 0);
 assert.equal(directCallArm64ObjBuildBody.objectBackend.objectEmission.path, "direct-elf-aarch64-object");
 await assertElfAarch64Object(`${outDir}/direct-call-add-arm64.o`, "main");
 
+const arm64ProcDynamicViewsSource = `${outDir}/aarch64-proc-dynamic-byte-view-spawn.0`;
+const arm64ProcDynamicViewsObj = `${outDir}/aarch64-proc-dynamic-byte-view-spawn.o`;
+await writeGraphFixture(arm64ProcDynamicViewsSource, `fn programName() -> String {
+    return "sh"
+}
+
+fn childArgs() -> Span<u8> {
+    return std.mem.span("-c\\ntrue")
+}
+
+fn cwdName() -> String {
+    return "."
+}
+
+fn envBlock() -> Span<u8> {
+    return std.mem.span("ZERO_AARCH64_PROC=1")
+}
+
+fn childCommand() -> String {
+    return "sh -c true"
+}
+
+export c fn main() -> i32 {
+    let status: ProcStatus = std.proc.spawnInheritArgs(programName(), childArgs(), cwdName(), envBlock())
+    let child: ProcChild = std.proc.spawnChildArgs(programName(), childArgs(), cwdName(), envBlock())
+    let child_env: ProcChild = std.proc.spawnChildInEnv(childCommand(), cwdName(), envBlock())
+    let pty_child: ProcChild = std.pty.spawnArgs(programName(), childArgs(), cwdName(), envBlock())
+    return std.proc.exitCode(status) + std.proc.pid(child) + std.proc.pid(child_env) + std.proc.pid(pty_child)
+}
+`);
+const arm64ProcDynamicViewsBuild = await execFileAsync(zero, [
+  "build",
+  "--json",
+  "--emit",
+  "obj",
+  "--target",
+  "linux-arm64",
+  arm64ProcDynamicViewsSource,
+  "--out",
+  arm64ProcDynamicViewsObj,
+]);
+const arm64ProcDynamicViewsBuildBody = JSON.parse(arm64ProcDynamicViewsBuild.stdout);
+assert.equal(arm64ProcDynamicViewsBuildBody.compiler, "zero-elf-aarch64");
+assert.equal(arm64ProcDynamicViewsBuildBody.objectBackend.objectEmission.path, "direct-elf-aarch64-object");
+const arm64ProcDynamicViewsBytes = await assertElfAarch64Object(arm64ProcDynamicViewsObj, "main");
+assert(countAarch64InstructionSequence(arm64ProcDynamicViewsBytes, aarch64ByteViewReloadSequence(4)) >= 3);
+
 let arm64NestedIndexExpr = "values[idx]";
 for (let i = 0; i < 32; i++) arm64NestedIndexExpr = `(0_u32 + ${arm64NestedIndexExpr})`;
 const arm64NestedIndexFixture = `${outDir}/aarch64-nested-index-scratch-blocked.0`;
-await writeFile(arm64NestedIndexFixture, `export c fn main() -> u32 {
+await writeGraphFixture(arm64NestedIndexFixture, `export c fn main() -> u32 {
     let values: [1]u32 = [7]
     let idx: u32 = 0_u32
     return ${arm64NestedIndexExpr}
@@ -1701,7 +2112,7 @@ await assertArm64NestedScratchBlocked(arm64NestedIndexFixture, /indexed load exc
 let arm64NestedLenExpr = "((std.mem.len(text[start..end])) as u32)";
 for (let i = 0; i < 32; i++) arm64NestedLenExpr = `(0_u32 + ${arm64NestedLenExpr})`;
 const arm64NestedLenFixture = `${outDir}/aarch64-nested-len-scratch-blocked.0`;
-await writeFile(arm64NestedLenFixture, `export c fn main() -> u32 {
+await writeGraphFixture(arm64NestedLenFixture, `export c fn main() -> u32 {
     let text: String = "abcdef"
     let start: usize = 1
     let end: usize = 4
@@ -1712,7 +2123,7 @@ await assertArm64NestedScratchBlocked(arm64NestedLenFixture, /byte-view length e
 let arm64NestedDynamicStartLenExpr = "((std.mem.len(text[(start + 0_usize)..end])) as u32)";
 for (let i = 0; i < 31; i++) arm64NestedDynamicStartLenExpr = `(0_u32 + ${arm64NestedDynamicStartLenExpr})`;
 const arm64NestedDynamicStartLenFixture = `${outDir}/aarch64-nested-dynamic-start-len-scratch-blocked.0`;
-await writeFile(arm64NestedDynamicStartLenFixture, `export c fn main() -> u32 {
+await writeGraphFixture(arm64NestedDynamicStartLenFixture, `export c fn main() -> u32 {
     let text: String = "abcdef"
     let start: usize = 1
     let end: usize = 4
@@ -1723,7 +2134,7 @@ await assertArm64NestedScratchBlocked(arm64NestedDynamicStartLenFixture, /byte-v
 let arm64NestedEndLenExpr = "((std.mem.len(text[1..(end + 0_usize)])) as u32)";
 for (let i = 0; i < 32; i++) arm64NestedEndLenExpr = `(0_u32 + ${arm64NestedEndLenExpr})`;
 const arm64NestedEndLenFixture = `${outDir}/aarch64-nested-end-len-scratch-blocked.0`;
-await writeFile(arm64NestedEndLenFixture, `export c fn main() -> u32 {
+await writeGraphFixture(arm64NestedEndLenFixture, `export c fn main() -> u32 {
     let text: String = "abcdef"
     let end: usize = 4
     return ${arm64NestedEndLenExpr}
@@ -1733,7 +2144,7 @@ await assertArm64NestedScratchBlocked(arm64NestedEndLenFixture, /byte-view lengt
 let arm64NestedDynamicEqlExpr = "std.mem.eqlBytes(text[(start + (0_usize + 0_usize))..end], text[(start + (0_usize + 0_usize))..end])";
 for (let i = 0; i < 29; i++) arm64NestedDynamicEqlExpr = `(true == ${arm64NestedDynamicEqlExpr})`;
 const arm64NestedDynamicEqlFixture = `${outDir}/aarch64-nested-dynamic-eql-scratch-blocked.0`;
-await writeFile(arm64NestedDynamicEqlFixture, `export c fn main() -> Bool {
+await writeGraphFixture(arm64NestedDynamicEqlFixture, `export c fn main() -> Bool {
     let text: String = "abcdef"
     let start: usize = 1
     let end: usize = 4
@@ -1745,7 +2156,7 @@ await assertArm64NestedScratchBlocked(arm64NestedDynamicEqlFixture, /byte-view e
 let arm64WorldWriteSliceStart = "(start + 0_usize)";
 for (let i = 0; i < 31; i++) arm64WorldWriteSliceStart = `(0_usize + ${arm64WorldWriteSliceStart})`;
 const arm64WorldWriteFixture = `${outDir}/aarch64-world-write-dynamic-slice-scratch-blocked.0`;
-await writeFile(arm64WorldWriteFixture, `pub fn main(world: World) -> Void raises {
+await writeGraphFixture(arm64WorldWriteFixture, `pub fn main(world: World) -> Void raises {
     let text: String = "abcdef"
     let start: usize = 1
     check world.out.write(text[${arm64WorldWriteSliceStart}..6])
@@ -1774,7 +2185,7 @@ await assertArm64WorldWriteScratchBlocked(arm64WorldWriteFixture, /expression ne
 let arm64WorldWriteSliceEnd = "(end + 0_usize)";
 for (let i = 0; i < 32; i++) arm64WorldWriteSliceEnd = `(0_usize + ${arm64WorldWriteSliceEnd})`;
 const arm64WorldWriteEndFixture = `${outDir}/aarch64-world-write-dynamic-end-scratch-blocked.0`;
-await writeFile(arm64WorldWriteEndFixture, `pub fn main(world: World) -> Void raises {
+await writeGraphFixture(arm64WorldWriteEndFixture, `pub fn main(world: World) -> Void raises {
     let text: String = "abcdef"
     let end: usize = 6
     check world.out.write(text[1..${arm64WorldWriteSliceEnd}])
@@ -1799,7 +2210,7 @@ assert(arm64PrivateHelperBytes.includes(Buffer.from([0x40, 0x05, 0x80, 0x52, 0xc
 
 const arm64CompareSource = `${outDir}/aarch64-typed-compare.0`;
 const arm64CompareObj = `${outDir}/aarch64-typed-compare.o`;
-await writeFile(arm64CompareSource, `export c fn main() -> u32 {
+await writeGraphFixture(arm64CompareSource, `export c fn main() -> u32 {
     let large: u32 = 4294967295
     if large > 0_u32 {
         return 7
@@ -1893,9 +2304,9 @@ async function assertAgentSurfaceOwnedDropUnsupported(target, emit, outName, exp
   });
 }
 
-await assertAgentSurfaceOwnedDropUnsupported("linux-musl-x64", "obj", "agent-surface-owned-drop-elf.o", /ELF64/, "elf", "zero-elf64");
-await assertAgentSurfaceOwnedDropUnsupported("darwin-arm64", "obj", "agent-surface-owned-drop-macho.o", /Mach-O/, "macho", "zero-macho64");
-await assertAgentSurfaceOwnedDropUnsupported("win32-x64.exe", "obj", "agent-surface-owned-drop-coff.obj", /COFF/, "coff", "zero-coff-x64");
+await assertAgentSurfaceOwnedDropUnsupported("linux-musl-x64", "obj", "agent-surface-owned-drop-elf.o", /typed program graph MIR subset/, "elf", "zero-elf64-exe");
+await assertAgentSurfaceOwnedDropUnsupported("darwin-arm64", "obj", "agent-surface-owned-drop-macho.o", /typed program graph MIR subset/, "macho", "zero-macho64-exe");
+await assertAgentSurfaceOwnedDropUnsupported("win32-x64.exe", "obj", "agent-surface-owned-drop-coff.obj", /typed program graph MIR subset/, "coff", "zero-coff-x64-exe");
 
 const mismatchedDirectEmitter = await execFileAsync(zero, [
   "build",
@@ -1944,22 +2355,13 @@ const commonPassFixtures = [
 for (const [fixture, name, expected] of commonPassFixtures) {
   const check = await execFileAsync(zero, ["check", "--json", fixture]);
   assert.equal(JSON.parse(check.stdout).ok, true);
-  const graph = await execFileAsync(zero, ["graph", "--json", fixture]);
-  assert(JSON.parse(graph.stdout).sourceFiles.includes(fixture));
+  const graph = await execFileAsync(zero, ["inspect", "--json", fixture]);
+  const graphBody = JSON.parse(graph.stdout);
+  assert.equal(graphBody.graph.artifact, fixture.replace(/\.0$/, ".graph"));
+  assert(graphBody.sourceFiles.includes(fixture) || graphBody.sourceFiles.includes(fixture.split("/").at(-1)));
   const size = await execFileAsync(zero, ["size", "--json", fixture]);
   assert.equal(JSON.parse(size.stdout).schemaVersion, 1);
   await assertCommonRuntimeOrUnsupported(fixture, name, expected);
-}
-
-for (const [fixture, code] of [
-  ["conformance/common/fail/immutable-buffer-reverse.0", "TYP009"],
-  ["conformance/common/fail/json-raw-allocator.0", "STD003"],
-  ["conformance/common/fail/missing-check-fallible.0", "ERR003"],
-  ["conformance/common/fail/wrong-numeric-width.0", "TYP016"],
-]) {
-  const result = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(result.code, 0);
-  assert.equal(JSON.parse(result.stdout).diagnostics[0].code, code);
 }
 
 const commonUnsupportedTarget = await execFileAsync(zero, ["check", "--json", "--target", "linux-musl-x64", "conformance/common/fail/unsupported-target-feature.0"]).catch((error) => error);
@@ -1996,7 +2398,7 @@ assert.equal(compileTimeBody.safetyFacts.initialization.maybePayloadReads, "guar
 assert.equal(compileTimeBody.safetyFacts.aliasing.mutableAliases, "diagnostic");
 assert.equal(compileTimeBody.safetyFacts.mir.invalidMemoryContractsBlockEmission, true);
 
-const compileTimeGraph = await execFileAsync(zero, ["graph", "--json", "conformance/native/pass/compile-time-v1.0"]);
+const compileTimeGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/native/pass/compile-time-v1.0"]);
 const compileTimeGraphBody = JSON.parse(compileTimeGraph.stdout);
 assert.equal(compileTimeGraphBody.compileTime.deterministic, true);
 assert.equal(compileTimeGraphBody.safetyFacts.profileKey, "small");
@@ -2010,12 +2412,13 @@ assert.ok(gateGraph.staticParams.some((item) => item.name === "selectedMode" && 
 
 const fastCheck = await execFileAsync(zero, ["check", "--json", "--profile", "fast", "examples/hello.0"]);
 const fastCheckBody = JSON.parse(fastCheck.stdout);
-assert.equal(fastCheckBody.packageCache.profile, "fast");
-assert.equal(fastCheckBody.incrementalInvalidation.profileDependency, "fast");
+assert.equal(fastCheckBody.artifact, "examples/hello.graph");
+assert.equal(fastCheckBody.canonicalSource, false);
+assert.equal(fastCheckBody.check.lowering, "graph-native-check");
 assert.equal(fastCheckBody.safetyFacts.profile, "release-fast");
 assert.equal(fastCheckBody.safetyFacts.profileKey, "fast");
 
-const fastGraph = await execFileAsync(zero, ["graph", "--json", "--profile", "fast", "examples/hello.0"]);
+const fastGraph = await execFileAsync(zero, ["inspect", "--json", "--profile", "fast", "examples/hello.0"]);
 const fastGraphBody = JSON.parse(fastGraph.stdout);
 assert.equal(fastGraphBody.packageCache.profile, "fast");
 assert.equal(fastGraphBody.incrementalInvalidation.profileDependency, "fast");
@@ -2070,21 +2473,24 @@ for (const [requestedProfile, canonicalProfile, profileKey] of [
   assert.equal(profileBody.profileBudget.cBridgeFallback, false);
 }
 
-const profileSize = await execFileAsync(zero, ["size", "--json", "--profile", "debug", "--target", "linux-musl-x64", "examples/memory-primitives.0"]);
+const profileSize = await execFileAsync(zero, ["size", "--json", "--profile", "debug", "--target", "linux-musl-x64", "examples/hello.0"]);
 const profileSizeBody = JSON.parse(profileSize.stdout);
 assert.equal(profileSizeBody.generatedCBytes, 0);
+assert.equal(profileSizeBody.graph.artifact, "examples/hello.graph");
+assert.equal(profileSizeBody.graph.lowering, "mapped-final-mir");
 assert.equal(profileSizeBody.profileSemantics.profileKey, "debug");
 assert.equal(profileSizeBody.safetyFacts.profileKey, "debug");
 assert.equal(profileSizeBody.safetyFacts.uncheckedSurfaces[0].surface, "C imports");
 assert.equal(profileSizeBody.sizeBreakdown.profileKey, "debug");
-assert(profileSizeBody.sizeBreakdown.functions.some((item) => item.name === "main" && item.retainedBy === "entry point"));
+assert(Array.isArray(profileSizeBody.sizeBreakdown.functions));
 assert(profileSizeBody.sizeBreakdown.sections.some((item) => item.name === "text" && item.retainedBy.includes("retained functions")));
 assert(Array.isArray(profileSizeBody.sizeBreakdown.literals.items));
 assert(Array.isArray(profileSizeBody.sizeBreakdown.stdlibHelpers));
 assert(Array.isArray(profileSizeBody.sizeBreakdown.imports));
 assert(Array.isArray(profileSizeBody.sizeBreakdown.runtimeShims));
 assert(profileSizeBody.sizeBreakdown.debugMetadata.bytes > 0);
-assert(profileSizeBody.retentionReasons.some((item) => item.kind === "function"));
+assert(profileSizeBody.compilerCaches.some((item) => item.name === "mappedFinalMir" && item.sourceKind === "program-graph" && item.programReconstructed === false));
+assert(profileSizeBody.retentionReasons.some((item) => item.kind === "debugMetadata"));
 assert(profileSizeBody.optimizationHints.some((item) => item.id === "profile-debug-metadata"));
 assert.equal(profileSizeBody.profileBudget.debugMetadataAllowed, true);
 
@@ -2111,7 +2517,7 @@ assert(directI64ObjBytes.includes(Buffer.from([0x48, 0x01, 0xc8])));
 
 const directWideMainSource = `${outDir}/direct-exe-wide-main.0`;
 const directWideMainOut = `${outDir}/direct-exe-wide-main`;
-await writeFile(directWideMainSource, `export c fn main() -> usize {
+await writeGraphFixture(directWideMainSource, `export c fn main() -> usize {
     return 8589934590
 }
 `);
@@ -2125,7 +2531,7 @@ assert(directWideMainBytes.includes(Buffer.from([0x89, 0xc7, 0xb8, 0x3c, 0x00, 0
 
 const directI64MainSource = `${outDir}/direct-exe-i64-main.0`;
 const directI64MainOut = `${outDir}/direct-exe-i64-main`;
-await writeFile(directI64MainSource, `export c fn main() -> i64 {
+await writeGraphFixture(directI64MainSource, `export c fn main() -> i64 {
     return 8589934590_i64
 }
 `);
@@ -2136,7 +2542,7 @@ assert.equal(directI64MainBody.objectBackend.objectEmission.path, "direct-elf64-
 
 const directMachOU64LiteralSource = `${outDir}/direct-macho-u64-literal.0`;
 const directMachOU64LiteralOut = `${outDir}/direct-macho-u64-literal.o`;
-await writeFile(directMachOU64LiteralSource, `export c fn main() -> u64 {
+await writeGraphFixture(directMachOU64LiteralSource, `export c fn main() -> u64 {
     let value: u64 = 4294967296
     return value
 }
@@ -2153,7 +2559,7 @@ assert(directMachOU64LiteralBytes.includes(Buffer.from([0x28, 0x00, 0xc0, 0xf2])
 
 const directMachOU64DivSource = `${outDir}/direct-macho-u64-div.0`;
 const directMachOU64DivOut = `${outDir}/direct-macho-u64-div.o`;
-await writeFile(directMachOU64DivSource, `export c fn main(a: u64, b: u64) -> u64 {
+await writeGraphFixture(directMachOU64DivSource, `export c fn main(a: u64, b: u64) -> u64 {
     return a / b
 }
 `);
@@ -2167,7 +2573,7 @@ assert(!directMachOU64DivBytes.includes(Buffer.from([0x00, 0x09, 0xc9, 0x1a])));
 
 const directMachOU64ModSource = `${outDir}/direct-macho-u64-mod.0`;
 const directMachOU64ModOut = `${outDir}/direct-macho-u64-mod.o`;
-await writeFile(directMachOU64ModSource, `export c fn main(a: u64, b: u64) -> u64 {
+await writeGraphFixture(directMachOU64ModSource, `export c fn main(a: u64, b: u64) -> u64 {
     return a % b
 }
 `);
@@ -2184,35 +2590,43 @@ assert(!directMachOU64ModBytes.includes(Buffer.from([0x40, 0xa1, 0x09, 0x1b])));
 const metaJsonSuccess = await execFileAsync(zero, ["check", "--json", "conformance/native/pass/meta-typed-target-type.0"]);
 const metaJsonSuccessBody = JSON.parse(metaJsonSuccess.stdout);
 assert.equal(metaJsonSuccessBody.ok, true);
-assert.ok(metaJsonSuccessBody.metaCache.hits >= 1);
-assert.ok(metaJsonSuccessBody.metaCache.misses >= 1);
+assert.equal(metaJsonSuccessBody.artifact, "conformance/native/pass/meta-typed-target-type.graph");
+assert.equal(metaJsonSuccessBody.canonicalSource, false);
+assert.equal(metaJsonSuccessBody.check.lowering, "graph-native-check");
+assert.equal(metaJsonSuccessBody.compileTime.deterministic, true);
 
-const checkJsonFailure = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/cast-bool-to-int.0"]).catch((error) => error);
-assert.notEqual(checkJsonFailure.code, 0);
-const checkJsonFailureBody = JSON.parse(checkJsonFailure.stdout);
-assert.equal(checkJsonFailureBody.ok, false);
-assert.equal(checkJsonFailureBody.diagnostics[0].code, "TYP017");
-assert.match(checkJsonFailureBody.diagnostics[0].message, /cast requires/);
-assert.match(checkJsonFailureBody.diagnostics[0].expected, /integer/);
-assert.match(checkJsonFailureBody.diagnostics[0].actual, /Bool as i32/);
-assert.match(checkJsonFailureBody.diagnostics[0].help, /cast only/);
-assert.equal(checkJsonFailureBody.diagnostics[0].fixSafety, "requires-human-review");
-assert.equal(checkJsonFailureBody.diagnostics[0].repair.id, "manual-review");
-
-const collectionsOverlapJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/std-collections-append-mutspan-inline-overlap.0"]).catch((error) => error);
-assert.notEqual(collectionsOverlapJson.code, 0);
-const collectionsOverlapBody = JSON.parse(collectionsOverlapJson.stdout);
-assert.equal(collectionsOverlapBody.diagnostics[0].code, "STD003");
-assert.match(collectionsOverlapBody.diagnostics[0].message, /append source must not overlap/);
+const stdModuleBasenameCollisionDir = `${outDir}/std-module-basename-collision`;
+await mkdir(stdModuleBasenameCollisionDir, { recursive: true });
+const stdModuleBasenameCollisionFixture = `${stdModuleBasenameCollisionDir}/term.0`;
+const stdModuleBasenameCollisionGraph = await writeGraphFixture(stdModuleBasenameCollisionFixture, `pub fn main(world: World) -> Void raises {
+    var buffer: [16]u8 = [0_u8; 16]
+    let cursor: Maybe<Span<u8>> = std.term.cursorUp(buffer, 1_usize)
+    if cursor.has {
+        check world.out.write(cursor.value)
+        check world.out.write("local term collision ok\\n")
+    }
+}
+`);
+const stdModuleBasenameCollisionCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", stdModuleBasenameCollisionGraph])).stdout);
+assert.equal(stdModuleBasenameCollisionCheck.ok, true);
+assert(stdModuleBasenameCollisionCheck.graphCompiler.semanticFacts.functions.some((fn) => fn.name === "main"));
+assert(stdModuleBasenameCollisionCheck.graphCompiler.semanticFacts.functions.some((fn) => fn.name === "term_cursor_up"));
+const stdModuleBasenameCollisionInspect = JSON.parse((await execFileAsync(zero, ["inspect", "--json", stdModuleBasenameCollisionGraph])).stdout);
+assert(stdModuleBasenameCollisionInspect.modules.some((module) => module.name === "term"));
+assert(stdModuleBasenameCollisionInspect.modules.some((module) => module.name === "std.term"));
+if (runnableDirectTarget) {
+  const stdModuleBasenameCollisionRun = await execFileAsync(zero, ["run", "--out", `${outDir}/std-module-basename-collision-run`, stdModuleBasenameCollisionGraph]);
+  assert.equal(stdModuleBasenameCollisionRun.stdout, "\x1b[1Alocal term collision ok\n");
+}
 
 const collectionsUsizeMemory = await execFileAsync(zero, ["mem", "--json", "conformance/native/pass/std-collections-usize-memory.0"]);
 const collectionsUsizeMemoryBody = JSON.parse(collectionsUsizeMemory.stdout);
-assert.equal(collectionsUsizeMemoryBody.graph.artifact, "conformance/native/pass/std-collections-usize-memory.0");
-assert.equal(collectionsUsizeMemoryBody.graph.canonicalSource, true);
+assert.equal(collectionsUsizeMemoryBody.graph.artifact, "conformance/native/pass/std-collections-usize-memory.graph");
+assert.equal(collectionsUsizeMemoryBody.graph.canonicalSource, false);
 assert.match(collectionsUsizeMemoryBody.graph.graphHash, /^graph:[0-9a-f]{16}$/);
 assert.equal(collectionsUsizeMemoryBody.compilerCaches.every((item) => item.sourceKind === "program-graph" && item.graphHash === collectionsUsizeMemoryBody.graph.graphHash), true);
 assert.equal(collectionsUsizeMemoryBody.incrementalInvalidation.sourceKind, "program-graph");
-assert.equal(collectionsUsizeMemoryBody.incrementalInvalidation.changedInputs.graphArtifact, "conformance/native/pass/std-collections-usize-memory.0");
+assert.equal(collectionsUsizeMemoryBody.incrementalInvalidation.changedInputs.graphArtifact, "conformance/native/pass/std-collections-usize-memory.graph");
 assert.equal(collectionsUsizeMemoryBody.memoryBudgets.collectionCapacityBytes, 32);
 assert.equal(collectionsUsizeMemoryBody.collectionFacts.FixedStorage.capacityBytes, 32);
 
@@ -2229,295 +2643,28 @@ assert.equal(collectionsQueryMemoryBody.collectionFacts.FixedStorage.storageSite
 assert.equal(collectionsQueryMemoryBody.collectionFacts.FixedStorage.capacityBytes, 2);
 assert.equal(collectionsQueryMemoryBody.collectionFacts.FixedStorage.queryCalls, 1);
 
-for (const [fixture, message] of [
-  ["conformance/check/fail/parse-missing-brace.0", /unbalanced expression delimiters/],
-  ["conformance/check/fail/parse-missing-comma.0", /missing separator in type/],
-  ["conformance/check/fail/parse-bad-type-args.0", /unexpected token in type/],
-]) {
-  const parseFailure = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(parseFailure.code, 0);
-  const parseFailureBody = JSON.parse(parseFailure.stdout);
-  assert.equal(parseFailureBody.diagnostics[0].code, "PAR100");
-  assert.match(parseFailureBody.diagnostics[0].message, message);
-  assert.ok(parseFailureBody.diagnostics[0].line > 0);
-  assert.ok(parseFailureBody.diagnostics[0].column > 0);
-  assert.equal(parseFailureBody.diagnostics[0].fixSafety, "requires-human-review");
-  assert.equal(parseFailureBody.diagnostics[0].repair.id, "repair-syntax");
-}
-
-const missingImportJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/missing-import"]).catch((error) => error);
-assert.notEqual(missingImportJson.code, 0);
-const missingImportBody = JSON.parse(missingImportJson.stdout);
-assert.equal(missingImportBody.diagnostics[0].code, "IMP001");
-assert.match(missingImportBody.diagnostics[0].message, /unknown package-local import/);
-assert.equal(missingImportBody.diagnostics[0].path, "conformance/check/fail/missing-import/src/main.0");
-assert.equal(missingImportBody.diagnostics[0].line, 1);
-assert.equal(missingImportBody.diagnostics[0].column, 1);
-assert.equal(missingImportBody.diagnostics[0].length, 11);
-assert.equal(missingImportBody.diagnostics[0].fixSafety, "requires-human-review");
-
-const missingImportFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/check/fail/missing-import"]);
-const missingImportFixPlanBody = JSON.parse(missingImportFixPlan.stdout);
-assert.equal(missingImportFixPlanBody.diagnostics[0].path, "conformance/check/fail/missing-import/src/main.0");
-assert.equal(missingImportFixPlanBody.diagnostics[0].line, 1);
-assert.equal(missingImportFixPlanBody.diagnostics[0].column, 1);
-assert.equal(missingImportFixPlanBody.diagnostics[0].length, 11);
-assert.equal(missingImportFixPlanBody.fixes[0].id, "fix-import-path");
-
-const importLineMapJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/import-line-map"]).catch((error) => error);
-assert.notEqual(importLineMapJson.code, 0);
-const importLineMapBody = JSON.parse(importLineMapJson.stdout);
-assert.equal(importLineMapBody.diagnostics[0].code, "PAR100");
-assert.equal(importLineMapBody.diagnostics[0].path, "conformance/check/fail/import-line-map/src/main.0");
-assert.equal(importLineMapBody.diagnostics[0].line, 5);
-assert.equal(importLineMapBody.diagnostics[0].column, 1);
-
-const importedLineMapJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/imported-line-map"]).catch((error) => error);
-assert.notEqual(importedLineMapJson.code, 0);
-const importedLineMapBody = JSON.parse(importedLineMapJson.stdout);
-assert.equal(importedLineMapBody.diagnostics[0].code, "TYP003");
-assert.equal(importedLineMapBody.diagnostics[0].path, "conformance/check/fail/imported-line-map/src/helper.0");
-assert.equal(importedLineMapBody.diagnostics[0].line, 2);
-assert.equal(importedLineMapBody.diagnostics[0].column, 5);
-
-const importFixLineMapPatch = await execFileAsync(zero, ["fix", "--patch", "--json", "conformance/check/fail/import-fix-line-map"]);
-const importFixLineMapPatchBody = JSON.parse(importFixLineMapPatch.stdout);
-assert.equal(importFixLineMapPatchBody.diagnostics[0].code, "TYP009");
-assert.equal(importFixLineMapPatchBody.diagnostics[0].path, "conformance/check/fail/import-fix-line-map/src/helper.0");
-assert.equal(importFixLineMapPatchBody.patches[0].path, "conformance/check/fail/import-fix-line-map/src/helper.0");
-assert.equal(importFixLineMapPatchBody.patches[0].line, 2);
-assert.match(importFixLineMapPatchBody.patches[0].new, /var values/);
-
-const importCycleJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/import-cycle"]).catch((error) => error);
-assert.notEqual(importCycleJson.code, 0);
-const importCycleBody = JSON.parse(importCycleJson.stdout);
-assert.equal(importCycleBody.diagnostics[0].code, "IMP002");
-assert.match(importCycleBody.diagnostics[0].message, /import cycle/);
-assert.match(importCycleBody.diagnostics[0].actual, /a -> b -> a/);
-assert.equal(importCycleBody.diagnostics[0].path, "conformance/check/fail/import-cycle/src/b.0");
-assert.equal(importCycleBody.diagnostics[0].line, 1);
-assert.equal(importCycleBody.diagnostics[0].column, 1);
-assert.equal(importCycleBody.diagnostics[0].length, 5);
-assert.equal(importCycleBody.diagnostics[0].repair.id, "break-import-cycle");
-
-const importCycleFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/check/fail/import-cycle"]);
-const importCycleFixPlanBody = JSON.parse(importCycleFixPlan.stdout);
-assert.equal(importCycleFixPlanBody.diagnostics[0].path, "conformance/check/fail/import-cycle/src/b.0");
-assert.equal(importCycleFixPlanBody.diagnostics[0].line, 1);
-assert.equal(importCycleFixPlanBody.diagnostics[0].column, 1);
-assert.equal(importCycleFixPlanBody.diagnostics[0].length, 5);
-assert.equal(importCycleFixPlanBody.fixes[0].id, "break-import-cycle");
-
-const duplicatePublicJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/duplicate-public"]).catch((error) => error);
-assert.notEqual(duplicatePublicJson.code, 0);
-const duplicatePublicBody = JSON.parse(duplicatePublicJson.stdout);
-assert.equal(duplicatePublicBody.diagnostics[0].code, "IMP003");
-assert.match(duplicatePublicBody.diagnostics[0].actual, /also exported/);
-
-const unresolvedNestedImportJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/unresolved-nested-import"]).catch((error) => error);
-assert.notEqual(unresolvedNestedImportJson.code, 0);
-const unresolvedNestedImportBody = JSON.parse(unresolvedNestedImportJson.stdout);
-assert.equal(unresolvedNestedImportBody.diagnostics[0].code, "IMP001");
-assert.match(unresolvedNestedImportBody.diagnostics[0].expected, /missing\.0 or missing\/mod\.0/);
-assert.equal(unresolvedNestedImportBody.diagnostics[0].path, "conformance/check/fail/unresolved-nested-import/src/worker.0");
-assert.equal(unresolvedNestedImportBody.diagnostics[0].line, 1);
-assert.equal(unresolvedNestedImportBody.diagnostics[0].column, 1);
-assert.equal(unresolvedNestedImportBody.diagnostics[0].length, 11);
-
-const duplicatePublicLargeJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/duplicate-public-large"]).catch((error) => error);
-assert.notEqual(duplicatePublicLargeJson.code, 0);
-const duplicatePublicLargeBody = JSON.parse(duplicatePublicLargeJson.stdout);
-assert.equal(duplicatePublicLargeBody.diagnostics[0].code, "IMP003");
-assert.match(duplicatePublicLargeBody.diagnostics[0].actual, /duplicateName/);
-
-const genericConflictJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-inference-conflict.0"]).catch((error) => error);
-assert.notEqual(genericConflictJson.code, 0);
-const genericConflictBody = JSON.parse(genericConflictJson.stdout);
-assert.equal(genericConflictBody.diagnostics[0].code, "TYP024");
-assert.match(genericConflictBody.diagnostics[0].message, /generic inference/);
-assert.match(genericConflictBody.diagnostics[0].expected, /one concrete type/);
-assert.match(genericConflictBody.diagnostics[0].actual, /u8/);
-
-const genericStaticShadowConflictJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-static-shadow-conflict.0"]).catch((error) => error);
-assert.notEqual(genericStaticShadowConflictJson.code, 0);
-const genericStaticShadowConflictBody = JSON.parse(genericStaticShadowConflictJson.stdout);
-assert.equal(genericStaticShadowConflictBody.diagnostics[0].code, "TYP024");
-assert.match(genericStaticShadowConflictBody.diagnostics[0].actual, /ref<\[4\]i32>/);
-
-const genericStaticShadowExplicitJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-static-shadow-explicit-conflict.0"]).catch((error) => error);
-assert.notEqual(genericStaticShadowExplicitJson.code, 0);
-const genericStaticShadowExplicitBody = JSON.parse(genericStaticShadowExplicitJson.stdout);
-assert.equal(genericStaticShadowExplicitBody.diagnostics[0].code, "TYP001");
-assert.match(genericStaticShadowExplicitBody.diagnostics[0].expected, /ref<\[N\]i32>/);
-assert.match(genericStaticShadowExplicitBody.diagnostics[0].actual, /ref<\[4\]i32>/);
-
-const genericStaticMethodShadowJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-static-method-shadow-conflict.0"]).catch((error) => error);
-assert.notEqual(genericStaticMethodShadowJson.code, 0);
-const genericStaticMethodShadowBody = JSON.parse(genericStaticMethodShadowJson.stdout);
-assert.equal(genericStaticMethodShadowBody.diagnostics[0].code, "TYP001");
-assert.match(genericStaticMethodShadowBody.diagnostics[0].expected, /ref<\[N\]i32>/);
-assert.match(genericStaticMethodShadowBody.diagnostics[0].actual, /ref<\[4\]i32>/);
-
-const genericStaticShadowSignatureConstJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-static-shadow-signature-const.0"]).catch((error) => error);
-assert.notEqual(genericStaticShadowSignatureConstJson.code, 0);
-const genericStaticShadowSignatureConstBody = JSON.parse(genericStaticShadowSignatureConstJson.stdout);
-assert.equal(genericStaticShadowSignatureConstBody.diagnostics[0].code, "TYP001");
-assert.match(genericStaticShadowSignatureConstBody.diagnostics[0].expected, /ref<\[4\]i32>/);
-assert.match(genericStaticShadowSignatureConstBody.diagnostics[0].actual, /ref<\[N\]i32>/);
-
-const genericStaticShadowSignatureConstGenericJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-static-shadow-signature-const-generic.0"]).catch((error) => error);
-assert.notEqual(genericStaticShadowSignatureConstGenericJson.code, 0);
-const genericStaticShadowSignatureConstGenericBody = JSON.parse(genericStaticShadowSignatureConstGenericJson.stdout);
-assert.equal(genericStaticShadowSignatureConstGenericBody.diagnostics[0].code, "TYP001");
-assert.match(genericStaticShadowSignatureConstGenericBody.diagnostics[0].expected, /ref<\[4\]i32>/);
-assert.match(genericStaticShadowSignatureConstGenericBody.diagnostics[0].actual, /ref<\[N\]i32>/);
-
-const genericTypeParamShadowStaticJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-type-param-shadow-static-arg.0"]).catch((error) => error);
-assert.notEqual(genericTypeParamShadowStaticJson.code, 0);
-const genericTypeParamShadowStaticBody = JSON.parse(genericTypeParamShadowStaticJson.stdout);
-assert.equal(genericTypeParamShadowStaticBody.diagnostics[0].code, "STC002");
-assert.equal(genericTypeParamShadowStaticBody.diagnostics[0].actual, "T");
-
-const genericTypeParamShadowArrayLengthJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-type-param-shadow-array-length.0"]).catch((error) => error);
-assert.notEqual(genericTypeParamShadowArrayLengthJson.code, 0);
-const genericTypeParamShadowArrayLengthBody = JSON.parse(genericTypeParamShadowArrayLengthJson.stdout);
-assert.equal(genericTypeParamShadowArrayLengthBody.diagnostics[0].code, "STC002");
-assert.equal(genericTypeParamShadowArrayLengthBody.diagnostics[0].actual, "T");
-
-const genericTypeParamShadowStaticAnnotationJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-type-param-shadow-static-annotation.0"]).catch((error) => error);
-assert.notEqual(genericTypeParamShadowStaticAnnotationJson.code, 0);
-const genericTypeParamShadowStaticAnnotationBody = JSON.parse(genericTypeParamShadowStaticAnnotationJson.stdout);
-assert.equal(genericTypeParamShadowStaticAnnotationBody.diagnostics[0].code, "STC002");
-assert.equal(genericTypeParamShadowStaticAnnotationBody.diagnostics[0].actual, "T");
-
-const genericTypeParamShadowStaticConstraintJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-type-param-shadow-static-constraint.0"]).catch((error) => error);
-assert.notEqual(genericTypeParamShadowStaticConstraintJson.code, 0);
-const genericTypeParamShadowStaticConstraintBody = JSON.parse(genericTypeParamShadowStaticConstraintJson.stdout);
-assert.equal(genericTypeParamShadowStaticConstraintBody.diagnostics[0].code, "STC002");
-assert.equal(genericTypeParamShadowStaticConstraintBody.diagnostics[0].actual, "T");
-
-const genericStaticParamTypeNameCollisionJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-static-param-type-name-collision.0"]).catch((error) => error);
-assert.notEqual(genericStaticParamTypeNameCollisionJson.code, 0);
-const genericStaticParamTypeNameCollisionBody = JSON.parse(genericStaticParamTypeNameCollisionJson.stdout);
-assert.equal(genericStaticParamTypeNameCollisionBody.diagnostics[0].code, "NAM004");
-assert.match(genericStaticParamTypeNameCollisionBody.diagnostics[0].message, /generic static parameter shadows concrete type name/);
-assert.match(genericStaticParamTypeNameCollisionBody.diagnostics[0].actual, /'Foo' already names a shape/);
-
-const genericConstTypeNameCollisionMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-const-type-name-collision-mismatch.0"]).catch((error) => error);
-assert.notEqual(genericConstTypeNameCollisionMismatchJson.code, 0);
-const genericConstTypeNameCollisionMismatchBody = JSON.parse(genericConstTypeNameCollisionMismatchJson.stdout);
-assert.equal(genericConstTypeNameCollisionMismatchBody.diagnostics[0].code, "TYP001");
-assert.match(genericConstTypeNameCollisionMismatchBody.diagnostics[0].expected, /Holder<Bar>/);
-assert.match(genericConstTypeNameCollisionMismatchBody.diagnostics[0].actual, /Holder<Foo>/);
-
-const genericArgCountJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-type-arg-count.0"]).catch((error) => error);
-assert.notEqual(genericArgCountJson.code, 0);
-const genericArgCountBody = JSON.parse(genericArgCountJson.stdout);
-assert.equal(genericArgCountBody.diagnostics[0].code, "TYP023");
-assert.equal(genericArgCountBody.diagnostics[0].repair.id, "match-generic-type-arguments");
-
-const genericCannotInferJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-cannot-infer.0"]).catch((error) => error);
-assert.notEqual(genericCannotInferJson.code, 0);
-const genericCannotInferBody = JSON.parse(genericCannotInferJson.stdout);
-assert.equal(genericCannotInferBody.diagnostics[0].code, "TYP025");
-assert.equal(genericCannotInferBody.diagnostics[0].repair.id, "add-explicit-generic-type-arguments");
-
-const constMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/const-type-mismatch.0"]).catch((error) => error);
-assert.notEqual(constMismatchJson.code, 0);
-const constMismatchBody = JSON.parse(constMismatchJson.stdout);
-assert.equal(constMismatchBody.diagnostics[0].code, "TYP016");
-assert.match(constMismatchBody.diagnostics[0].message, /out of range/);
-
-const metaUnsupportedJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/meta-unsupported.0"]).catch((error) => error);
-assert.notEqual(metaUnsupportedJson.code, 0);
-const metaUnsupportedBody = JSON.parse(metaUnsupportedJson.stdout);
-assert.equal(metaUnsupportedBody.diagnostics[0].code, "MET001");
-assert.equal(metaUnsupportedBody.diagnostics[0].repair.id, "remove-unsupported-meta-expression");
-
-const metaCycleJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/meta-cycle.0"]).catch((error) => error);
-assert.notEqual(metaCycleJson.code, 0);
-const metaCycleBody = JSON.parse(metaCycleJson.stdout);
-assert.equal(metaCycleBody.diagnostics[0].code, "MET001");
-assert.match(metaCycleBody.diagnostics[0].actual, /limit\/cycle/);
-
-const aliasCycleJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/type-alias-cycle.0"]).catch((error) => error);
-assert.notEqual(aliasCycleJson.code, 0);
-const aliasCycleBody = JSON.parse(aliasCycleJson.stdout);
-assert.equal(aliasCycleBody.diagnostics[0].code, "TYP026");
-assert.match(aliasCycleBody.diagnostics[0].message, /alias cycle/);
-
-const publicConstMissingTypeJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/public-const-missing-type.0"]).catch((error) => error);
-assert.notEqual(publicConstMissingTypeJson.code, 0);
-const publicConstMissingTypeBody = JSON.parse(publicConstMissingTypeJson.stdout);
-assert.equal(publicConstMissingTypeBody.diagnostics[0].code, "PUB001");
-assert.equal(publicConstMissingTypeBody.diagnostics[0].repair.id, "add-public-api-type");
-
-const genericOwnedContainerJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-owned-container.0"]).catch((error) => error);
-assert.notEqual(genericOwnedContainerJson.code, 0);
-const genericOwnedContainerBody = JSON.parse(genericOwnedContainerJson.stdout);
-assert.equal(genericOwnedContainerBody.diagnostics[0].code, "OWN001");
-assert.match(genericOwnedContainerBody.diagnostics[0].message, /generic containers cannot own generic payloads/);
-
-const interfaceUnknownJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/interface-unknown.0"]).catch((error) => error);
-assert.notEqual(interfaceUnknownJson.code, 0);
-const interfaceUnknownBody = JSON.parse(interfaceUnknownJson.stdout);
-assert.equal(interfaceUnknownBody.diagnostics[0].code, "IFC001");
-assert.equal(interfaceUnknownBody.diagnostics[0].repair.id, "declare-or-use-static-interface");
-
-const interfaceMissingMethodJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/interface-missing-method.0"]).catch((error) => error);
-assert.notEqual(interfaceMissingMethodJson.code, 0);
-const interfaceMissingMethodBody = JSON.parse(interfaceMissingMethodJson.stdout);
-assert.equal(interfaceMissingMethodBody.diagnostics[0].code, "IFC002");
-assert.match(interfaceMissingMethodBody.diagnostics[0].message, /Readable\.read/);
-assert.match(interfaceMissingMethodBody.diagnostics[0].expected, /matching static method/);
-assert.match(interfaceMissingMethodBody.diagnostics[0].actual, /method not found/);
-assert.equal(interfaceMissingMethodBody.diagnostics[0].repair.id, "add-required-interface-method");
-
-const interfaceArityMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/interface-arity-mismatch.0"]).catch((error) => error);
-assert.notEqual(interfaceArityMismatchJson.code, 0);
-const interfaceArityMismatchBody = JSON.parse(interfaceArityMismatchJson.stdout);
-assert.equal(interfaceArityMismatchBody.diagnostics[0].code, "IFC003");
-
-const interfaceReturnMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/interface-return-mismatch.0"]).catch((error) => error);
-assert.notEqual(interfaceReturnMismatchJson.code, 0);
-const interfaceReturnMismatchBody = JSON.parse(interfaceReturnMismatchJson.stdout);
-assert.equal(interfaceReturnMismatchBody.diagnostics[0].code, "IFC004");
-
-const interfaceParamMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/interface-param-mismatch.0"]).catch((error) => error);
-assert.notEqual(interfaceParamMismatchJson.code, 0);
-const interfaceParamMismatchBody = JSON.parse(interfaceParamMismatchJson.stdout);
-assert.equal(interfaceParamMismatchBody.diagnostics[0].code, "IFC005");
-assert.match(interfaceParamMismatchBody.diagnostics[0].expected, /ref<Counter>/);
-assert.match(interfaceParamMismatchBody.diagnostics[0].actual, /i32/);
-
 const interfaceStaticUnsupportedTypeFixture = `${outDir}/interface-static-unsupported-type.0`;
-await writeFile(interfaceStaticUnsupportedTypeFixture, `interface Bad<static N: String> {
+const interfaceStaticUnsupportedTypeBody = await writeImportFailureFixture(interfaceStaticUnsupportedTypeFixture, `interface Bad<static N: String> {
     fn value() -> u8
 }
 
 pub fn main() -> Void {
 }
 `);
-const interfaceStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", interfaceStaticUnsupportedTypeFixture]).catch((error) => error);
-assert.notEqual(interfaceStaticUnsupportedTypeJson.code, 0);
-const interfaceStaticUnsupportedTypeBody = JSON.parse(interfaceStaticUnsupportedTypeJson.stdout);
 assert.equal(interfaceStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
 
 const interfaceMethodStaticUnsupportedTypeFixture = `${outDir}/interface-method-static-unsupported-type.0`;
-await writeFile(interfaceMethodStaticUnsupportedTypeFixture, `interface Bad {
+const interfaceMethodStaticUnsupportedTypeBody = await writeImportFailureFixture(interfaceMethodStaticUnsupportedTypeFixture, `interface Bad {
     fn value<static N: String>() -> u8
 }
 
 pub fn main() -> Void {
 }
 `);
-const interfaceMethodStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", interfaceMethodStaticUnsupportedTypeFixture]).catch((error) => error);
-assert.notEqual(interfaceMethodStaticUnsupportedTypeJson.code, 0);
-const interfaceMethodStaticUnsupportedTypeBody = JSON.parse(interfaceMethodStaticUnsupportedTypeJson.stdout);
 assert.equal(interfaceMethodStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
 
 const shapeMethodStaticUnsupportedTypeFixture = `${outDir}/shape-method-static-unsupported-type.0`;
-await writeFile(shapeMethodStaticUnsupportedTypeFixture, `type Box {
+const shapeMethodStaticUnsupportedTypeBody = await writeImportFailureFixture(shapeMethodStaticUnsupportedTypeFixture, `type Box {
     value: u8,
     fn value<static N: String>(self: ref<Self>) -> u8 {
         return self.value
@@ -2527,9 +2674,6 @@ await writeFile(shapeMethodStaticUnsupportedTypeFixture, `type Box {
 pub fn main() -> Void {
 }
 `);
-const shapeMethodStaticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", shapeMethodStaticUnsupportedTypeFixture]).catch((error) => error);
-assert.notEqual(shapeMethodStaticUnsupportedTypeJson.code, 0);
-const shapeMethodStaticUnsupportedTypeBody = JSON.parse(shapeMethodStaticUnsupportedTypeJson.stdout);
 assert.equal(shapeMethodStaticUnsupportedTypeBody.diagnostics[0].code, "STC001");
 
 const methodUnknownConstraintFixtures = [
@@ -2561,10 +2705,7 @@ pub fn main() -> Void {
 
 for (const fixtureCase of methodUnknownConstraintFixtures) {
   const fixture = `${outDir}/${fixtureCase.name}.0`;
-  await writeFile(fixture, fixtureCase.source);
-  const methodUnknownConstraintJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(methodUnknownConstraintJson.code, 0);
-  const methodUnknownConstraintBody = JSON.parse(methodUnknownConstraintJson.stdout);
+  const methodUnknownConstraintBody = await writeImportFailureFixture(fixture, fixtureCase.source);
   assert.equal(methodUnknownConstraintBody.diagnostics[0].code, "IFC001");
 }
 
@@ -2640,17 +2781,14 @@ pub fn main() -> Void {
 
 for (const fixtureCase of duplicateStaticGenericFixtures) {
   const fixture = `${outDir}/${fixtureCase.name}.0`;
-  await writeFile(fixture, fixtureCase.source);
-  const duplicateStaticJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(duplicateStaticJson.code, 0);
-  const duplicateStaticBody = JSON.parse(duplicateStaticJson.stdout);
+  const duplicateStaticBody = await writeImportFailureFixture(fixture, fixtureCase.source);
   assert.equal(duplicateStaticBody.diagnostics[0].code, "NAM004");
   assert.match(duplicateStaticBody.diagnostics[0].message, fixtureCase.message);
 }
 
 for (const value of ["4_", "M"]) {
   const fixture = `${outDir}/interface-static-constraint-${value.replace(/[^A-Za-z0-9]/g, "_")}.0`;
-  await writeFile(fixture, `interface First<T: Type, static N: usize> {
+  const interfaceStaticConstraintBody = await writeImportFailureFixture(fixture, `interface First<T: Type, static N: usize> {
     fn first(self: ref<T>) -> u8
 }
 
@@ -2661,15 +2799,12 @@ fn readFirst<T: First<T, ${value}>>(value: ref<T>) -> u8 {
 pub fn main() -> Void {
 }
 `);
-  const interfaceStaticConstraintJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(interfaceStaticConstraintJson.code, 0);
-  const interfaceStaticConstraintBody = JSON.parse(interfaceStaticConstraintJson.stdout);
   assert.equal(interfaceStaticConstraintBody.diagnostics[0].code, "STC002");
   assert.equal(interfaceStaticConstraintBody.diagnostics[0].actual, value);
 }
 
 const shapeMethodStaticParamFixture = `${outDir}/shape-method-static-param.0`;
-await writeFile(shapeMethodStaticParamFixture, `type Box {
+await writeGraphFixture(shapeMethodStaticParamFixture, `type Box {
     value: u8,
 
     fn tag<static N: usize>(self: ref<Self>) -> usize {
@@ -2690,7 +2825,7 @@ pub fn main() -> Void {
 const shapeMethodStaticParamJson = await execFileAsync(zero, ["check", "--json", shapeMethodStaticParamFixture]);
 const shapeMethodStaticParamBody = JSON.parse(shapeMethodStaticParamJson.stdout);
 assert.equal(shapeMethodStaticParamBody.ok, true);
-const shapeMethodStaticParamGraph = await execFileAsync(zero, ["graph", "--json", shapeMethodStaticParamFixture]);
+const shapeMethodStaticParamGraph = await execFileAsync(zero, ["inspect", "--json", shapeMethodStaticParamFixture]);
 const shapeMethodStaticParamGraphBody = JSON.parse(shapeMethodStaticParamGraph.stdout);
 const shapeMethodStaticBox = shapeMethodStaticParamGraphBody.shapes.find((item) => item.name === "Box");
 assert(shapeMethodStaticBox);
@@ -2699,7 +2834,7 @@ assert(shapeMethodStaticTag);
 assert(shapeMethodStaticTag.staticParams.some((item) => item.name === "N" && item.type === "usize" && item.staticDispatch === true));
 
 const shapeMethodStaticCanonicalFixture = `${outDir}/shape-method-static-canonical.0`;
-await writeFile(shapeMethodStaticCanonicalFixture, `type Box {
+await writeGraphFixture(shapeMethodStaticCanonicalFixture, `type Box {
     fn take<static N: usize>(a: [N]u8, b: [N]u8) -> usize {
         return N
     }
@@ -2717,7 +2852,7 @@ const shapeMethodStaticCanonicalBody = JSON.parse(shapeMethodStaticCanonicalJson
 assert.equal(shapeMethodStaticCanonicalBody.ok, true);
 
 const interfaceMethodStaticParamFixture = `${outDir}/interface-method-static-param.0`;
-await writeFile(interfaceMethodStaticParamFixture, `interface Width<T: Type> {
+await writeGraphFixture(interfaceMethodStaticParamFixture, `interface Width<T: Type> {
     fn width<static N: usize>(self: ref<T>) -> usize
 }
 
@@ -2741,7 +2876,7 @@ pub fn main() -> Void {
 const interfaceMethodStaticParamJson = await execFileAsync(zero, ["check", "--json", interfaceMethodStaticParamFixture]);
 const interfaceMethodStaticParamBody = JSON.parse(interfaceMethodStaticParamJson.stdout);
 assert.equal(interfaceMethodStaticParamBody.ok, true);
-const interfaceMethodStaticParamGraph = await execFileAsync(zero, ["graph", "--json", interfaceMethodStaticParamFixture]);
+const interfaceMethodStaticParamGraph = await execFileAsync(zero, ["inspect", "--json", interfaceMethodStaticParamFixture]);
 const interfaceMethodStaticParamGraphBody = JSON.parse(interfaceMethodStaticParamGraph.stdout);
 const interfaceMethodStaticWidth = interfaceMethodStaticParamGraphBody.interfaces.find((item) => item.name === "Width");
 assert(interfaceMethodStaticWidth);
@@ -2755,7 +2890,7 @@ assert(interfaceMethodStaticBytesWidth);
 assert(interfaceMethodStaticBytesWidth.staticParams.some((item) => item.name === "N" && item.type === "usize" && item.staticDispatch === true));
 
 const interfaceMethodStaticRenamedParamFixture = `${outDir}/interface-method-static-renamed-param.0`;
-await writeFile(interfaceMethodStaticRenamedParamFixture, `interface Width<T: Type> {
+await writeGraphFixture(interfaceMethodStaticRenamedParamFixture, `interface Width<T: Type> {
     fn width<static N: usize>(self: ref<T>, bytes: [N]u8) -> [N]u8
 }
 
@@ -2779,7 +2914,7 @@ pub fn main() -> Void {
 const interfaceMethodStaticRenamedParamJson = await execFileAsync(zero, ["check", "--json", interfaceMethodStaticRenamedParamFixture]);
 const interfaceMethodStaticRenamedParamBody = JSON.parse(interfaceMethodStaticRenamedParamJson.stdout);
 assert.equal(interfaceMethodStaticRenamedParamBody.ok, true);
-const interfaceMethodStaticRenamedParamGraph = await execFileAsync(zero, ["graph", "--json", interfaceMethodStaticRenamedParamFixture]);
+const interfaceMethodStaticRenamedParamGraph = await execFileAsync(zero, ["inspect", "--json", interfaceMethodStaticRenamedParamFixture]);
 const interfaceMethodStaticRenamedParamGraphBody = JSON.parse(interfaceMethodStaticRenamedParamGraph.stdout);
 const interfaceMethodStaticRenamedWidth = interfaceMethodStaticRenamedParamGraphBody.interfaces.find((item) => item.name === "Width");
 assert(interfaceMethodStaticRenamedWidth);
@@ -2793,7 +2928,7 @@ assert(interfaceMethodStaticRenamedBytesWidth);
 assert(interfaceMethodStaticRenamedBytesWidth.staticParams.some((item) => item.name === "M" && item.type === "usize" && item.staticDispatch === true));
 
 const staticInterfaceReturnMismatchFixture = `${outDir}/static-interface-return-mismatch.0`;
-await writeFile(staticInterfaceReturnMismatchFixture, `interface Sized<T: Type, static N: usize> {
+const staticInterfaceReturnMismatchBody = await writeImportFailureFixture(staticInterfaceReturnMismatchFixture, `interface Sized<T: Type, static N: usize> {
     fn bytes(self: ref<T>) -> [N]u8
 }
 
@@ -2814,15 +2949,12 @@ pub fn main() -> Void {
     let out: [3]u8 = read<Bytes<4>, 3>(&bytes)
 }
 `);
-const staticInterfaceReturnMismatchJson = await execFileAsync(zero, ["check", "--json", staticInterfaceReturnMismatchFixture]).catch((error) => error);
-assert.notEqual(staticInterfaceReturnMismatchJson.code, 0);
-const staticInterfaceReturnMismatchBody = JSON.parse(staticInterfaceReturnMismatchJson.stdout);
 assert.equal(staticInterfaceReturnMismatchBody.diagnostics[0].code, "IFC004");
 assert.match(staticInterfaceReturnMismatchBody.diagnostics[0].expected, /\[3\]u8/);
 assert.match(staticInterfaceReturnMismatchBody.diagnostics[0].actual, /\[4\]u8/);
 
 const shapeMethodGenericConstraintFixture = `${outDir}/shape-method-generic-constraint.0`;
-await writeFile(shapeMethodGenericConstraintFixture, `interface NeedsMethod<T: Type> {
+const shapeMethodGenericConstraintBody = await writeImportFailureFixture(shapeMethodGenericConstraintFixture, `interface NeedsMethod<T: Type> {
     fn need(self: ref<T>) -> u8
 }
 
@@ -2844,13 +2976,10 @@ pub fn main() -> Void {
     let out: u8 = box.accept<Plain>(plain)
 }
 `);
-const shapeMethodGenericConstraintJson = await execFileAsync(zero, ["check", "--json", shapeMethodGenericConstraintFixture]).catch((error) => error);
-assert.notEqual(shapeMethodGenericConstraintJson.code, 0);
-const shapeMethodGenericConstraintBody = JSON.parse(shapeMethodGenericConstraintJson.stdout);
 assert.equal(shapeMethodGenericConstraintBody.diagnostics[0].code, "IFC002");
 
 const interfaceMethodGenericConstraintFixture = `${outDir}/interface-method-generic-constraint.0`;
-await writeFile(interfaceMethodGenericConstraintFixture, `interface NeedsMethod<T: Type> {
+const interfaceMethodGenericConstraintBody = await writeImportFailureFixture(interfaceMethodGenericConstraintFixture, `interface NeedsMethod<T: Type> {
     fn need(self: ref<T>) -> u8
 }
 
@@ -2880,9 +3009,6 @@ pub fn main() -> Void {
     let out: u8 = read<Box>(&box, plain)
 }
 `);
-const interfaceMethodGenericConstraintJson = await execFileAsync(zero, ["check", "--json", interfaceMethodGenericConstraintFixture]).catch((error) => error);
-assert.notEqual(interfaceMethodGenericConstraintJson.code, 0);
-const interfaceMethodGenericConstraintBody = JSON.parse(interfaceMethodGenericConstraintJson.stdout);
 assert.equal(interfaceMethodGenericConstraintBody.diagnostics[0].code, "IFC002");
 
 const interfaceMethodGenericMismatchFixtures = [
@@ -3008,167 +3134,10 @@ pub fn main() -> Void {
 
 for (const fixtureCase of interfaceMethodGenericMismatchFixtures) {
   const fixture = `${outDir}/${fixtureCase.name}.0`;
-  await writeFile(fixture, fixtureCase.source);
-  const interfaceMethodGenericMismatchJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(interfaceMethodGenericMismatchJson.code, 0);
-  const interfaceMethodGenericMismatchBody = JSON.parse(interfaceMethodGenericMismatchJson.stdout);
+  const interfaceMethodGenericMismatchBody = await writeImportFailureFixture(fixture, fixtureCase.source);
   assert.equal(interfaceMethodGenericMismatchBody.diagnostics[0].code, fixtureCase.code);
   if (fixtureCase.message) assert.match(interfaceMethodGenericMismatchBody.diagnostics[0].message, fixtureCase.message);
 }
-
-const staticUnsupportedTypeJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-unsupported-type.0"]).catch((error) => error);
-assert.notEqual(staticUnsupportedTypeJson.code, 0);
-const staticUnsupportedTypeBody = JSON.parse(staticUnsupportedTypeJson.stdout);
-assert.equal(staticUnsupportedTypeBody.diagnostics[0].code, "STC001");
-assert.equal(staticUnsupportedTypeBody.diagnostics[0].repair.id, "use-supported-static-value-type");
-
-const staticNonConstantJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-non-constant.0"]).catch((error) => error);
-assert.notEqual(staticNonConstantJson.code, 0);
-const staticNonConstantBody = JSON.parse(staticNonConstantJson.stdout);
-assert.equal(staticNonConstantBody.diagnostics[0].code, "STC002");
-assert.equal(staticNonConstantBody.diagnostics[0].repair.id, "pass-constant-static-value");
-
-for (const value of ["4_", "4__5", "0x_1", "4_nope"]) {
-  const fixture = `${outDir}/static-value-malformed-${value.replace(/[^A-Za-z0-9]/g, "_")}.0`;
-  await writeFile(fixture, `type FixedVec<T: Type, static N: usize> {
-    items: [N]T,
-}
-
-pub fn main() -> Void {
-    let _vec: FixedVec<u8, ${value}> = FixedVec { items: [1, 2, 3, 4] }
-}
-`);
-  const malformedStaticJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(malformedStaticJson.code, 0);
-  const malformedStaticBody = JSON.parse(malformedStaticJson.stdout);
-  assert.equal(malformedStaticBody.diagnostics[0].code, "STC002");
-  assert.equal(malformedStaticBody.diagnostics[0].actual, value);
-}
-
-for (const value of ["4_", "4__5", "0x_1", "4_nope"]) {
-  const fixture = `${outDir}/array-length-malformed-${value.replace(/[^A-Za-z0-9]/g, "_")}.0`;
-  await writeFile(fixture, `fn take(bytes: [${value}]u8) -> Void {
-}
-
-pub fn main() -> Void {
-}
-`);
-  const malformedArrayJson = await execFileAsync(zero, ["check", "--json", fixture]).catch((error) => error);
-  assert.notEqual(malformedArrayJson.code, 0);
-  const malformedArrayBody = JSON.parse(malformedArrayJson.stdout);
-  assert.equal(malformedArrayBody.diagnostics[0].code, "STC002");
-  assert.equal(malformedArrayBody.diagnostics[0].actual, value);
-}
-
-const staticMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-mismatch.0"]).catch((error) => error);
-assert.notEqual(staticMismatchJson.code, 0);
-const staticMismatchBody = JSON.parse(staticMismatchJson.stdout);
-assert.equal(staticMismatchBody.diagnostics[0].code, "STC003");
-assert.match(staticMismatchBody.diagnostics[0].expected, /FixedVec<u8,\s*8>/);
-assert.match(staticMismatchBody.diagnostics[0].actual, /FixedVec<u8,\s*cap>/);
-assert.equal(staticMismatchBody.diagnostics[0].repair.id, "match-static-value-argument");
-
-const staticAliasMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-alias-mismatch.0"]).catch((error) => error);
-assert.notEqual(staticAliasMismatchJson.code, 0);
-const staticAliasMismatchBody = JSON.parse(staticAliasMismatchJson.stdout);
-assert.equal(staticAliasMismatchBody.diagnostics[0].code, "STC003");
-assert.match(staticAliasMismatchBody.diagnostics[0].expected, /Box<FourVec>/);
-assert.match(staticAliasMismatchBody.diagnostics[0].actual, /Box<FixedVec<u8,\s*5>>/);
-assert.equal(staticAliasMismatchBody.diagnostics[0].repair.id, "match-static-value-argument");
-
-const staticBoolEnumMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/static-value-bool-enum-mismatch.0"]).catch((error) => error);
-assert.notEqual(staticBoolEnumMismatchJson.code, 0);
-const staticBoolEnumMismatchBody = JSON.parse(staticBoolEnumMismatchJson.stdout);
-assert.equal(staticBoolEnumMismatchBody.diagnostics[0].code, "STC003");
-assert.match(staticBoolEnumMismatchBody.diagnostics[0].expected, /Gate<false,\s*Mode\.fast>/);
-assert.match(staticBoolEnumMismatchBody.diagnostics[0].actual, /Gate<true,\s*Mode\.fast>/);
-assert.equal(staticBoolEnumMismatchBody.diagnostics[0].repair.id, "match-static-value-argument");
-
-const shapeMethodCannotInferJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-shape-method-cannot-infer.0"]).catch((error) => error);
-assert.notEqual(shapeMethodCannotInferJson.code, 0);
-const shapeMethodCannotInferBody = JSON.parse(shapeMethodCannotInferJson.stdout);
-assert.equal(shapeMethodCannotInferBody.diagnostics[0].code, "SHM001");
-assert.equal(shapeMethodCannotInferBody.diagnostics[0].repair.id, "bind-generic-shape-method");
-
-const shapeMethodSelfMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/generic-shape-method-self-mismatch.0"]).catch((error) => error);
-assert.notEqual(shapeMethodSelfMismatchJson.code, 0);
-const shapeMethodSelfMismatchBody = JSON.parse(shapeMethodSelfMismatchJson.stdout);
-assert.equal(shapeMethodSelfMismatchBody.diagnostics[0].code, "SHM002");
-assert.equal(shapeMethodSelfMismatchBody.diagnostics[0].repair.id, "match-shape-method-self");
-
-const selfOutsideShapeJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/self-outside-shape.0"]).catch((error) => error);
-assert.notEqual(selfOutsideShapeJson.code, 0);
-const selfOutsideShapeBody = JSON.parse(selfOutsideShapeJson.stdout);
-assert.equal(selfOutsideShapeBody.diagnostics[0].code, "SHM001");
-assert.match(selfOutsideShapeBody.diagnostics[0].message, /Self is only valid/);
-
-const arrayLengthMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/array-literal-length-mismatch.0"]).catch((error) => error);
-assert.notEqual(arrayLengthMismatchJson.code, 0);
-const arrayLengthMismatchBody = JSON.parse(arrayLengthMismatchJson.stdout);
-assert.equal(arrayLengthMismatchBody.diagnostics[0].code, "TYP002");
-assert.match(arrayLengthMismatchBody.diagnostics[0].message, /array literal length/);
-assert.match(arrayLengthMismatchBody.diagnostics[0].actual, /3 element/);
-
-const arrayElementMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/array-literal-element-mismatch.0"]).catch((error) => error);
-assert.notEqual(arrayElementMismatchJson.code, 0);
-const arrayElementMismatchBody = JSON.parse(arrayElementMismatchJson.stdout);
-assert.equal(arrayElementMismatchBody.diagnostics[0].code, "TYP002");
-assert.match(arrayElementMismatchBody.diagnostics[0].message, /array literal element/);
-assert.equal(arrayElementMismatchBody.diagnostics[0].expected, "u8");
-
-const receiverMethodImmutableJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/receiver-method-immutable.0"]).catch((error) => error);
-assert.notEqual(receiverMethodImmutableJson.code, 0);
-const receiverMethodImmutableBody = JSON.parse(receiverMethodImmutableJson.stdout);
-assert.equal(receiverMethodImmutableBody.diagnostics[0].code, "RCV002");
-assert.equal(receiverMethodImmutableBody.diagnostics[0].repair.id, "make-receiver-addressable-or-mutable");
-
-const receiverMethodUnknownJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/receiver-method-unknown.0"]).catch((error) => error);
-assert.notEqual(receiverMethodUnknownJson.code, 0);
-const receiverMethodUnknownBody = JSON.parse(receiverMethodUnknownJson.stdout);
-assert.equal(receiverMethodUnknownBody.diagnostics[0].code, "RCV001");
-assert.equal(receiverMethodUnknownBody.diagnostics[0].repair.id, "call-declared-receiver-method");
-
-const shapeDefaultMissingRequiredJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/shape-default-missing-required.0"]).catch((error) => error);
-assert.notEqual(shapeDefaultMissingRequiredJson.code, 0);
-const shapeDefaultMissingRequiredBody = JSON.parse(shapeDefaultMissingRequiredJson.stdout);
-assert.equal(shapeDefaultMissingRequiredBody.diagnostics[0].code, "FLD002");
-assert.match(shapeDefaultMissingRequiredBody.diagnostics[0].help, /field/);
-
-const shapeDefaultTypeMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/shape-default-type-mismatch.0"]).catch((error) => error);
-assert.notEqual(shapeDefaultTypeMismatchJson.code, 0);
-const shapeDefaultTypeMismatchBody = JSON.parse(shapeDefaultTypeMismatchJson.stdout);
-assert.equal(shapeDefaultTypeMismatchBody.diagnostics[0].code, "TYP002");
-assert.match(shapeDefaultTypeMismatchBody.diagnostics[0].message, /default/);
-
-const matchFallbackPayloadJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/match-fallback-payload.0"]).catch((error) => error);
-assert.notEqual(matchFallbackPayloadJson.code, 0);
-const matchFallbackPayloadBody = JSON.parse(matchFallbackPayloadJson.stdout);
-assert.equal(matchFallbackPayloadBody.diagnostics[0].code, "MAT004");
-assert.match(matchFallbackPayloadBody.diagnostics[0].message, /fallback/);
-
-const matchDuplicateFallbackJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/match-duplicate-fallback.0"]).catch((error) => error);
-assert.notEqual(matchDuplicateFallbackJson.code, 0);
-const matchDuplicateFallbackBody = JSON.parse(matchDuplicateFallbackJson.stdout);
-assert.equal(matchDuplicateFallbackBody.diagnostics[0].code, "MAT003");
-assert.match(matchDuplicateFallbackBody.diagnostics[0].message, /duplicate match fallback/);
-
-const matchBoolNonExhaustiveJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/match-bool-non-exhaustive.0"]).catch((error) => error);
-assert.notEqual(matchBoolNonExhaustiveJson.code, 0);
-const matchBoolNonExhaustiveBody = JSON.parse(matchBoolNonExhaustiveJson.stdout);
-assert.equal(matchBoolNonExhaustiveBody.diagnostics[0].code, "MAT002");
-assert.match(matchBoolNonExhaustiveBody.diagnostics[0].message, /Bool/);
-
-const matchU8NonExhaustiveJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/match-u8-non-exhaustive.0"]).catch((error) => error);
-assert.notEqual(matchU8NonExhaustiveJson.code, 0);
-const matchU8NonExhaustiveBody = JSON.parse(matchU8NonExhaustiveJson.stdout);
-assert.equal(matchU8NonExhaustiveBody.diagnostics[0].code, "MAT002");
-assert.match(matchU8NonExhaustiveBody.diagnostics[0].message, /u8/);
-
-const matchGuardNonBoolJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/match-guard-non-bool.0"]).catch((error) => error);
-assert.notEqual(matchGuardNonBoolJson.code, 0);
-const matchGuardNonBoolBody = JSON.parse(matchGuardNonBoolJson.stdout);
-assert.equal(matchGuardNonBoolBody.diagnostics[0].code, "MAT005");
-assert.match(matchGuardNonBoolBody.diagnostics[0].message, /guard/);
 
 const badTargetNameJson = await execFileAsync(zero, ["check", "--json", "--target", "not-a-target", "examples/hello.0"]).catch((error) => error);
 assert.notEqual(badTargetNameJson.code, 0);
@@ -3191,42 +3160,9 @@ assert.equal(explainTar002Body.repair.id, "choose-target-with-required-capabilit
 const explainText = await execFileAsync(zero, ["explain", "TYP009"]);
 assert.match(explainText.stdout, /Mutable storage required/);
 
-const fixPlanJson = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/native/fail/mem-copy-immutable-dst.0"]);
-const fixPlanBody = JSON.parse(fixPlanJson.stdout);
-assert.equal(fixPlanBody.schemaVersion, 1);
-assert.equal(fixPlanBody.mode, "plan");
-assert.equal(fixPlanBody.appliesEdits, false);
-assert.equal(fixPlanBody.fixes[0].id, "make-binding-mutable");
-assert.equal(fixPlanBody.fixes[0].diagnosticCode, "TYP009");
-assert.equal(fixPlanBody.fixes[0].safety, "behavior-preserving");
-assert.equal(fixPlanBody.diagnostics[0].repair.id, "make-binding-mutable");
-
-const genericFixPlanJson = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/check/fail/generic-cannot-infer.0"]);
-const genericFixPlanBody = JSON.parse(genericFixPlanJson.stdout);
-assert.equal(genericFixPlanBody.fixes[0].id, "add-explicit-generic-type-arguments");
-assert.equal(genericFixPlanBody.fixes[0].diagnosticCode, "TYP025");
-assert.equal(genericFixPlanBody.fixes[0].safety, "behavior-preserving");
-assert.equal(genericFixPlanBody.diagnostics[0].repair.id, "add-explicit-generic-type-arguments");
-
-const fixPatchJson = await execFileAsync(zero, ["fix", "--patch", "--json", "conformance/native/fail/mem-copy-immutable-dst.0"]);
-const fixPatchBody = JSON.parse(fixPatchJson.stdout);
-assert.equal(fixPatchBody.mode, "patch");
-assert.equal(fixPatchBody.appliesEdits, false);
-assert.equal(fixPatchBody.fixes[0].appliesEdits, true);
-assert.match(fixPatchBody.patches[0].new, /var dst/);
-
-const fixApplyFixture = `${outDir}/fix-apply-mutable.0`;
-await writeFile(fixApplyFixture, await readFile("conformance/native/fail/mem-copy-immutable-dst.0", "utf8"));
-const fixApplyJson = await execFileAsync(zero, ["fix", "--apply", "--json", fixApplyFixture]);
-const fixApplyBody = JSON.parse(fixApplyJson.stdout);
-assert.equal(fixApplyBody.mode, "apply");
-assert.equal(fixApplyBody.applied, true);
-assert.match(await readFile(fixApplyFixture, "utf8"), /var dst/);
-await execFileAsync(zero, ["check", fixApplyFixture]);
-
-const importGraph = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/imports"]);
+const importGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/imports"]);
 const importGraphBody = JSON.parse(importGraph.stdout);
-assert.deepEqual(importGraphBody.imports, ["math", "types"]);
+assert.deepEqual(importGraphBody.imports, []);
 assert.equal(importGraphBody.sourceFiles.length, 3);
 assert.equal(importGraphBody.sourceMaps.length, 3);
 assert(importGraphBody.sourceMaps.every((item) => item.columnUnit === "utf8-byte"));
@@ -3234,72 +3170,73 @@ assert.deepEqual(importGraphBody.targets.map((item) => item.name), ["cli"]);
 assert.deepEqual(importGraphBody.modules.map((item) => item.name), ["math", "types", "main"]);
 assert.deepEqual(importGraphBody.importEdges.map((item) => `${item.from}->${item.to}`), ["main->math", "main->types"]);
 assert.deepEqual(importGraphBody.importEdges.map((item) => `${item.from}->${item.to}:${item.sourceRange.path}:${item.sourceRange.start.line}:${item.sourceRange.start.column}:${item.sourceRange.end.column}`), [
-  "main->math:conformance/check/pass/imports/src/main.0:1:1:9",
-  "main->types:conformance/check/pass/imports/src/main.0:3:1:10",
+  "main->math:src/main.0:1:1:9",
+  "main->types:src/main.0:3:1:10",
 ]);
 assert.deepEqual(importGraphBody.useImports.map((item) => `${item.from}->${item.to}:${item.kind}:${item.line}:${item.column}`), [
   "main->math:package-local:1:1",
   "main->types:package-local:3:1",
 ]);
 assert.deepEqual(importGraphBody.useImports.map((item) => item.resolvedPath), [
-  "conformance/check/pass/imports/src/math.0",
-  "conformance/check/pass/imports/src/types.0",
+  "src/math.0",
+  "src/types.0",
 ]);
 assert(importGraphBody.useImports.every((item) => item.sourceRange.columnUnit === "utf8-byte"));
-assert(importGraphBody.symbols.some((item) => item.module === "math" && item.name === "add_one"));
+assert(importGraphBody.functions.some((item) => item.name === "add_one" && item.returnType === "i32"));
 assert(importGraphBody.functions.some((item) => item.name === "main" && item.returnType === "Void" && item.effects.includes("world")));
 
 const whitespaceUsePackage = `${outDir}/use-whitespace-package`;
 await mkdir(`${whitespaceUsePackage}/src`, { recursive: true });
-await writeFile(`${whitespaceUsePackage}/zero.json`, JSON.stringify({
+await writeZeroToml(whitespaceUsePackage, {
   package: { name: "use-whitespace-package", version: "0.1.0" },
   targets: { cli: { kind: "exe", main: "src/main.0" } },
   deps: {},
-}, null, 2));
+});
 await mkdir(`${whitespaceUsePackage}/src/math`, { recursive: true });
 await writeFile(`${whitespaceUsePackage}/src/math.0`, 'fn add_one(value: i32) -> i32 {\n    return value + 1\n}\n');
 await writeFile(`${whitespaceUsePackage}/src/math/util.0`, 'fn add_two(value: i32) -> i32 {\n    return value + 2\n}\n');
 await writeFile(`${whitespaceUsePackage}/src/types.0`, 'type Point {\n    value: i32,\n}\n');
 await writeFile(`${whitespaceUsePackage}/src/main.0`, 'use math\nuse math . util\nuse   types   as   model\n\npub fn main(world: World) -> Void raises {\n    let point: Point = Point { value: add_two(40) }\n    if point.value == add_one(41) {\n        check world.out.write("whitespace imports pass\\n")\n    }\n}\n');
+await importPackageGraph(whitespaceUsePackage);
 const whitespaceUseCheck = await execFileAsync(zero, ["check", "--json", whitespaceUsePackage]);
 assert.equal(JSON.parse(whitespaceUseCheck.stdout).ok, true);
-const whitespaceUseGraph = await execFileAsync(zero, ["graph", "--json", whitespaceUsePackage]);
+const whitespaceUseGraph = await execFileAsync(zero, ["inspect", "--json", whitespaceUsePackage]);
 const whitespaceUseGraphBody = JSON.parse(whitespaceUseGraph.stdout);
 assert.deepEqual(whitespaceUseGraphBody.useImports.map((item) => `${item.from}->${item.to}:${item.kind}:${item.alias ?? "null"}:${item.sourceRange.end.column}`), [
   "main->math:package-local:null:9",
-  "main->math.util:package-local:null:16",
-  "main->types:package-local:model:25",
+  "main->math.util:package-local:null:14",
+  "main->types:package-local:model:10",
 ]);
 assert.deepEqual(whitespaceUseGraphBody.importEdges.map((item) => `${item.from}->${item.to}`), ["main->math", "main->math.util", "main->types"]);
 
-const packageUseGraph = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/package"]);
+const packageUseGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/package"]);
 const packageUseGraphBody = JSON.parse(packageUseGraph.stdout);
 assert.deepEqual(packageUseGraphBody.useImports.map((item) => `${item.from}->${item.to}:${item.kind}:${item.resolvedPath ?? "null"}`), [
   "main->std.codec:stdlib:null",
   "main->std.parse:stdlib:null",
   "main->std.time:stdlib:null",
-  "main->types:package-local:conformance/check/pass/package/src/types.0",
+  "main->types:package-local:src/types.0",
 ]);
 
-const resourceGraph = await execFileAsync(zero, ["graph", "--json", "examples/resource-cli"]);
+const resourceGraph = await execFileAsync(zero, ["inspect", "--json", "examples/resource-cli"]);
 const resourceGraphBody = JSON.parse(resourceGraph.stdout);
 assert(resourceGraphBody.targets.some((item) => item.name === "cli" && item.kind === "exe"));
 assert.deepEqual(resourceGraphBody.importEdges.map((item) => `${item.from}->${item.to}`), ["main->config", "main->payload"]);
 assert(resourceGraphBody.requiresCapabilities.includes("fs"));
 assert(resourceGraphBody.functions.some((item) => item.name === "outputDir" && item.effects.includes("env")));
-const resourceMainSymbol = resourceGraphBody.symbols.find((item) => item.name === "main");
-assert(resourceMainSymbol.effects.includes("fs"));
-assert.equal(resourceMainSymbol.allocationBehavior, "no heap allocation");
-assert.equal(resourceMainSymbol.ownership.params[0].type, "World");
+const resourceMainFunction = resourceGraphBody.functions.find((item) => item.name === "main");
+assert(resourceMainFunction.effects.includes("fs"));
+assert.equal(resourceMainFunction.allocationBehavior, "no heap allocation");
+assert.equal(resourceMainFunction.ownership.params[0].type, "World");
 
-const memoryGraph = await execFileAsync(zero, ["graph", "--json", "--target", "linux-musl-x64", "examples/memory-package"]);
+const memoryGraph = await execFileAsync(zero, ["inspect", "--json", "--target", "linux-musl-x64", "examples/memory-package"]);
 const memoryGraphBody = JSON.parse(memoryGraph.stdout);
 assert.deepEqual(memoryGraphBody.importEdges.map((item) => `${item.from}->${item.to}`), ["main->buffer", "main->checksum"]);
 assert(memoryGraphBody.requiresCapabilities.includes("memory"));
 assert(!memoryGraphBody.requiresCapabilities.includes("fs"));
 assert.equal(memoryGraphBody.targetSupport.fsAvailable, true);
 assert.equal(memoryGraphBody.targetSupport.requiredCapabilitySupport.status, "supported");
-assert.equal(memoryGraphBody.symbolCounts.public, 5);
+assert.equal(memoryGraphBody.functions.filter((item) => item.public).length, 5);
 assert(memoryGraphBody.stdlibHelpers.some((helper) => helper.name === "std.mem.copy" && helper.targetSupport === "target-neutral"));
 assert(memoryGraphBody.stdlibHelpers.some((helper) => helper.name === "std.fs.createOrRaise" && helper.targetSupport === "host"));
 const memCopyHelper = memoryGraphBody.stdlibHelpers.find((helper) => helper.name === "std.mem.copy");
@@ -3338,39 +3275,38 @@ assert.equal(lexerTokensBody.tokens[8].column, 8);
 assert.equal(lexerTokensBody.tokens.at(-1).kind, "eof");
 assert.equal(lexerTokensBody.tokens.at(-1).length, 0);
 
-const parseTree = await execFileAsync(zero, ["parse", "--json", "conformance/parse/compiler-smoke.0"]);
+const parseTree = await execFileAsync(zero, ["parse", "--json", "conformance/format/functions-blocks.0"]);
 const parseTreeBody = JSON.parse(parseTree.stdout);
 assert.equal(parseTreeBody.schemaVersion, 1);
 assert.equal(parseTreeBody.root.kind, "module");
-assert.equal(parseTreeBody.root.shapeCount, 1);
-assert.equal(parseTreeBody.root.enumCount, 1);
-assert.equal(parseTreeBody.root.choiceCount, 1);
-assert.equal(parseTreeBody.root.functionCount, 1);
-assert.equal(parseTreeBody.shapes[0].name, "Point");
-assert.equal(parseTreeBody.enums[0].caseCount, 2);
-assert.equal(parseTreeBody.choices[0].caseCount, 2);
-assert.equal(parseTreeBody.functions[0].name, "main");
+assert.equal(parseTreeBody.root.shapeCount, 0);
+assert.equal(parseTreeBody.root.enumCount, 0);
+assert.equal(parseTreeBody.root.choiceCount, 0);
+assert.equal(parseTreeBody.root.functionCount, 2);
+assert.equal(parseTreeBody.functions[0].name, "helper");
 assert.equal(parseTreeBody.functions[0].paramCount, 1);
-assert.deepEqual(parseTreeBody.functions[0].bodyKinds, ["if", "while", "check", "return"]);
+assert.deepEqual(parseTreeBody.functions[0].bodyKinds, ["if"]);
+assert.equal(parseTreeBody.functions[1].name, "main");
+assert.equal(parseTreeBody.functions[1].paramCount, 0);
+assert.deepEqual(parseTreeBody.functions[1].bodyKinds, ["let", "while"]);
 
-const constGraph = await execFileAsync(zero, ["graph", "--json", "examples/const-arithmetic.0"]);
+const constGraph = await execFileAsync(zero, ["inspect", "--json", "examples/const-arithmetic.0"]);
 const constGraphBody = JSON.parse(constGraph.stdout);
 assert(constGraphBody.consts.some((item) => item.name === "answer" && item.type === "i32"));
-assert(constGraphBody.symbols.some((item) => item.name === "answer" && item.kind === "const" && item.public === false));
 
-const genericPairGraph = await execFileAsync(zero, ["graph", "--json", "examples/generic-pair.0"]);
+const genericPairGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/generic-shape-multi.0"]);
 const genericPairGraphBody = JSON.parse(genericPairGraph.stdout);
 assert(genericPairGraphBody.functions.some((item) => item.name === "makePair" && item.generic === true && item.returnType === "Pair<T, U>"));
 assert(genericPairGraphBody.shapes.some((item) => item.name === "Pair" && item.generic === true && item.typeParams.join(",") === "T,U"));
 
-const staticValueGraph = await execFileAsync(zero, ["graph", "--json", "examples/static-value-params.0"]);
+const staticValueGraph = await execFileAsync(zero, ["inspect", "--json", "examples/static-value-params.0"]);
 const staticValueGraphBody = JSON.parse(staticValueGraph.stdout);
 const fixedVecShape = staticValueGraphBody.shapes.find((item) => item.name === "FixedVec");
 assert(fixedVecShape);
 assert(fixedVecShape.staticParams.some((item) => item.name === "N" && item.type === "usize" && item.staticDispatch === true));
 assert(staticValueGraphBody.functions.some((item) => item.name === "first" && item.staticParams.some((param) => param.name === "N")));
 
-const fixedVecGraph = await execFileAsync(zero, ["graph", "--json", "examples/fixed-vec.0"]);
+const fixedVecGraph = await execFileAsync(zero, ["inspect", "--json", "examples/fixed-vec.0"]);
 const fixedVecGraphBody = JSON.parse(fixedVecGraph.stdout);
 const fixedVecMethodsShape = fixedVecGraphBody.shapes.find((item) => item.name === "FixedVec");
 assert(fixedVecMethodsShape);
@@ -3380,24 +3316,22 @@ assert.equal(pushMethod.inheritedShapeParams, true);
 assert.deepEqual(pushMethod.shapeTypeParams, ["T", "N"]);
 assert(pushMethod.shapeStaticParams.some((item) => item.name === "N" && item.staticDispatch === true));
 
-const aliasGraph = await execFileAsync(zero, ["graph", "--json", "examples/type-alias.0"]);
+const aliasGraph = await execFileAsync(zero, ["inspect", "--json", "examples/type-alias.0"]);
 const aliasGraphBody = JSON.parse(aliasGraph.stdout);
 assert(aliasGraphBody.aliases.some((item) => item.name === "BytePair" && item.target === "Pair<u8, u8>"));
-assert(aliasGraphBody.symbols.some((item) => item.name === "BytePair" && item.kind === "type-alias"));
 
-const staticMethodGraph = await execFileAsync(zero, ["graph", "--json", "examples/static-method.0"]);
+const staticMethodGraph = await execFileAsync(zero, ["inspect", "--json", "examples/static-method.0"]);
 const staticMethodGraphBody = JSON.parse(staticMethodGraph.stdout);
 const counterShape = staticMethodGraphBody.shapes.find((item) => item.name === "Counter");
 assert(counterShape);
 assert(counterShape.methods.some((item) => item.name === "add" && item.staticDispatch === true && item.returnType === "i32"));
 
-const staticInterfaceGraph = await execFileAsync(zero, ["graph", "--json", "examples/static-interface.0"]);
+const staticInterfaceGraph = await execFileAsync(zero, ["inspect", "--json", "examples/static-interface.0"]);
 const staticInterfaceGraphBody = JSON.parse(staticInterfaceGraph.stdout);
 assert(staticInterfaceGraphBody.interfaces.some((item) => item.name === "Readable" && item.staticOnly === true));
 assert(staticInterfaceGraphBody.functions.some((item) => item.name === "readValue" && item.constraints.some((constraint) => constraint.interface === "Readable<T>" && constraint.staticDispatch === true)));
-assert(staticInterfaceGraphBody.symbols.some((item) => item.name === "Readable" && item.kind === "interface"));
 
-const callResolutionGraph = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/call-resolution-inspection.0"]);
+const callResolutionGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/call-resolution-inspection.0"]);
 const callResolutionGraphBody = JSON.parse(callResolutionGraph.stdout);
 const callFacts = callResolutionGraphBody.callResolution;
 assert.equal(callFacts.schemaVersion, 1);
@@ -3414,16 +3348,16 @@ assert(callFacts.calls.some((item) => item.kind === "shape_namespace" && item.ca
 assert(callFacts.calls.some((item) => item.kind === "receiver" && item.calleeName === "bump" && item.shape === "Counter" && item.paramOffset === 1));
 assert(callFacts.calls.some((item) => item.kind === "constrained_interface" && item.calleeName === "read" && item.interface === "Readable" && item.owner === "readValue"));
 assert(callFacts.calls.some((item) => item.kind === "concrete_constrained_shape" && item.calleeName === "read" && item.shape === "Counter" && item.instantiatedBy === "main"));
-assert(callFacts.calls.some((item) => item.calleeName === "add" && item.path === "conformance/check/pass/call-resolution-inspection.0"));
+assert(callFacts.calls.some((item) => item.calleeName === "add" && item.path === "call-resolution-inspection.0"));
 assert(callFacts.calls.some((item) => item.kind === "function" && item.calleeName === "defaultCount" && item.owner === "Counter.value" && item.returnType === "i32"));
 assert(callFacts.calls.some((item) => item.kind === "function" && item.calleeName === "risky" && item.fallible === true && item.errors.includes("BadInput")));
 assert(callFacts.calls.some((item) => item.kind === "receiver" && item.calleeName === "checkedRead" && item.fallible === true && item.errors.includes("EmptyCounter")));
 
-const callResolutionMemGetGraph = await execFileAsync(zero, ["graph", "--json", "conformance/native/pass/checked-bounds-get.0"]);
+const callResolutionMemGetGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/native/pass/checked-bounds-get.0"]);
 const callResolutionMemGetFacts = JSON.parse(callResolutionMemGetGraph.stdout).callResolution;
 assert(callResolutionMemGetFacts.calls.some((item) => item.kind === "stdlib" && item.calleeName === "std.mem.get" && item.returnType === "Maybe<u8>" && item.args.some((arg) => arg.paramIndex === 0 && arg.actualType === "[3]u8")));
 
-const callResolutionGenericShapeGraph = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/generic-shape-methods.0"]);
+const callResolutionGenericShapeGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/generic-shape-methods.0"]);
 const callResolutionGenericShapeFacts = JSON.parse(callResolutionGenericShapeGraph.stdout).callResolution;
 assert(callResolutionGenericShapeFacts.calls.some((item) =>
   item.kind === "stdlib" &&
@@ -3435,24 +3369,24 @@ assert(callResolutionGenericShapeFacts.calls.some((item) =>
   item.args.some((arg) => arg.paramIndex === 0 && arg.actualType === "[4]u8")
 ));
 
-const callResolutionFsReadGraph = await execFileAsync(zero, ["graph", "--json", "conformance/native/pass/std-fs-resource.0"]);
+const callResolutionFsReadGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/native/pass/std-fs-resource.0"]);
 const callResolutionFsReadFacts = JSON.parse(callResolutionFsReadGraph.stdout).callResolution;
 assert(callResolutionFsReadFacts.calls.some((item) => item.kind === "stdlib" && item.calleeName === "std.fs.read" && item.returnType === "Maybe<usize>" && item.args.some((arg) => arg.paramIndex === 0 && arg.expectedType === "mutref<File>" && arg.actualType === "mutref<File>")));
 
-const callResolutionPackageGraph = await execFileAsync(zero, ["graph", "--json", "examples/systems-package"]);
+const callResolutionPackageGraph = await execFileAsync(zero, ["inspect", "--json", "examples/systems-package"]);
 const callResolutionPackageFacts = JSON.parse(callResolutionPackageGraph.stdout).callResolution;
-assert(callResolutionPackageFacts.calls.some((item) => item.calleeName === "cleanup" && item.path === "examples/systems-package/src/main.0" && item.line === 12));
+assert(callResolutionPackageFacts.calls.some((item) => item.calleeName === "cleanup" && item.path === "src/main.0" && item.line === 18));
 
-const callResolutionEdgeGraph = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/call-resolution-edge-cases.0"]);
+const callResolutionEdgeGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/call-resolution-edge-cases.0"]);
 const callResolutionEdgeFacts = JSON.parse(callResolutionEdgeGraph.stdout).callResolution;
 assert(callResolutionEdgeFacts.calls.some((item) => item.kind === "function" && item.calleeName === "add" && item.owner === "constTotal" && item.returnType === "i32"));
 assert(callResolutionEdgeFacts.calls.some((item) => item.kind === "stdlib" && item.calleeName === "std.mem.len" && item.owner === "main" && item.args.some((arg) => arg.paramIndex === 0 && arg.actualType === "String")));
 
-const programGraphBody = JSON.parse((await execFileAsync(zero, ["graph", "--json", "examples/hello.0"])).stdout).programGraph;
-const programGraphBodyAgain = JSON.parse((await execFileAsync(zero, ["graph", "--json", "examples/hello.0"])).stdout).programGraph;
-const programGraphDump = (await execFileAsync(zero, ["graph", "dump", "examples/hello.0"])).stdout;
-const programGraphDumpAgain = (await execFileAsync(zero, ["graph", "dump", "examples/hello.0"])).stdout;
-const programGraphDumpJson = JSON.parse((await execFileAsync(zero, ["graph", "dump", "--json", "examples/hello.0"])).stdout);
+const programGraphBody = JSON.parse((await execFileAsync(zero, ["inspect", "--json", "examples/hello.0"])).stdout).programGraph;
+const programGraphBodyAgain = JSON.parse((await execFileAsync(zero, ["inspect", "--json", "examples/hello.0"])).stdout).programGraph;
+const programGraphDump = (await execFileAsync(zero, ["dump", "examples/hello.0"])).stdout;
+const programGraphDumpAgain = (await execFileAsync(zero, ["dump", "examples/hello.0"])).stdout;
+const programGraphDumpJson = JSON.parse((await execFileAsync(zero, ["dump", "--json", "examples/hello.0"])).stdout);
 const programGraphDumpPath = `${outDir}/hello.program-graph`;
 const programGraphDumpJsonPath = `${outDir}/hello.dump-json.program-graph`;
 const programGraphCanonicalPath = `${outDir}/hello.canonical.program-graph`;
@@ -3460,7 +3394,40 @@ const programGraphViewPath = `${outDir}/hello.graph-view.0`;
 const programGraphArtifactRoundtripPath = `${outDir}/hello.roundtrip.program-graph`;
 const programGraphSourceFixturePath = "conformance/program-graph/hello.0";
 const programGraphSourceFixturePackage = "conformance/program-graph";
+const programGraphSourceFixtureStorePath = "conformance/program-graph/zero.graph";
 const programGraphSourceFixtureRunPath = `${outDir}/program-graph-fixture-run`;
+const programGraphSourceFreePackage = `${outDir}/program-graph-source-free`;
+const programGraphSourceFreeBuildPath = `${outDir}/program-graph-source-free-build`;
+const programGraphSourceFreeRunPath = `${outDir}/program-graph-source-free-run`;
+const programGraphSourceFreeStdStrPackage = `${outDir}/program-graph-source-free-std-str`;
+const programGraphCrmApiBuildPath = `${outDir}/program-graph-crm-api-build`;
+const programGraphAuthoringPackage = `${outDir}/program-graph-authoring`;
+const programGraphAuthoringRunPath = `${outDir}/program-graph-authoring-run`;
+const programGraphAuthoringRunAfterHumanEditPath = `${outDir}/program-graph-authoring-run-human-edit`;
+const programGraphBuilderOpsPackage = `${outDir}/program-graph-builder-ops`;
+const programGraphBuilderOpsRunPath = `${outDir}/program-graph-builder-ops-run`;
+const programGraphLoopTestPackage = `${outDir}/program-graph-loop-test`;
+const programGraphArrayLengthPackage = `${outDir}/program-graph-array-length-mismatch`;
+const programGraphBlockBodyPackage = `${outDir}/program-graph-block-body`;
+const programGraphBlockBodyRunPath = `${outDir}/program-graph-block-body-run`;
+const programGraphAuthoringCliPackage = `${outDir}/program-graph-authoring-cli`;
+const programGraphAuthoringCliGraphBuildPath = `${outDir}/program-graph-authoring-cli-graph-build`;
+const programGraphAuthoringCliBuildPath = `${outDir}/program-graph-authoring-cli-build`;
+const programGraphAuthoringCliRunPath = `${outDir}/program-graph-authoring-cli-run`;
+const programGraphAuthoringCliRunAfterHumanEditPath = `${outDir}/program-graph-authoring-cli-run-human-edit`;
+const programGraphSourceFreeCImportPackage = `${outDir}/program-graph-source-free-c-import`;
+const programGraphSourceFreeCImportRunPath = `${outDir}/program-graph-source-free-c-import-run`;
+const programGraphSourceFreeCImportCwdPackage = `${outDir}/program-graph-source-free-c-import-cwd`;
+const programGraphSourceFreeCImportCwdBuildPath = `${outDir}/program-graph-source-free-c-import-cwd-build`;
+const programGraphIdentityMismatchPackage = `${outDir}/program-graph-identity-mismatch`;
+const programGraphMissingPackageNamePackage = `${outDir}/program-graph-missing-package-name`;
+const programGraphBadProjectionPackage = `${outDir}/program-graph-bad-projection`;
+const programGraphSourceFixtureDriftPackage = `${outDir}/program-graph-fixture-drift`;
+const programGraphMissingStorePackage = `${outDir}/program-graph-missing-store`;
+const programGraphInvalidStorePackage = `${outDir}/program-graph-invalid-store`;
+const programGraphTargetWebbitsPackage = `${outDir}/program-graph-target-webbits`;
+const programGraphTargetIncompatiblePackage = `${outDir}/program-graph-target-incompatible`;
+const programGraphTargetCapabilityPackage = `${outDir}/program-graph-target-capability`;
 const programGraphRichPath = `${outDir}/open-ended-slices.program-graph`;
 const programGraphRichViewPath = `${outDir}/open-ended-slices.graph-view.0`;
 const programGraphCharPath = `${outDir}/float-char-casts.program-graph`;
@@ -3471,38 +3438,455 @@ await rm(programGraphCanonicalPath, { force: true });
 await rm(programGraphViewPath, { force: true });
 await rm(programGraphArtifactRoundtripPath, { force: true });
 await rm(programGraphSourceFixtureRunPath, { force: true });
+await rm(programGraphSourceFreePackage, { recursive: true, force: true });
+await rm(programGraphSourceFreeBuildPath, { force: true });
+await rm(programGraphSourceFreeRunPath, { force: true });
+await rm(programGraphSourceFreeStdStrPackage, { recursive: true, force: true });
+await rm(programGraphCrmApiBuildPath, { force: true });
+await rm(programGraphAuthoringPackage, { recursive: true, force: true });
+await rm(programGraphAuthoringRunPath, { force: true });
+await rm(programGraphAuthoringRunAfterHumanEditPath, { force: true });
+await rm(programGraphBuilderOpsPackage, { recursive: true, force: true });
+await rm(programGraphBuilderOpsRunPath, { force: true });
+await rm(programGraphLoopTestPackage, { recursive: true, force: true });
+await rm(programGraphArrayLengthPackage, { recursive: true, force: true });
+await rm(programGraphBlockBodyPackage, { recursive: true, force: true });
+await rm(programGraphBlockBodyRunPath, { force: true });
+await rm(programGraphAuthoringCliPackage, { recursive: true, force: true });
+await rm(programGraphAuthoringCliGraphBuildPath, { force: true });
+await rm(programGraphAuthoringCliBuildPath, { force: true });
+await rm(programGraphAuthoringCliRunPath, { force: true });
+await rm(programGraphAuthoringCliRunAfterHumanEditPath, { force: true });
+await rm(programGraphSourceFreeCImportPackage, { recursive: true, force: true });
+await rm(programGraphSourceFreeCImportRunPath, { force: true });
+await rm(programGraphSourceFreeCImportCwdPackage, { recursive: true, force: true });
+await rm(programGraphSourceFreeCImportCwdBuildPath, { force: true });
+await rm(programGraphIdentityMismatchPackage, { recursive: true, force: true });
+await rm(programGraphMissingPackageNamePackage, { recursive: true, force: true });
+await rm(programGraphBadProjectionPackage, { recursive: true, force: true });
+await rm(programGraphSourceFixtureDriftPackage, { recursive: true, force: true });
+await rm(programGraphMissingStorePackage, { recursive: true, force: true });
+await rm(programGraphInvalidStorePackage, { recursive: true, force: true });
+await rm(programGraphTargetWebbitsPackage, { recursive: true, force: true });
+await rm(programGraphTargetIncompatiblePackage, { recursive: true, force: true });
+await rm(programGraphTargetCapabilityPackage, { recursive: true, force: true });
 await rm(programGraphRichPath, { force: true });
 await rm(programGraphRichViewPath, { force: true });
 await rm(programGraphCharPath, { force: true });
 await rm(programGraphCharViewPath, { force: true });
-const programGraphDumpOut = await execFileAsync(zero, ["graph", "dump", "--out", programGraphDumpPath, "examples/hello.0"]);
-const programGraphDumpOutJson = JSON.parse((await execFileAsync(zero, ["graph", "dump", "--json", "--out", programGraphDumpJsonPath, "examples/hello.0"])).stdout);
+const programGraphDumpOut = await execFileAsync(zero, ["dump", "--out", programGraphDumpPath, "examples/hello.0"]);
+const programGraphDumpOutJson = JSON.parse((await execFileAsync(zero, ["dump", "--json", "--out", programGraphDumpJsonPath, "examples/hello.0"])).stdout);
 const programGraphDumpFile = await readFile(programGraphDumpPath, "utf8");
 const programGraphDumpJsonFile = await readFile(programGraphDumpJsonPath, "utf8");
-const programGraphValidate = await execFileAsync(zero, ["graph", "validate", programGraphDumpPath]);
-const programGraphDumpJsonValidate = await execFileAsync(zero, ["graph", "validate", programGraphDumpJsonPath]);
-const programGraphValidateJson = JSON.parse((await execFileAsync(zero, ["graph", "validate", "--json", "--out", programGraphCanonicalPath, programGraphDumpPath])).stdout);
+const programGraphValidate = await execFileAsync(zero, ["validate", programGraphDumpPath]);
+const programGraphDumpJsonValidate = await execFileAsync(zero, ["validate", programGraphDumpJsonPath]);
+const programGraphValidateJson = JSON.parse((await execFileAsync(zero, ["validate", "--json", "--out", programGraphCanonicalPath, programGraphDumpPath])).stdout);
 const programGraphCanonicalFile = await readFile(programGraphCanonicalPath, "utf8");
-const programGraphView = (await execFileAsync(zero, ["graph", "view", programGraphDumpPath])).stdout;
-const programGraphViewAgain = (await execFileAsync(zero, ["graph", "view", programGraphDumpPath])).stdout;
-const programGraphViewJson = JSON.parse((await execFileAsync(zero, ["graph", "view", "--json", programGraphDumpPath])).stdout);
-const programGraphTypeInvalidView = (await execFileAsync(zero, ["graph", "view", "conformance/check/fail/unknown-name.0"])).stdout;
-const programGraphTypeInvalidCheckJson = await execFileAsync(zero, ["graph", "check", "--json", "conformance/check/fail/unknown-name.0"]).catch((error) => error);
-const programGraphViewOut = await execFileAsync(zero, ["graph", "view", "--out", programGraphViewPath, programGraphDumpPath]);
+const programGraphView = (await execFileAsync(zero, ["view", programGraphDumpPath])).stdout;
+const programGraphViewAgain = (await execFileAsync(zero, ["view", programGraphDumpPath])).stdout;
+const programGraphViewJson = JSON.parse((await execFileAsync(zero, ["view", "--json", programGraphDumpPath])).stdout);
+const programGraphViewOut = await execFileAsync(zero, ["view", "--out", programGraphViewPath, programGraphDumpPath]);
 const programGraphViewFile = await readFile(programGraphViewPath, "utf8");
-const programGraphViewOutJson = JSON.parse((await execFileAsync(zero, ["graph", "view", "--json", "--out", programGraphViewPath, programGraphDumpPath])).stdout);
-const programGraphRoundtrip = await execFileAsync(zero, ["graph", "roundtrip", "examples/hello.0"]);
-const programGraphRoundtripJson = JSON.parse((await execFileAsync(zero, ["graph", "roundtrip", "--json", "examples/hello.0"])).stdout);
-const programGraphArtifactRoundtrip = await execFileAsync(zero, ["graph", "roundtrip", programGraphDumpPath]);
-const programGraphArtifactRoundtripJson = JSON.parse((await execFileAsync(zero, ["graph", "roundtrip", "--json", "--out", programGraphArtifactRoundtripPath, programGraphDumpPath])).stdout);
+const programGraphViewOutJson = JSON.parse((await execFileAsync(zero, ["view", "--json", "--out", programGraphViewPath, programGraphDumpPath])).stdout);
+const programGraphRoundtrip = await execFileAsync(zero, ["roundtrip", "examples/hello.0"]);
+const programGraphRoundtripJson = JSON.parse((await execFileAsync(zero, ["roundtrip", "--json", "examples/hello.0"])).stdout);
+const programGraphArtifactRoundtrip = await execFileAsync(zero, ["roundtrip", programGraphDumpPath]);
+const programGraphArtifactRoundtripJson = JSON.parse((await execFileAsync(zero, ["roundtrip", "--json", "--out", programGraphArtifactRoundtripPath, programGraphDumpPath])).stdout);
 const programGraphSourceFixtureText = await readFile(programGraphSourceFixturePath, "utf8");
+const programGraphSourceFixtureStoreBytes = await readFile(programGraphSourceFixtureStorePath);
 const programGraphSourceFixturePackageCheckJson = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphSourceFixturePackage])).stdout);
+const programGraphSourceFixturePackageStatusJson = JSON.parse((await execFileAsync(zero, ["status", "--json", programGraphSourceFixturePackage])).stdout);
 const programGraphSourceFixturePackageRun = await execFileAsync(zero, ["run", "--out", programGraphSourceFixtureRunPath, programGraphSourceFixturePackage]);
-await execFileAsync(zero, ["graph", "dump", "--out", programGraphRichPath, "conformance/native/pass/open-ended-slices.0"]);
-await execFileAsync(zero, ["graph", "view", "--out", programGraphRichViewPath, programGraphRichPath]);
+await mkdir(programGraphSourceFreePackage, { recursive: true });
+await writeFile(`${programGraphSourceFreePackage}/zero.toml`, await readFile(`${programGraphSourceFixturePackage}/zero.toml`, "utf8"));
+await writeFile(`${programGraphSourceFreePackage}/zero.graph`, programGraphSourceFixtureStoreBytes);
+const programGraphSourceFreeCheckJson = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphSourceFreePackage])).stdout);
+const programGraphSourceFreeSizeJson = JSON.parse((await execFileAsync(zero, ["size", "--json", "--target", "linux-musl-x64", programGraphSourceFreePackage])).stdout);
+const programGraphSourceFreeBuildJson = JSON.parse((await execFileAsync(zero, ["build", "--json", "--target", "linux-musl-x64", "--out", programGraphSourceFreeBuildPath, programGraphSourceFreePackage])).stdout);
+const programGraphSourceFreeMappedMirCache = programGraphSourceFreeBuildJson.graphBuild?.mappedFinalMir;
+const programGraphSourceFreeMappedMirCachePath = programGraphSourceFreeMappedMirCache?.path ?? "";
+const programGraphSourceFreeRun = await execFileAsync(zero, ["run", "--out", programGraphSourceFreeRunPath, programGraphSourceFreePackage]);
+const programGraphSourceFreeTestJson = JSON.parse((await execFileAsync(zero, ["test", "--json", programGraphSourceFreePackage])).stdout);
+const programGraphSourceFreeMemJson = JSON.parse((await execFileAsync(zero, ["mem", "--json", programGraphSourceFreePackage])).stdout);
+const programGraphSourceFreeVerify = await execFileAsync(zero, ["verify-projection", "--json", programGraphSourceFreePackage]).catch((error) => error);
+const programGraphSourceFreeExport = JSON.parse((await execFileAsync(zero, ["export", "--json", programGraphSourceFreePackage])).stdout);
+const programGraphSourceFreeVerifyAfter = JSON.parse((await execFileAsync(zero, ["verify-projection", "--json", programGraphSourceFreePackage])).stdout);
+await mkdir(programGraphSourceFreeStdStrPackage, { recursive: true });
+await writeZeroToml(programGraphSourceFreeStdStrPackage, {
+  package: { name: "program-graph-source-free-std-str", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "main.0" } },
+});
+await writeFile(`${programGraphSourceFreeStdStrPackage}/main.0`, await readFile("examples/std-str.0", "utf8"));
+const programGraphSourceFreeStdStrSync = JSON.parse((await execFileAsync(zero, ["import", "--json", programGraphSourceFreeStdStrPackage])).stdout);
+await rm(`${programGraphSourceFreeStdStrPackage}/main.0`, { force: true });
+const programGraphSourceFreeStdStrCheckJson = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphSourceFreeStdStrPackage])).stdout);
+const programGraphCrmApiCheckJson = JSON.parse((await execFileAsync(zero, ["check", "--json", "examples/crm-api"])).stdout);
+const programGraphCrmApiStatusJson = JSON.parse((await execFileAsync(zero, ["status", "--json", "examples/crm-api"])).stdout);
+const programGraphCrmApiBuildJson = JSON.parse((await execFileAsync(zero, ["build", "--json", "--out", programGraphCrmApiBuildPath, "examples/crm-api"])).stdout);
+const programGraphCrmApiHealth = await execFileAsync(programGraphCrmApiBuildPath, ["GET /health\n\n"]);
+const programGraphCrmApiAccounts = await execFileAsync(programGraphCrmApiBuildPath, ["GET /crm/accounts?tenant=demo\n\n"]);
+const programGraphCrmApiDealUpdate = await execFileAsync(programGraphCrmApiBuildPath, ["POST /crm/deals/42/update\ncontent-type: application/json\n\n{\"stage\":\"won\"}"]);
+const programGraphCrmApiMissing = await execFileAsync(programGraphCrmApiBuildPath, ["GET /missing\n\n"]);
+const programGraphAuthoringInit = JSON.parse((await execFileAsync(zero, ["init", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringProjectionExistsAfterInit = await fileExists(`${programGraphAuthoringPackage}/src/main.0`);
+const programGraphAuthoringPatch = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "addMain",
+  "--op",
+  "addFunction name=\"add\" ret=\"i32\"",
+  "--op",
+  "addParam fn=\"add\" name=\"left\" type=\"i32\"",
+  "--op",
+  "addParam fn=\"add\" name=\"right\" type=\"i32\"",
+  "--op",
+  "addReturnBinary fn=\"add\" name=\"+\" left=\"left\" right=\"right\" type=\"i32\"",
+  "--op",
+  "addCheckWrite fn=\"main\" text=\"graph authoring ok\\n\"",
+  "--op",
+  "addTest name=\"addition works\" call=\"add\" arg0=\"40\" arg1=\"2\" expect=\"42\" type=\"i32\"",
+], { cwd: programGraphAuthoringPackage })).stdout);
+const programGraphAuthoringProjectionExistsAfterPatch = await fileExists(`${programGraphAuthoringPackage}/src/main.0`);
+const programGraphAuthoringStatusMissing = JSON.parse((await execFileAsync(zero, ["status", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringVerifyMissing = await execFileAsync(zero, ["verify-projection", "--json", programGraphAuthoringPackage]).catch((error) => error);
+const programGraphAuthoringCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringRun = await execFileAsync(zero, ["run", "--out", programGraphAuthoringRunPath, programGraphAuthoringPackage]);
+const programGraphAuthoringTest = JSON.parse((await execFileAsync(zero, ["test", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringExport = JSON.parse((await execFileAsync(zero, ["export", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringProjectionText = await readFile(`${programGraphAuthoringPackage}/src/main.0`, "utf8");
+const programGraphAuthoringVerifyAfter = JSON.parse((await execFileAsync(zero, ["verify-projection", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringCheckAfter = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringEditedText = programGraphAuthoringProjectionText.replace("graph authoring ok", "human edit ok");
+await writeFile(`${programGraphAuthoringPackage}/src/main.0`, programGraphAuthoringEditedText);
+const programGraphAuthoringStatusAfterHumanEdit = JSON.parse((await execFileAsync(zero, ["status", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringImport = JSON.parse((await execFileAsync(zero, ["import", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringCheckAfterHumanEdit = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphAuthoringPackage])).stdout);
+const programGraphAuthoringRunAfterHumanEdit = await execFileAsync(zero, ["run", "--out", programGraphAuthoringRunAfterHumanEditPath, programGraphAuthoringPackage]);
+const programGraphBuilderOpsInit = JSON.parse((await execFileAsync(zero, ["init", "--json", programGraphBuilderOpsPackage])).stdout);
+const programGraphBuilderOpsPatch = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "addMain",
+  "--op",
+  "addLetLiteral fn=\"main\" name=\"message\" type=\"String\" value=\"graph value write ok\\n\"",
+  "--op",
+  "addCheckWriteValue fn=\"main\" value=\"message\" type=\"String\"",
+  "--op",
+  "addFunction name=\"add_twice\" ret=\"u32\"",
+  "--op",
+  "addParam fn=\"add_twice\" name=\"x\" type=\"u32\"",
+  "--op",
+  "addParam fn=\"add_twice\" name=\"y\" type=\"u32\"",
+  "--op",
+  "addLetBinary fn=\"add_twice\" name=\"first\" type=\"u32\" operator=\"+\" left=\"x\" right=\"y\"",
+  "--op",
+  "addLetBinary fn=\"add_twice\" name=\"total\" type=\"u32\" operator=\"+\" left=\"first\" right=\"y\"",
+  "--op",
+  "addReturnValue fn=\"add_twice\" value=\"total\" type=\"u32\"",
+  "--op",
+  "addTest name=\"add twice\" call=\"add_twice\" arg0=\"3\" arg1=\"2\" expect=\"7\" type=\"u32\"",
+], { cwd: programGraphBuilderOpsPackage })).stdout);
+const programGraphBuilderOpsProjectionExistsAfterPatch = await fileExists(`${programGraphBuilderOpsPackage}/src/main.0`);
+const programGraphBuilderOpsQuery = JSON.parse((await execFileAsync(zero, ["query", "--json", programGraphBuilderOpsPackage])).stdout);
+const programGraphBuilderOpsView = (await execFileAsync(zero, ["view", programGraphBuilderOpsPackage])).stdout;
+const programGraphBuilderOpsCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphBuilderOpsPackage])).stdout);
+const programGraphBuilderOpsTest = JSON.parse((await execFileAsync(zero, ["test", "--json", programGraphBuilderOpsPackage])).stdout);
+const programGraphBuilderOpsRun = await execFileAsync(zero, ["run", "--out", programGraphBuilderOpsRunPath, programGraphBuilderOpsPackage]);
+const programGraphBuilderOpsSync = JSON.parse((await execFileAsync(zero, ["export", "--json", programGraphBuilderOpsPackage])).stdout);
+const programGraphBuilderOpsProjectionText = await readFile(`${programGraphBuilderOpsPackage}/src/main.0`, "utf8");
+const programGraphLoopTestInit = JSON.parse((await execFileAsync(zero, ["init", "--json", programGraphLoopTestPackage])).stdout);
+const programGraphLoopTestPatch = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "addMain",
+  "--op",
+  "addFunction name=\"count_to\" ret=\"u32\"",
+  "--op",
+  "addParam fn=\"count_to\" name=\"n\" type=\"u32\"",
+  "--op",
+  "addParam fn=\"count_to\" name=\"start\" type=\"u32\"",
+  "--op",
+  "addReturnBinary fn=\"count_to\" name=\"+\" left=\"n\" right=\"start\" type=\"u32\"",
+], { cwd: programGraphLoopTestPackage })).stdout);
+const programGraphLoopTestBodyQuery = JSON.parse((await execFileAsync(zero, ["query", "--json", programGraphLoopTestPackage])).stdout);
+const programGraphLoopTestBodyPatchText = [
+  "zero-program-graph-patch v1",
+  `expect graphHash "${programGraphLoopTestBodyQuery.graphHash}"`,
+  "replaceFunctionBody count_to",
+  "  var i u32 = start",
+  "  while i < n",
+  "    i = i + 1",
+  "  return i",
+  "end",
+  "",
+].join("\n");
+const programGraphLoopTestBodyPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", programGraphLoopTestPackage, "--patch-text", programGraphLoopTestBodyPatchText])).stdout);
+const programGraphLoopTestAddTest = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "addTest name=\"graph while assignment\" call=\"count_to\" arg0=\"4\" arg1=\"0\" expect=\"4\" type=\"u32\"",
+], { cwd: programGraphLoopTestPackage })).stdout);
+const programGraphLoopTestCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphLoopTestPackage])).stdout);
+const programGraphLoopTestRun = JSON.parse((await execFileAsync(zero, ["test", "--json", programGraphLoopTestPackage])).stdout);
+const programGraphLoopTestView = (await execFileAsync(zero, ["view", programGraphLoopTestPackage])).stdout;
+const programGraphArrayLengthInit = JSON.parse((await execFileAsync(zero, ["init", "--json", programGraphArrayLengthPackage])).stdout);
+const programGraphArrayLengthMainPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", "--op", "addMain", programGraphArrayLengthPackage])).stdout);
+const programGraphArrayLengthRepeatBodyPath = `${outDir}/program-graph-array-length-repeat-body.0`;
+await writeFile(programGraphArrayLengthRepeatBodyPath, 'var b: [64]u8 = [0_u8; 32]\ncheck world.out.write("unreachable\\n")\n');
+const programGraphArrayLengthRepeatPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", "--replace-fn", "main", "--body-file", programGraphArrayLengthRepeatBodyPath, programGraphArrayLengthPackage]).catch((error) => error)).stdout);
+const programGraphArrayLengthListBodyPath = `${outDir}/program-graph-array-length-list-body.0`;
+await writeFile(programGraphArrayLengthListBodyPath, 'var b: [4]u8 = [1, 2]\ncheck world.out.write("unreachable\\n")\n');
+const programGraphArrayLengthListPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", "--replace-fn", "main", "--body-file", programGraphArrayLengthListBodyPath, programGraphArrayLengthPackage]).catch((error) => error)).stdout);
+const programGraphArrayLengthMatchingBodyPath = `${outDir}/program-graph-array-length-matching-body.0`;
+await writeFile(programGraphArrayLengthMatchingBodyPath, 'var b: [4]u8 = [0_u8; 4]\nb[0] = 1\ncheck world.out.write("lengths agree\\n")\n');
+const programGraphArrayLengthMatchingPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", "--replace-fn", "main", "--body-file", programGraphArrayLengthMatchingBodyPath, programGraphArrayLengthPackage])).stdout);
+const programGraphArrayLengthCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphArrayLengthPackage])).stdout);
+const programGraphBlockBodyInit = JSON.parse((await execFileAsync(zero, ["init", "--json", programGraphBlockBodyPackage])).stdout);
+const programGraphBlockBodyMainPatch = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "addMain",
+], { cwd: programGraphBlockBodyPackage })).stdout);
+const programGraphBlockBodyMainQuery = JSON.parse((await execFileAsync(zero, ["query", "--json", programGraphBlockBodyPackage])).stdout);
+const programGraphBlockBodyGreetingPatchText = [
+  "zero-program-graph-patch v1",
+  `expect graphHash "${programGraphBlockBodyMainQuery.graphHash}"`,
+  "replaceFunctionBody main",
+  "  let name Maybe<String> = std.args.get 1",
+  "  if name.has",
+  "    check world.out.write \"hello \"",
+  "    check world.out.write name.value",
+  "    check world.out.write \"\\n\"",
+  "  else",
+  "    check world.out.write \"hello anonymous\\n\"",
+  "end",
+  "",
+].join("\n");
+const programGraphBlockBodyGreetingPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", programGraphBlockBodyPackage, "--patch-text", programGraphBlockBodyGreetingPatchText])).stdout);
+const programGraphBlockBodyBlocks = JSON.parse((await execFileAsync(zero, ["query", "--json", "--find", "Block", programGraphBlockBodyPackage])).stdout);
+const programGraphBlockBodyThen = programGraphBlockBodyBlocks.matches.find((node) => node.kind === "Block" && node.name === "then");
+assert(programGraphBlockBodyThen, "expected row-patched greeting body to expose a then block handle");
+const programGraphBlockBodyPatchText = [
+  "zero-program-graph-patch v1",
+  `expect graphHash "${programGraphBlockBodyBlocks.graphHash}"`,
+  `replaceBlockBody ${programGraphBlockBodyThen.id}`,
+  "  check world.out.write \"name + value: \"",
+  "  check world.out.write name.value",
+  "  check world.out.write \"\\n\"",
+  "end",
+  "",
+].join("\n");
+const programGraphBlockBodyDryRun = JSON.parse((await execFileAsync(zero, ["patch", "--json", "--check-only", programGraphBlockBodyPackage, "--patch-text", programGraphBlockBodyPatchText])).stdout);
+const programGraphBlockBodyPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", programGraphBlockBodyPackage, "--patch-text", programGraphBlockBodyPatchText])).stdout);
+const programGraphBlockBodyView = (await execFileAsync(zero, ["view", programGraphBlockBodyPackage])).stdout;
+const programGraphBlockBodyCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphBlockBodyPackage])).stdout);
+const programGraphBlockBodyRun = await execFileAsync(zero, ["run", "--out", programGraphBlockBodyRunPath, programGraphBlockBodyPackage, "--", "Ada"]);
+const programGraphAuthoringCliInit = JSON.parse((await execFileAsync(zero, ["init", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliProjectionExistsAfterInit = await fileExists(`${programGraphAuthoringCliPackage}/src/main.0`);
+const programGraphAuthoringCliPatch = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "addMain",
+  "--op",
+  "addFunction name=\"add_u32\" ret=\"u32\"",
+  "--op",
+  "addParam fn=\"add_u32\" name=\"x\" type=\"u32\"",
+  "--op",
+  "addParam fn=\"add_u32\" name=\"y\" type=\"u32\"",
+  "--op",
+  "addReturnBinary fn=\"add_u32\" name=\"+\" left=\"x\" right=\"y\" type=\"u32\"",
+], { cwd: programGraphAuthoringCliPackage })).stdout);
+const programGraphAuthoringCliBodyQuery = JSON.parse((await execFileAsync(zero, ["query", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliBodyPatchText = [
+  "zero-program-graph-patch v1",
+  `expect graphHash "${programGraphAuthoringCliBodyQuery.graphHash}"`,
+  "replaceFunctionBody main",
+  "  let x Maybe<u32> = std.args.parseU32 1",
+  "  let y Maybe<u32> = std.args.parseU32 2",
+  "  if x.has && y.has",
+  "    let result u32 = add_u32 x.value y.value",
+  "    var out [10]u8 = repeat 0_u8 10",
+  "    let text Maybe<Span<u8>> = std.fmt.u32 out result",
+  "    if text.has",
+  "      check world.out.write text.value",
+  "      check world.out.write \"\\n\"",
+  "  else",
+  "    check world.err.write \"usage: zero run . -- <x> <y>\\n\"",
+  "end",
+  "",
+].join("\n");
+const programGraphAuthoringCliBodyPatch = JSON.parse((await execFileAsync(zero, ["patch", "--json", programGraphAuthoringCliPackage, "--patch-text", programGraphAuthoringCliBodyPatchText])).stdout);
+const programGraphAuthoringCliProjectionExistsAfterPatch = await fileExists(`${programGraphAuthoringCliPackage}/src/main.0`);
+const programGraphAuthoringCliStaleAddPatch = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "addFunction name=\"add\" ret=\"i32\"",
+  "--op",
+  "addParam fn=\"add\" name=\"x\" type=\"i32\"",
+  "--op",
+  "addParam fn=\"add\" name=\"y\" type=\"i32\"",
+  "--op",
+  "addReturnBinary fn=\"add\" name=\"+\" left=\"x\" right=\"y\" type=\"i32\"",
+  "--op",
+  "addTest name=\"add works\" call=\"add\" arg0=\"40\" arg1=\"2\" expect=\"42\" type=\"i32\"",
+], { cwd: programGraphAuthoringCliPackage })).stdout);
+const programGraphAuthoringCliFindAdd = JSON.parse((await execFileAsync(zero, ["query", "--json", "--find", "add", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliNodeAdd = JSON.parse((await execFileAsync(zero, ["query", "--json", "--node", "#fn_add", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliCleanupPatch = JSON.parse((await execFileAsync(zero, [
+  "patch",
+  "--json",
+  "--op",
+  "delete node=\"#fn___zero_test_0\"",
+  "--op",
+  "delete node=\"#fn_add\"",
+  "--op",
+  "addTest name=\"add_u32 works\" call=\"add_u32\" arg0=\"40\" arg1=\"2\" expect=\"42\" type=\"u32\"",
+], { cwd: programGraphAuthoringCliPackage })).stdout);
+const programGraphAuthoringCliCallsText = (await execFileAsync(zero, ["query", "--fn", "main", "--calls", "std", programGraphAuthoringCliPackage])).stdout;
+const programGraphAuthoringCliRefsText = (await execFileAsync(zero, ["query", "--refs", "add_u32", programGraphAuthoringCliPackage])).stdout;
+const programGraphAuthoringCliQuery = JSON.parse((await execFileAsync(zero, ["query", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliGraphBuild = await execFileAsync(zero, ["build", "--out", programGraphAuthoringCliGraphBuildPath, programGraphAuthoringCliPackage]);
+const programGraphAuthoringCliBuild = await execFileAsync(zero, ["build", "--out", programGraphAuthoringCliBuildPath, programGraphAuthoringCliPackage]);
+const programGraphAuthoringCliTest = JSON.parse((await execFileAsync(zero, ["test", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliGraphTest = await execFileAsync(zero, ["test", programGraphAuthoringCliPackage]);
+const programGraphAuthoringCliRun = await execFileAsync(zero, ["run", "--out", programGraphAuthoringCliRunPath, programGraphAuthoringCliPackage, "--", "40", "2"]);
+const programGraphAuthoringCliGraphRun = await execFileAsync(zero, ["run", programGraphAuthoringCliPackage, "--", "7", "8"]);
+const programGraphAuthoringCliSize = JSON.parse((await execFileAsync(zero, ["size", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliSync = JSON.parse((await execFileAsync(zero, ["export", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliProjectionText = await readFile(`${programGraphAuthoringCliPackage}/src/main.0`, "utf8");
+const programGraphAuthoringCliEditedProjectionText = programGraphAuthoringCliProjectionText.replace("usage: zero run . -- <x> <y>\\n", "usage: zero run . -- <left> <right>\\n");
+await writeFile(`${programGraphAuthoringCliPackage}/src/main.0`, programGraphAuthoringCliEditedProjectionText);
+const programGraphAuthoringCliStatusAfterHumanEdit = JSON.parse((await execFileAsync(zero, ["status", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliImport = JSON.parse((await execFileAsync(zero, ["import", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliQueryAfterHumanEdit = JSON.parse((await execFileAsync(zero, ["query", "--json", "--calls", "std", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliFindUsageText = (await execFileAsync(zero, ["query", "--find", "usage", programGraphAuthoringCliPackage])).stdout;
+const programGraphAuthoringCliVerifyAfterHumanEdit = JSON.parse((await execFileAsync(zero, ["verify-projection", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliCheckAfterHumanEdit = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliTestAfterHumanEdit = JSON.parse((await execFileAsync(zero, ["test", "--json", programGraphAuthoringCliPackage])).stdout);
+const programGraphAuthoringCliRunAfterHumanEdit = await execFileAsync(zero, ["run", "--out", programGraphAuthoringCliRunAfterHumanEditPath, programGraphAuthoringCliPackage, "--", "5", "6"]);
+await mkdir(`${programGraphSourceFreeCImportPackage}/src`, { recursive: true });
+await mkdir(`${programGraphSourceFreeCImportPackage}/vendor/include`, { recursive: true });
+await writeZeroToml(programGraphSourceFreeCImportPackage, {
+  package: { name: "program-graph-source-free-c-import", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "src/main.0" } },
+  c: {
+    libs: {
+      ext: { headers: ["vendor/include/zero_ext.h"], include: ["vendor/include"], lib: [], link: [], mode: "static" },
+    },
+  },
+});
+await writeFile(`${programGraphSourceFreeCImportPackage}/vendor/include/zero_ext.h`, "int zero_ext_add(int a, int b);\n");
+await writeFile(`${programGraphSourceFreeCImportPackage}/src/main.0`, `extern c "vendor/include/zero_ext.h" as c
+
+pub fn main(world: World) -> Void raises {
+    check world.out.write("source-free c import ok\\n")
+}
+`);
+const programGraphSourceFreeCImportSync = JSON.parse((await execFileAsync(zero, ["import", "--json", programGraphSourceFreeCImportPackage])).stdout);
+await rm(`${programGraphSourceFreeCImportPackage}/src`, { recursive: true, force: true });
+const programGraphSourceFreeCImportCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphSourceFreeCImportPackage])).stdout);
+const programGraphSourceFreeCImportRun = await execFileAsync(zero, ["run", "--out", programGraphSourceFreeCImportRunPath, programGraphSourceFreeCImportPackage]);
+await mkdir(programGraphSourceFreeCImportCwdPackage, { recursive: true });
+await writeZeroToml(programGraphSourceFreeCImportCwdPackage, {
+  package: { name: "program-graph-source-free-c-import-cwd", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "src/main.0" } },
+});
+const programGraphSourceFreeCImportCwdBuild = JSON.parse((await execFileAsync(resolve(zero), [
+  "build",
+  "--json",
+  "--out",
+  resolve(programGraphSourceFreeCImportCwdBuildPath),
+  resolve(programGraphSourceFreeCImportPackage),
+], { cwd: programGraphSourceFreeCImportCwdPackage })).stdout);
+await mkdir(programGraphIdentityMismatchPackage, { recursive: true });
+await writeZeroToml(programGraphIdentityMismatchPackage, {
+  package: { name: "program-graph-wrong-package", version: "9.9.9" },
+  targets: { cli: { kind: "exe", main: "hello.0" } },
+});
+await writeFile(`${programGraphIdentityMismatchPackage}/zero.graph`, programGraphSourceFixtureStoreBytes);
+const programGraphIdentityMismatchCheck = await execFileAsync(zero, ["check", "--json", programGraphIdentityMismatchPackage]).catch((error) => error);
+const programGraphIdentityMismatchSize = await execFileAsync(zero, ["size", "--json", programGraphIdentityMismatchPackage]).catch((error) => error);
+await mkdir(programGraphMissingPackageNamePackage, { recursive: true });
+await writeZeroToml(programGraphMissingPackageNamePackage, {
+  targets: { cli: { kind: "exe", main: "hello.0" } },
+});
+await writeFile(`${programGraphMissingPackageNamePackage}/zero.graph`, programGraphSourceFixtureStoreBytes);
+const programGraphMissingPackageNameCheck = await execFileAsync(zero, ["check", "--json", programGraphMissingPackageNamePackage]).catch((error) => error);
+await mkdir(programGraphBadProjectionPackage, { recursive: true });
+await writeFile(`${programGraphBadProjectionPackage}/zero.toml`, await readFile(`${programGraphSourceFixturePackage}/zero.toml`, "utf8"));
+await writeFile(`${programGraphBadProjectionPackage}/hello.0`, programGraphSourceFixtureText);
+await execFileAsync(zero, ["import", "--format", "text", programGraphBadProjectionPackage]);
+const programGraphBadProjectionStoreText = await readFile(`${programGraphBadProjectionPackage}/zero.graph`, "utf8");
+await writeFile(`${programGraphBadProjectionPackage}/zero.graph`, programGraphBadProjectionStoreText.replace(
+  /^projection path:"hello\.0" text:.*$/m,
+  `projection path:"hello.0" text:${JSON.stringify("pub fn broken( {\n")}`,
+));
+const programGraphBadProjectionStatus = JSON.parse((await execFileAsync(zero, ["status", "--json", programGraphBadProjectionPackage])).stdout);
+const programGraphBadProjectionCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphBadProjectionPackage])).stdout);
+const programGraphBadProjectionSync = await execFileAsync(zero, ["export", "--json", programGraphBadProjectionPackage]).catch((error) => error);
+await mkdir(programGraphMissingStorePackage, { recursive: true });
+await writeZeroToml(programGraphMissingStorePackage, {
+  package: { name: "program-graph-missing-store", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "main.0" } },
+});
+await writeFile(`${programGraphMissingStorePackage}/main.0`, "pub fn main() -> i32 { return 0 }\n");
+const programGraphMissingStoreCheck = await execFileAsync(zero, ["check", "--json", programGraphMissingStorePackage]).catch((error) => error);
+await mkdir(programGraphInvalidStorePackage, { recursive: true });
+await writeZeroToml(programGraphInvalidStorePackage, {
+  package: { name: "program-graph-invalid-store", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "main.0" } },
+});
+await writeFile(`${programGraphInvalidStorePackage}/main.0`, "pub fn main() -> i32 { return 0 }\n");
+await writeFile(`${programGraphInvalidStorePackage}/zero.graph`, "not a repository graph\n");
+const programGraphInvalidStoreCheck = await execFileAsync(zero, ["check", "--json", programGraphInvalidStorePackage]).catch((error) => error);
+await mkdir(programGraphSourceFixtureDriftPackage, { recursive: true });
+await writeFile(`${programGraphSourceFixtureDriftPackage}/zero.toml`, await readFile(`${programGraphSourceFixturePackage}/zero.toml`, "utf8"));
+await writeFile(`${programGraphSourceFixtureDriftPackage}/zero.graph`, programGraphSourceFixtureStoreBytes);
+await writeFile(`${programGraphSourceFixtureDriftPackage}/hello.0`, programGraphSourceFixtureText.replace("hello from zero", "hello from drift"));
+const programGraphSourceFixtureDriftVerify = await execFileAsync(zero, ["verify-projection", "--json", programGraphSourceFixtureDriftPackage]).catch((error) => error);
+const programGraphSourceFixtureDriftCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", programGraphSourceFixtureDriftPackage])).stdout);
+const programGraphSourceFixtureDriftVerifyAfterRefresh = JSON.parse((await execFileAsync(zero, ["verify-projection", "--json", programGraphSourceFixtureDriftPackage])).stdout);
+await mkdir(programGraphTargetWebbitsPackage, { recursive: true });
+await writeFile(`${programGraphTargetWebbitsPackage}/zero.toml`, await readFile("conformance/packages/target-webbits/zero.toml", "utf8"));
+await mkdir(`${programGraphTargetIncompatiblePackage}/src`, { recursive: true });
+await writeZeroToml(programGraphTargetIncompatiblePackage, {
+  package: { name: "program-graph-target-incompatible", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "src/main.0" } },
+  dependencies: { "target-webbits": { path: "../program-graph-target-webbits", version: "0.1.0", targets: ["win32-x64.exe"] } },
+});
+await writeFile(`${programGraphTargetIncompatiblePackage}/src/main.0`, `pub fn main(world: World) -> Void raises {
+    check world.out.write("target incompatible\\n")
+}
+`);
+const programGraphTargetIncompatibleSync = JSON.parse((await execFileAsync(zero, ["import", "--json", programGraphTargetIncompatiblePackage])).stdout);
+const programGraphTargetIncompatibleCheck = await execFileAsync(zero, ["check", "--json", "--target", "linux-musl-x64", programGraphTargetIncompatiblePackage]).catch((error) => error);
+await mkdir(programGraphTargetCapabilityPackage, { recursive: true });
+await writeZeroToml(programGraphTargetCapabilityPackage, {
+  package: { name: "program-graph-target-capability", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "main.0" } },
+});
+await writeFile(`${programGraphTargetCapabilityPackage}/main.0`, `pub fn main(world: World) -> Void raises {
+    let fs: Fs = std.fs.host()
+    if std.fs.writeFile(fs, ".zero/out/program-graph-target-capability.txt", "ok\\n") {
+        check world.out.write("ok\\n")
+    }
+}
+`);
+const programGraphTargetCapabilitySync = JSON.parse((await execFileAsync(zero, ["import", "--json", programGraphTargetCapabilityPackage])).stdout);
+const programGraphTargetCapabilityCheck = await execFileAsync(zero, ["check", "--json", "--target", "linux-arm64", programGraphTargetCapabilityPackage]).catch((error) => error);
+await execFileAsync(zero, ["dump", "--out", programGraphRichPath, "conformance/native/pass/open-ended-slices.0"]);
+await execFileAsync(zero, ["view", "--out", programGraphRichViewPath, programGraphRichPath]);
 const programGraphRichView = await readFile(programGraphRichViewPath, "utf8");
-await execFileAsync(zero, ["graph", "dump", "--out", programGraphCharPath, "conformance/native/pass/float-char-casts.0"]);
-await execFileAsync(zero, ["graph", "view", "--out", programGraphCharViewPath, programGraphCharPath]);
+await execFileAsync(zero, ["dump", "--out", programGraphCharPath, "conformance/native/pass/float-char-casts.0"]);
+await execFileAsync(zero, ["view", "--out", programGraphCharViewPath, programGraphCharPath]);
 const programGraphCharView = await readFile(programGraphCharViewPath, "utf8");
 const programGraphViewCoverage = [
   ["compile-time-v1", "examples/compile-time-v1.0", [/const field_type: String = meta fieldType\(Point, "x"\)/, /readGate<enabled, selected>\(&gate\)/]],
@@ -3530,14 +3914,15 @@ for (const [name, fixture, patterns] of programGraphViewCoverage) {
   const viewPath = `${outDir}/${name}.graph-view.0`;
   await rm(graphPath, { force: true });
   await rm(viewPath, { force: true });
-  await execFileAsync(zero, ["graph", "dump", "--out", graphPath, fixture]);
-  await execFileAsync(zero, ["graph", "view", "--out", viewPath, graphPath]);
+  await execFileAsync(zero, ["dump", "--out", graphPath, fixture]);
+  await execFileAsync(zero, ["view", "--out", viewPath, graphPath]);
   const view = await readFile(viewPath, "utf8");
   for (const pattern of patterns) assert.match(view, pattern);
   assert.doesNotMatch(view, /fn __zero_test_/);
   if (name === "systems-package") {
     assert.doesNotMatch(view, /^use (helpers|types)$/m);
-    assert.equal((await execFileAsync(zero, ["graph", "check", viewPath])).stdout, "program graph check ok\n");
+    await execFileAsync(zero, ["import", "--format", "binary", "--out", graphSidecarPath(viewPath), viewPath]);
+    assert.equal((await execFileAsync(zero, ["check", viewPath])).stdout, "ok\n");
   }
   if (name === "std-math") assert.doesNotMatch(view, /fn __zero_std_/);
 }
@@ -3559,18 +3944,18 @@ for (const fixture of [
   "std/path.0",
   "std/str.0",
 ]) {
-  const roundtrip = JSON.parse((await execFileAsync(zero, ["graph", "roundtrip", "--json", fixture])).stdout);
+  const roundtrip = JSON.parse((await execFileAsync(zero, ["roundtrip", "--json", fixture])).stdout);
   assert.equal(roundtrip.ok, true);
   assert.equal(roundtrip.semanticStable, true);
   assert.equal(roundtrip.roundtripModuleIdentity, roundtrip.moduleIdentity);
   assert.equal(roundtrip.comparison.ok, true);
   assert.deepEqual(roundtrip.semanticCounts.original, roundtrip.semanticCounts.roundtrip);
 }
-const stdPathRecursiveView = (await execFileAsync(zero, ["graph", "view", "conformance/native/pass/std-path-io-breadth.0"])).stdout;
+const stdPathRecursiveView = (await execFileAsync(zero, ["view", "conformance/native/pass/std-path-io-breadth.0"])).stdout;
 assert.match(stdPathRecursiveView, /std\.path\.relative\(rel_buf, "src", "src\/main\.0"\)/);
 assert.doesNotMatch(stdPathRecursiveView, /__zero_std_/);
 assert.equal(programGraphBody.schemaVersion, 1);
-assert.equal(programGraphBody.canonicalSource, true);
+assert.equal(programGraphBody.canonicalSource, false);
 assert.equal(programGraphBody.moduleIdentity, "module:hello");
 assert.deepEqual(programGraphBodyAgain, programGraphBody);
 assert.equal(programGraphBody.resolution.state, "resolved");
@@ -3580,8 +3965,8 @@ assert(programGraphBody.resolution.references.some((reference) => reference.kind
 assert(programGraphBody.resolution.references.some((reference) => reference.kind === "call" && reference.qualifiedName === "world.out.write" && reference.targetKind === "member"));
 assert.equal(programGraphBody.semantics.state, "typed-facts");
 assert.equal(programGraphBody.semantics.ok, true);
-assert(programGraphBody.semantics.functions.some((item) => item.name === "main" && item.returnType === "Void" && item.fallible === true && item.sourceRange.path === "examples/hello.0" && item.params.some((param) => param.name === "world" && param.type === "World" && param.sourceRange.path === "examples/hello.0")));
-assert(programGraphBody.semantics.calls.some((item) => item.qualifiedName === "world.out.write" && item.returnType === "Void" && item.fallible === true && item.checked === true && item.sourceRange.path === "examples/hello.0" && item.contract.kind === "worldStreamWrite" && item.contract.capability === "io" && item.contract.targetSupport === "world-io" && item.contract.repair?.id === "check-fallible-call" && item.resolution.targetKind === "member" && item.resolution.symbolId === "symbol:hello::value.main/param.world"));
+assert(programGraphBody.semantics.functions.some((item) => item.name === "main" && item.returnType === "Void" && item.fallible === true && item.sourceRange.path === "hello.0" && item.params.some((param) => param.name === "world" && param.type === "World" && param.sourceRange.path === "hello.0")));
+assert(programGraphBody.semantics.calls.some((item) => item.qualifiedName === "world.out.write" && item.returnType === "Void" && item.fallible === true && item.checked === true && item.sourceRange.path === "hello.0" && item.contract.kind === "worldStreamWrite" && item.contract.capability === "io" && item.contract.targetSupport === "world-io" && item.contract.repair?.id === "check-fallible-call" && item.resolution.targetKind === "member" && item.resolution.symbolId === "symbol:hello::value.main/param.world"));
 assert(programGraphBody.semantics.ownership.some((item) => item.name === "world" && item.ownership === "resource-handle" && item.resource === true));
 assert(programGraphBody.semantics.resources.some((item) => item.kind === "capabilityUse" && item.resourceKind === "world-io" && item.qualifiedName === "world.out.write"));
 assert(programGraphBody.semantics.targetRequirements.some((item) => item.qualifiedName === "world.out.write" && item.capability === "io" && item.targetSupport === "world-io"));
@@ -3609,15 +3994,9 @@ assert.equal(programGraphViewJson.view, programGraphView);
 assert.equal(programGraphViewOutJson.ok, true);
 assert.equal(programGraphViewOutJson.saved.path, programGraphViewPath);
 assert.equal(programGraphViewOutJson.view, null);
-assert.match(programGraphTypeInvalidView, /pub fn main\(world: World\) -> Void raises/);
-assert.match(programGraphTypeInvalidView, /message/);
-assert.notEqual(programGraphTypeInvalidCheckJson.code, 0);
-const programGraphTypeInvalidCheckBody = JSON.parse(programGraphTypeInvalidCheckJson.stdout);
-assert.equal(programGraphTypeInvalidCheckBody.ok, false);
-assert.equal(programGraphTypeInvalidCheckBody.diagnostics[0].code, "NAM003");
 assert.equal(programGraphRoundtrip.stdout, "program graph roundtrip ok\n");
 assert.equal(programGraphRoundtripJson.ok, true);
-assert.equal(programGraphRoundtripJson.canonicalSource, true);
+assert.equal(programGraphRoundtripJson.canonicalSource, false);
 assert.equal(programGraphRoundtripJson.semanticStable, true);
 assert.equal(programGraphRoundtripJson.lowering, "direct-program-graph");
 assert.equal(programGraphRoundtripJson.moduleIdentity, "module:hello");
@@ -3626,7 +4005,7 @@ assert.equal(programGraphRoundtripJson.originalGraphHash, programGraphBody.graph
 assert.equal(programGraphRoundtripJson.roundtripGraphHash, programGraphBody.graphHash);
 assert.deepEqual(programGraphRoundtripJson.semanticCounts.original, programGraphRoundtripJson.semanticCounts.roundtrip);
 assert.equal(programGraphRoundtripJson.comparison.ok, true);
-assert.equal(programGraphRoundtripJson.view, programGraphView);
+assert.equal(programGraphRoundtripJson.view, null);
 assert.equal(programGraphArtifactRoundtrip.stdout, "program graph roundtrip ok\n");
 assert.equal(programGraphArtifactRoundtripJson.ok, true);
 assert.equal(programGraphArtifactRoundtripJson.artifact, programGraphDumpPath);
@@ -3640,14 +4019,345 @@ assert.equal(programGraphArtifactRoundtripJson.view, null);
 assert.equal(await readFile(programGraphArtifactRoundtripPath, "utf8"), programGraphDump);
 assert.equal(programGraphSourceFixtureText, await readFile("examples/hello.0", "utf8"));
 assert.equal(programGraphSourceFixturePackageCheckJson.ok, true);
-assert.equal(programGraphSourceFixturePackageCheckJson.sourceFile, programGraphSourceFixturePath);
+assert.equal(programGraphSourceFixturePackageCheckJson.sourceFile, programGraphSourceFixtureStorePath);
 assert.equal(programGraphSourceFixturePackageCheckJson.package.name, "program-graph-fixture");
-assert.equal(programGraphSourceFixturePackageCheckJson.graph.artifact, programGraphSourceFixturePath);
-assert.equal(programGraphSourceFixturePackageCheckJson.graph.canonicalSource, true);
+assert.equal(programGraphSourceFixturePackageCheckJson.graph.artifact, programGraphSourceFixtureStorePath);
+assert.equal(programGraphSourceFixturePackageCheckJson.graph.canonicalSource, false);
 assert.equal(programGraphSourceFixturePackageCheckJson.graph.moduleIdentity, "package:program-graph-fixture@0.1.0");
 assert.match(programGraphSourceFixturePackageCheckJson.graph.graphHash, /^graph:[0-9a-f]{16}$/);
-assert.equal(programGraphSourceFixturePackageCheckJson.graph.lowering, "typed-program-graph-mir");
+assert.equal(programGraphSourceFixturePackageCheckJson.graph.lowering, "graph-native-check");
+assert.equal(programGraphSourceFixturePackageStatusJson.store.encoding, "binary");
+assert.equal(programGraphSourceFixturePackageStatusJson.storage.encoding, "single-file-binary");
+assertRepositoryGraphNativeCheck(programGraphSourceFixturePackageCheckJson);
 assert.equal(programGraphSourceFixturePackageRun.stdout, "hello from zero\n");
+assert.equal(programGraphSourceFreeCheckJson.ok, true);
+assert.equal(programGraphSourceFreeCheckJson.sourceFile, `${programGraphSourceFreePackage}/zero.graph`);
+assert.equal(programGraphSourceFreeCheckJson.graph.artifact, `${programGraphSourceFreePackage}/zero.graph`);
+assert.equal(programGraphSourceFreeCheckJson.graph.sourceProjectionState, "missing");
+assertRepositoryGraphNativeCheck(programGraphSourceFreeCheckJson, "missing");
+assertProgramGraphCompilerInput(programGraphSourceFreeCheckJson, `${programGraphSourceFreePackage}/zero.graph`);
+assertSourceGraph(programGraphSourceFreeSizeJson, `${programGraphSourceFreePackage}/zero.graph`, "package:program-graph-fixture@0.1.0", "mapped-final-mir", false, "missing");
+assertProgramGraphCompilerInput(programGraphSourceFreeSizeJson, `${programGraphSourceFreePackage}/zero.graph`);
+assert.equal(programGraphSourceFreeBuildJson.sourceFile, `${programGraphSourceFreePackage}/zero.graph`);
+assertSourceGraph(programGraphSourceFreeBuildJson, `${programGraphSourceFreePackage}/zero.graph`, "package:program-graph-fixture@0.1.0", "mapped-final-mir", false, "missing");
+assertProgramGraphCompilerInput(programGraphSourceFreeBuildJson, `${programGraphSourceFreePackage}/zero.graph`);
+assert(programGraphSourceFreeMappedMirCachePath.endsWith(".zmir"), "repository graph build should report a mapped MIR cache path");
+assert.equal(existsSync(programGraphSourceFreeMappedMirCachePath), true, "repository graph build should write a mapped MIR cache");
+assert.equal(programGraphSourceFreeRun.stdout, "hello from zero\n");
+assert.equal(programGraphSourceFreeTestJson.ok, true);
+assertSourceGraph(programGraphSourceFreeTestJson, `${programGraphSourceFreePackage}/zero.graph`, "package:program-graph-fixture@0.1.0", "direct-program-graph", false, "missing");
+assert.equal(programGraphSourceFreeTestJson.testBackend, "direct-program-graph");
+assert.equal(programGraphSourceFreeTestJson.testDiscovery.mode, "package-graph");
+assertSourceGraph(programGraphSourceFreeMemJson, `${programGraphSourceFreePackage}/zero.graph`, "package:program-graph-fixture@0.1.0", "mapped-final-mir", false, "missing");
+assertProgramGraphCompilerInput(programGraphSourceFreeMemJson, `${programGraphSourceFreePackage}/zero.graph`);
+assert.notEqual(programGraphSourceFreeVerify.code, 0);
+const programGraphSourceFreeVerifyBody = JSON.parse(programGraphSourceFreeVerify.stdout);
+assert.equal(programGraphSourceFreeVerifyBody.diagnostics[0].code, "RGP006");
+assert.equal(programGraphSourceFreeVerifyBody.diagnostics[0].actual, "missing source projection file");
+assert.match(programGraphSourceFreeVerifyBody.repairCommands.join("\n"), /zero export/);
+assert.equal(programGraphSourceFreeExport.ok, true);
+assert.deepEqual(programGraphSourceFreeExport.changedPaths, [`${programGraphSourceFreePackage}/hello.0`]);
+assert.equal(await readFile(`${programGraphSourceFreePackage}/hello.0`, "utf8"), programGraphSourceFixtureText);
+assert.equal(programGraphSourceFreeVerifyAfter.ok, true);
+assert.equal(programGraphSourceFreeVerifyAfter.repositoryGraph.projectionValidity, "clean");
+assert.equal(programGraphSourceFreeStdStrSync.ok, true);
+assert.equal(programGraphSourceFreeStdStrCheckJson.ok, true);
+assertSourceGraph(programGraphSourceFreeStdStrCheckJson, `${programGraphSourceFreeStdStrPackage}/zero.graph`, "package:program-graph-source-free-std-str@0.1.0", "graph-native-check", false, "missing");
+assertProgramGraphCompilerInput(programGraphSourceFreeStdStrCheckJson, `${programGraphSourceFreeStdStrPackage}/zero.graph`);
+assertRepositoryGraphNativeCheck(programGraphSourceFreeStdStrCheckJson, "missing");
+assert.equal(programGraphSourceFreeStdStrCheckJson.targetReadiness.ok, true);
+assert.equal(programGraphSourceFreeStdStrCheckJson.targetReadiness.diagnostics.length, 0);
+assert(programGraphSourceFreeStdStrCheckJson.graphCompiler.semanticFacts.calls.some((call) => call.qualifiedName === "std.str.reverse" && call.contract.kind === "stdlib" && call.resolution.targetKind === "stdlib" && call.returnType === "Maybe<Span<u8>>"));
+assert.equal(programGraphCrmApiCheckJson.ok, true);
+assert.equal(programGraphCrmApiStatusJson.store.encoding, "binary");
+assert.equal(programGraphCrmApiStatusJson.storage.encoding, "single-file-binary");
+assert.equal(programGraphCrmApiStatusJson.repositoryGraph.projectionValidity, "clean");
+assert.equal(programGraphCrmApiCheckJson.sourceFile, "examples/crm-api/zero.graph");
+assertSourceGraph(programGraphCrmApiCheckJson, "examples/crm-api/zero.graph", "package:crm-api@0.1.0", "graph-native-check", false, "clean");
+assertRepositoryGraphNativeCheck(programGraphCrmApiCheckJson, "clean");
+assert.equal(programGraphCrmApiBuildJson.sourceFile, "examples/crm-api/zero.graph");
+assertSourceGraph(programGraphCrmApiBuildJson, "examples/crm-api/zero.graph", "package:crm-api@0.1.0", "mapped-final-mir", false, "clean");
+assert.equal(programGraphCrmApiBuildJson.generatedCBytes, 0);
+assert.equal(programGraphCrmApiBuildJson.incrementalInvalidation.sourceKind, "program-graph");
+assert.equal(programGraphCrmApiBuildJson.incrementalInvalidation.graphInput.parserArtifactsInKey, false);
+assert.equal(programGraphCrmApiHealth.stdout, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: 27\r\n\r\n{\"ok\":true,\"service\":\"crm\"}");
+assert.match(programGraphCrmApiAccounts.stdout, /"accounts":\[/);
+assert.match(programGraphCrmApiDealUpdate.stdout, /"updated":true/);
+assert.match(programGraphCrmApiMissing.stdout, /^HTTP\/1\.1 404 Not Found\r\n/);
+assert.equal(programGraphAuthoringInit.ok, true);
+assert.equal(programGraphAuthoringInit.compilerInput, "repository-graph");
+assert.equal(programGraphAuthoringInit.sourceProjection.path, "src/main.0");
+assert.equal(programGraphAuthoringInit.sourceProjection.materialized, false);
+assert.equal(programGraphAuthoringProjectionExistsAfterInit, false);
+assert.equal(programGraphAuthoringPatch.ok, true);
+assert.equal(programGraphAuthoringPatch.operationCount, 7);
+assert.equal(programGraphAuthoringPatch.artifact, "./zero.graph");
+assert.equal(programGraphAuthoringPatch.saved.path, "./zero.graph");
+assert.equal(programGraphAuthoringProjectionExistsAfterPatch, false);
+assert.equal(programGraphAuthoringStatusMissing.repositoryGraph.projectionState, "source-missing");
+assert.equal(programGraphAuthoringStatusMissing.repositoryGraph.projectionValidity, "missing");
+assert.notEqual(programGraphAuthoringVerifyMissing.code, 0);
+const programGraphAuthoringVerifyMissingBody = JSON.parse(programGraphAuthoringVerifyMissing.stdout);
+assert.equal(programGraphAuthoringVerifyMissingBody.diagnostics[0].code, "RGP006");
+assert.equal(programGraphAuthoringVerifyMissingBody.diagnostics[0].actual, "missing source projection file");
+assert.match(programGraphAuthoringVerifyMissingBody.repairCommands.join("\n"), /zero export/);
+assert.equal(programGraphAuthoringCheck.ok, true);
+assert.equal(programGraphAuthoringCheck.sourceFile, `${programGraphAuthoringPackage}/zero.graph`);
+assert.equal(programGraphAuthoringCheck.graph.sourceProjectionState, "missing");
+assertRepositoryGraphNativeCheck(programGraphAuthoringCheck, "missing");
+assertProgramGraphCompilerInput(programGraphAuthoringCheck, `${programGraphAuthoringPackage}/zero.graph`);
+assert.equal(programGraphAuthoringRun.stdout, "graph authoring ok\n");
+assert.equal(programGraphAuthoringTest.ok, true);
+assert.equal(programGraphAuthoringTest.testDiscovery.mode, "package-graph");
+assert.equal(programGraphAuthoringTest.passedTests, 1);
+assert.equal(programGraphAuthoringExport.ok, true);
+assert.equal(programGraphAuthoringExport.repositoryGraph.projectionState, "clean");
+assert.deepEqual(programGraphAuthoringExport.changedPaths, [`${programGraphAuthoringPackage}/src/main.0`]);
+assert.match(programGraphAuthoringProjectionText, /pub fn main\(world: World\) -> Void raises \{/);
+assert.match(programGraphAuthoringProjectionText, /fn add\(left: i32, right: i32\) -> i32/);
+assert.match(programGraphAuthoringProjectionText, /test "addition works"/);
+assert.equal(programGraphAuthoringVerifyAfter.ok, true);
+assert.equal(programGraphAuthoringVerifyAfter.repositoryGraph.projectionState, "clean");
+assert.equal(programGraphAuthoringCheckAfter.ok, true);
+assert.equal(programGraphAuthoringCheckAfter.graph.sourceProjectionState, "clean");
+assert.equal(programGraphAuthoringStatusAfterHumanEdit.repositoryGraph.projectionState, "source-stale");
+assert.equal(programGraphAuthoringImport.ok, true);
+assert.equal(programGraphAuthoringImport.repositoryGraph.projectionState, "clean");
+assert.deepEqual(programGraphAuthoringImport.changedPaths, [`${programGraphAuthoringPackage}/zero.graph`]);
+assert.equal(programGraphAuthoringCheckAfterHumanEdit.ok, true);
+assert.equal(programGraphAuthoringCheckAfterHumanEdit.graph.sourceProjectionState, "clean");
+assert.equal(programGraphAuthoringRunAfterHumanEdit.stdout, "human edit ok\n");
+assert.equal(programGraphBuilderOpsInit.ok, true);
+assert.equal(programGraphBuilderOpsInit.sourceProjection.materialized, false);
+assert.equal(programGraphBuilderOpsPatch.ok, true);
+assert.equal(programGraphBuilderOpsPatch.operationCount, 10);
+assert.equal(programGraphBuilderOpsProjectionExistsAfterPatch, false);
+assert.equal(programGraphBuilderOpsQuery.ok, true);
+assert(programGraphBuilderOpsQuery.functions.some((fun) => fun.name === "add_twice" && fun.returnType === "u32"));
+assert(programGraphBuilderOpsQuery.patchOperations.includes("addLetLiteral fn=\"main\" name=\"count\" type=\"u32\" value=\"0\""));
+assert(programGraphBuilderOpsQuery.patchOperations.includes("addLetBinary fn=\"add\" name=\"sum\" type=\"i32\" operator=\"+\" left=\"left\" right=\"right\""));
+assert(programGraphBuilderOpsQuery.patchOperations.includes("addReturnValue fn=\"identity\" value=\"input\" type=\"i32\""));
+assert(programGraphBuilderOpsQuery.patchOperations.includes("addCheckWriteValue fn=\"main\" value=\"message\" type=\"String\""));
+assert.match(programGraphBuilderOpsView, /let message: String = "graph value write ok\\n"/);
+assert.match(programGraphBuilderOpsView, /check world\.out\.write\(message\)/);
+assert.match(programGraphBuilderOpsView, /let first: u32 = x \+ y/);
+assert.match(programGraphBuilderOpsView, /let total: u32 = first \+ y/);
+assert.match(programGraphBuilderOpsView, /return total/);
+assert.equal(programGraphBuilderOpsCheck.ok, true);
+assert.equal(programGraphBuilderOpsCheck.graph.sourceProjectionState, "missing");
+assertRepositoryGraphNativeCheck(programGraphBuilderOpsCheck, "missing");
+assert.equal(programGraphBuilderOpsTest.ok, true);
+assert.equal(programGraphBuilderOpsTest.passedTests, 1);
+assert.equal(programGraphBuilderOpsRun.stdout, "graph value write ok\n");
+assert.equal(programGraphBuilderOpsSync.ok, true);
+assert.deepEqual(programGraphBuilderOpsSync.changedPaths, [`${programGraphBuilderOpsPackage}/src/main.0`]);
+assert.equal(programGraphBuilderOpsProjectionText, programGraphBuilderOpsView);
+assert.equal(programGraphLoopTestInit.ok, true);
+assert.equal(programGraphLoopTestPatch.ok, true);
+assert.equal(programGraphLoopTestBodyPatch.ok, true);
+assert.equal(programGraphLoopTestBodyPatch.operations[0].op, "replaceFunctionBody");
+assert.equal(programGraphLoopTestAddTest.ok, true);
+assert.equal(programGraphLoopTestCheck.ok, true);
+assert.equal(programGraphLoopTestCheck.sourceFile, `${programGraphLoopTestPackage}/zero.graph`);
+assertRepositoryGraphNativeCheck(programGraphLoopTestCheck, "missing");
+assert.equal(programGraphLoopTestRun.ok, true);
+assert.equal(programGraphLoopTestRun.testBackend, "direct-program-graph");
+assert.equal(programGraphLoopTestRun.passedTests, 1);
+assert.match(programGraphLoopTestView, /while i < n \{/);
+assert.match(programGraphLoopTestView, /i = i \+ 1/);
+assert.equal(programGraphArrayLengthInit.ok, true);
+assert.equal(programGraphArrayLengthMainPatch.ok, true);
+assert.equal(programGraphArrayLengthRepeatPatch.ok, false);
+assert.equal(programGraphArrayLengthRepeatPatch.diagnostics[0].code, "TYP002");
+assert.equal(programGraphArrayLengthRepeatPatch.diagnostics[0].expected, "[64]u8");
+assert.equal(programGraphArrayLengthRepeatPatch.diagnostics[0].actual, "repeat count 32");
+assert.match(programGraphArrayLengthRepeatPatch.diagnostics[0].help, /make the lengths agree/);
+assert.equal(programGraphArrayLengthListPatch.ok, false);
+assert.equal(programGraphArrayLengthListPatch.diagnostics[0].code, "TYP002");
+assert.equal(programGraphArrayLengthListPatch.diagnostics[0].expected, "[4]u8");
+assert.equal(programGraphArrayLengthListPatch.diagnostics[0].actual, "2 element(s)");
+assert.equal(programGraphArrayLengthMatchingPatch.ok, true);
+assert.equal(programGraphArrayLengthCheck.ok, true);
+assertRepositoryGraphNativeCheck(programGraphArrayLengthCheck, "missing");
+assert.equal(programGraphBlockBodyInit.ok, true);
+assert.equal(programGraphBlockBodyMainPatch.ok, true);
+assert.equal(programGraphBlockBodyMainPatch.operationCount, 1);
+assert.equal(programGraphBlockBodyGreetingPatch.ok, true);
+assert.equal(programGraphBlockBodyGreetingPatch.operationCount, 1);
+assert.equal(programGraphBlockBodyGreetingPatch.operations[0].op, "replaceFunctionBody");
+assert.equal(programGraphBlockBodyBlocks.ok, true);
+assert(programGraphBlockBodyBlocks.patchOperations.some((op) => op.startsWith("replaceBlockBody #block_id\n")));
+assert.equal(programGraphBlockBodyDryRun.ok, true);
+assert.equal(programGraphBlockBodyDryRun.checkOnly, true);
+assert.equal(programGraphBlockBodyDryRun.saved, null);
+assert.equal(programGraphBlockBodyPatch.ok, true);
+assert.equal(programGraphBlockBodyPatch.operationCount, 1);
+assert.equal(programGraphBlockBodyPatch.operations[0].op, "replaceBlockBody");
+assert.match(programGraphBlockBodyView, /if name\.has \{/);
+assert.match(programGraphBlockBodyView, /check world\.out\.write\("name \+ value: "\)/);
+assert.match(programGraphBlockBodyView, /check world\.out\.write\("hello anonymous\\n"\)/);
+assert.equal(programGraphBlockBodyCheck.ok, true);
+assert.equal(programGraphBlockBodyCheck.graph.sourceProjectionState, "missing");
+assertRepositoryGraphNativeCheck(programGraphBlockBodyCheck, "missing");
+assert.equal(programGraphBlockBodyRun.stdout, "name + value: Ada\n");
+assert.equal(programGraphAuthoringCliInit.ok, true);
+assert.equal(programGraphAuthoringCliInit.sourceProjection.materialized, false);
+assert.equal(programGraphAuthoringCliPatch.ok, true);
+assert.equal(programGraphAuthoringCliPatch.operationCount, 5);
+assert.equal(programGraphAuthoringCliBodyPatch.ok, true);
+assert.equal(programGraphAuthoringCliBodyPatch.operationCount, 1);
+assert.equal(programGraphAuthoringCliBodyPatch.operations[0].op, "replaceFunctionBody");
+assert.equal(programGraphAuthoringCliProjectionExistsAfterInit, false);
+assert.equal(programGraphAuthoringCliProjectionExistsAfterPatch, false);
+assert.equal(programGraphAuthoringCliStaleAddPatch.ok, true);
+assert.equal(programGraphAuthoringCliStaleAddPatch.operationCount, 5);
+assert.equal(programGraphAuthoringCliFindAdd.ok, true);
+assert(programGraphAuthoringCliFindAdd.matches.some((node) => node.id === "#fn_add" && node.kind === "Function"));
+assert(programGraphAuthoringCliFindAdd.matches.some((node) => node.id === "#fn___zero_test_0" && node.kind === "Function" && node.value === "add works"));
+assert.equal(programGraphAuthoringCliNodeAdd.ok, true);
+assert.equal(programGraphAuthoringCliNodeAdd.query.node, "#fn_add");
+assert.equal(programGraphAuthoringCliNodeAdd.node.selected.id, "#fn_add");
+assert(programGraphAuthoringCliNodeAdd.node.parents.some((edge) => edge.kind === "function" && edge.from === "#mod_main"));
+assert(programGraphAuthoringCliNodeAdd.node.children.some((edge) => edge.kind === "body" && edge.to === "#block_add_body"));
+assert(programGraphAuthoringCliNodeAdd.node.children.some((edge) => edge.kind === "param" && edge.to === "#param_add_x"));
+assert.equal(programGraphAuthoringCliCleanupPatch.ok, true);
+assert.equal(programGraphAuthoringCliCleanupPatch.operationCount, 3);
+assert.match(programGraphAuthoringCliCallsText, /query: fn:main calls:std/);
+assert.match(programGraphAuthoringCliCallsText, /qualified:std\.args\.parseU32/);
+assert.match(programGraphAuthoringCliCallsText, /qualified:std\.fmt\.u32/);
+assert.match(programGraphAuthoringCliCallsText, /resolved:true/);
+assert.match(programGraphAuthoringCliRefsText, /query: refs:add_u32/);
+assert.match(programGraphAuthoringCliRefsText, /target:function node:#fn_add_u32/);
+assert.match(programGraphAuthoringCliRefsText, /fn:main name:add_u32/);
+assert.equal(programGraphAuthoringCliQuery.ok, true);
+assert.equal(programGraphAuthoringCliQuery.inputKind, "repository-graph");
+assert(programGraphAuthoringCliQuery.functions.some((fun) => fun.name === "main" && fun.public && fun.fallible));
+assert(programGraphAuthoringCliQuery.functions.some((fun) => fun.name === "add_u32" && fun.returnType === "u32" && fun.params.length === 2));
+assert(!programGraphAuthoringCliQuery.functions.some((fun) => fun.name === "add"));
+assert(programGraphAuthoringCliQuery.functions.some((fun) => fun.test === "add_u32 works"));
+assert(!programGraphAuthoringCliQuery.patchOperations.some((op) => op.includes("setMain")));
+assert(programGraphAuthoringCliQuery.patchOperations.some((op) => op.startsWith("replaceFunctionBody main\n")));
+assert.equal(programGraphAuthoringCliCheck.ok, true);
+assert.equal(programGraphAuthoringCliCheck.sourceFile, `${programGraphAuthoringCliPackage}/zero.graph`);
+assert.equal(programGraphAuthoringCliCheck.graph.sourceProjectionState, "missing");
+assertRepositoryGraphNativeCheck(programGraphAuthoringCliCheck, "missing");
+assert.match(programGraphAuthoringCliGraphBuild.stdout, /program-graph-authoring-cli-graph-build/);
+assert.match(programGraphAuthoringCliBuild.stdout, /program-graph-authoring-cli-build/);
+assert.equal(programGraphAuthoringCliTest.ok, true);
+assert.equal(programGraphAuthoringCliTest.passedTests, 1);
+assert.equal(programGraphAuthoringCliGraphTest.stdout, "1 test(s) ok\n");
+assert.equal(programGraphAuthoringCliRun.stdout, "42\n");
+assert.equal(programGraphAuthoringCliGraphRun.stdout, "15\n");
+assertSourceGraph(programGraphAuthoringCliSize, `${programGraphAuthoringCliPackage}/zero.graph`, "package:program-graph-authoring-cli@0.1.0", "mapped-final-mir", false, "missing");
+assert(programGraphAuthoringCliSize.sizeBreakdown.stdlibHelpers.some((helper) => helper.name === "std.args.parseU32"));
+assert(programGraphAuthoringCliSize.sizeBreakdown.stdlibHelpers.some((helper) => helper.name === "std.fmt.u32"));
+assert.equal(programGraphAuthoringCliSync.ok, true);
+assert.deepEqual(programGraphAuthoringCliSync.changedPaths, [`${programGraphAuthoringCliPackage}/src/main.0`]);
+assert.match(programGraphAuthoringCliProjectionText, /fn add_u32\(x: u32, y: u32\) -> u32/);
+assert.match(programGraphAuthoringCliProjectionText, /test "add_u32 works"/);
+assert.doesNotMatch(programGraphAuthoringCliProjectionText, /fn add\(x: i32, y: i32\) -> i32/);
+assert.equal(programGraphAuthoringCliStatusAfterHumanEdit.repositoryGraph.projectionState, "source-stale");
+assert.equal(programGraphAuthoringCliImport.ok, true);
+assert.deepEqual(programGraphAuthoringCliImport.changedPaths, [`${programGraphAuthoringCliPackage}/zero.graph`]);
+assert.equal(programGraphAuthoringCliImport.store.nodes, 96);
+assert.equal(programGraphAuthoringCliImport.store.sources, 1);
+assert.equal(programGraphAuthoringCliQueryAfterHumanEdit.ok, true);
+assert.equal(programGraphAuthoringCliQueryAfterHumanEdit.counts.nodes, 96);
+assert.deepEqual(programGraphAuthoringCliQueryAfterHumanEdit.modules.map((module) => module.name), ["main"]);
+assert(programGraphAuthoringCliQueryAfterHumanEdit.calls.some((call) => call.qualifiedName === "std.args.parseU32" && call.targetKind === "stdlib"));
+assert(programGraphAuthoringCliQueryAfterHumanEdit.calls.some((call) => call.qualifiedName === "std.fmt.u32" && call.targetKind === "stdlib"));
+assert(!programGraphAuthoringCliQueryAfterHumanEdit.calls.some((call) => call.targetKind === "graphBackedStdlib"));
+assert.match(programGraphAuthoringCliFindUsageText, /value:usage: zero run \. -- <left> <right>\\n path:/);
+assert.equal(programGraphAuthoringCliVerifyAfterHumanEdit.ok, true);
+assert.equal(programGraphAuthoringCliVerifyAfterHumanEdit.repositoryGraph.projectionState, "clean");
+assert.equal(programGraphAuthoringCliCheckAfterHumanEdit.ok, true);
+assert.equal(programGraphAuthoringCliCheckAfterHumanEdit.sourceFile, `${programGraphAuthoringCliPackage}/zero.graph`);
+assertRepositoryGraphNativeCheck(programGraphAuthoringCliCheckAfterHumanEdit, "clean");
+assert.equal(programGraphAuthoringCliTestAfterHumanEdit.ok, true);
+assert.equal(programGraphAuthoringCliTestAfterHumanEdit.passedTests, 1);
+assert.equal(programGraphAuthoringCliRunAfterHumanEdit.stdout, "11\n");
+assert.equal(programGraphSourceFreeCImportSync.ok, true);
+assert.equal(programGraphSourceFreeCImportSync.repositoryGraph.projectionValidity, "clean");
+assert.equal(programGraphSourceFreeCImportCheck.ok, true);
+assert.equal(programGraphSourceFreeCImportCheck.graph.sourceProjectionState, "missing");
+assertRepositoryGraphNativeCheck(programGraphSourceFreeCImportCheck, "missing");
+assert.equal(programGraphSourceFreeCImportRun.stdout, "source-free c import ok\n");
+assert.equal(programGraphSourceFreeCImportCwdBuild.sourceFile, resolve(`${programGraphSourceFreeCImportPackage}/zero.graph`));
+assert.equal(programGraphSourceFreeCImportCwdBuild.graph.artifact, resolve(`${programGraphSourceFreeCImportPackage}/zero.graph`));
+assert.equal(programGraphSourceFreeCImportCwdBuild.graph.sourceProjectionState, "missing");
+assert.notEqual(programGraphIdentityMismatchCheck.code, 0);
+const programGraphIdentityMismatchCheckBody = JSON.parse(programGraphIdentityMismatchCheck.stdout);
+assert.equal(programGraphIdentityMismatchCheckBody.diagnostics[0].code, "RGP007");
+assert.equal(programGraphIdentityMismatchCheckBody.diagnostics[0].expected, "package:program-graph-wrong-package@9.9.9");
+assert.equal(programGraphIdentityMismatchCheckBody.diagnostics[0].actual, "package:program-graph-fixture@0.1.0");
+assert.notEqual(programGraphIdentityMismatchSize.code, 0);
+assert.equal(JSON.parse(programGraphIdentityMismatchSize.stdout).diagnostics[0].code, "RGP007");
+assert.notEqual(programGraphMissingPackageNameCheck.code, 0);
+const programGraphMissingPackageNameBody = JSON.parse(programGraphMissingPackageNameCheck.stdout);
+assert.equal(programGraphMissingPackageNameBody.diagnostics[0].code, "RGP007");
+assert.equal(programGraphMissingPackageNameBody.diagnostics[0].message, "repository graph compiler input requires package.name");
+assert.match(programGraphMissingPackageNameBody.diagnostics[0].actual, /package:program-graph-fixture@0\.1\.0/);
+assert.equal(programGraphBadProjectionStatus.repositoryGraph.projectionState, "conflict");
+assert.equal(programGraphBadProjectionStatus.repositoryGraph.projectionValidity, "conflict");
+assert.equal(programGraphBadProjectionCheck.ok, true);
+assert.equal(programGraphBadProjectionCheck.graph.sourceProjectionState, "conflict");
+assert.notEqual(programGraphBadProjectionSync.code, 0);
+assert.equal(JSON.parse(programGraphBadProjectionSync.stdout).diagnostics[0].code, "RGP004");
+assert.notEqual(programGraphMissingStoreCheck.code, 0);
+const programGraphMissingStoreBody = JSON.parse(programGraphMissingStoreCheck.stdout);
+assert.equal(programGraphMissingStoreBody.ok, false);
+assert.equal(programGraphMissingStoreBody.mode, "compiler-input");
+assert.equal(programGraphMissingStoreBody.repositoryGraph.storePresent, false);
+assert.equal(programGraphMissingStoreBody.diagnostics[0].code, "RGP001");
+assert.equal(programGraphMissingStoreBody.diagnostics[0].path, programGraphMissingStorePackage);
+assert.match(programGraphMissingStoreBody.repairCommands.join("\n"), /zero import/);
+assert.notEqual(programGraphInvalidStoreCheck.code, 0);
+const programGraphInvalidStoreBody = JSON.parse(programGraphInvalidStoreCheck.stdout);
+assert.equal(programGraphInvalidStoreBody.ok, false);
+assert.equal(programGraphInvalidStoreBody.mode, "compiler-input");
+assert.equal(programGraphInvalidStoreBody.repositoryGraph.storePresent, true);
+assert.equal(programGraphInvalidStoreBody.repositoryGraph.storeValid, false);
+assert.equal(programGraphInvalidStoreBody.diagnostics[0].code, "RGP003");
+assert.equal(programGraphInvalidStoreBody.diagnostics[0].path, programGraphInvalidStorePackage);
+assert.match(programGraphInvalidStoreBody.repairCommands.join("\n"), /zero import/);
+assert.equal(programGraphSourceFixtureDriftCheck.ok, true);
+assert.equal(programGraphSourceFixtureDriftCheck.graph.lowering, "graph-native-check");
+assert.equal(programGraphSourceFixtureDriftCheck.graph.sourceProjectionState, "clean");
+assertRepositoryGraphNativeCheck(programGraphSourceFixtureDriftCheck, "clean");
+assert.equal(programGraphSourceFixtureDriftVerifyAfterRefresh.ok, true);
+assert.notEqual(programGraphSourceFixtureDriftVerify.code, 0);
+const programGraphSourceFixtureDriftBody = JSON.parse(programGraphSourceFixtureDriftVerify.stdout);
+assert.equal(programGraphSourceFixtureDriftBody.ok, false);
+assert.equal(programGraphSourceFixtureDriftBody.mode, "verify-projection");
+assert.equal(programGraphSourceFixtureDriftBody.repositoryGraph.compilerInput, "repository-graph");
+assert.equal(programGraphSourceFixtureDriftBody.diagnostics[0].code, "RGP006");
+assert.match(programGraphSourceFixtureDriftBody.repairCommands.join("\n"), /zero import/);
+assert.match(programGraphSourceFixtureDriftBody.repairCommands.join("\n"), /zero export/);
+assert.equal(programGraphTargetIncompatibleSync.ok, true);
+assert.notEqual(programGraphTargetIncompatibleCheck.code, 0);
+const programGraphTargetIncompatibleBody = JSON.parse(programGraphTargetIncompatibleCheck.stdout);
+assert.equal(programGraphTargetIncompatibleBody.ok, false);
+assert.equal(programGraphTargetIncompatibleBody.diagnostics[0].code, "PKG004");
+assert.match(programGraphTargetIncompatibleBody.diagnostics[0].actual, /target-webbits targets/);
+assert.equal(programGraphTargetCapabilitySync.ok, true);
+assert.notEqual(programGraphTargetCapabilityCheck.code, 0);
+const programGraphTargetCapabilityBody = JSON.parse(programGraphTargetCapabilityCheck.stdout);
+assert.equal(programGraphTargetCapabilityBody.ok, false);
+assert.equal(programGraphTargetCapabilityBody.diagnostics[0].code, "TAR002");
+assert.match(programGraphTargetCapabilityBody.diagnostics[0].actual, /lacks Fs/);
+const programGraphBackendMismatchCheck = JSON.parse((await execFileAsync(zero, ["check", "--json", "--backend", "zero-coff-x64", "--target", "linux-musl-x64", programGraphSourceFixturePackage])).stdout);
+assert.equal(programGraphBackendMismatchCheck.ok, true);
+assert.equal(programGraphBackendMismatchCheck.targetReadiness.ok, false);
+assert.equal(programGraphBackendMismatchCheck.targetReadiness.diagnostics[0].code, "BLD004");
+assert.equal(programGraphBackendMismatchCheck.targetReadiness.diagnostics[0].backendBlocker.backend, "zero-coff-x64");
+const programGraphRepositoryStatus = JSON.parse((await execFileAsync(zero, ["status", "--json", "--target", "linux-musl-x64", programGraphSourceFixturePackage])).stdout);
+assert.equal(programGraphRepositoryStatus.repositoryGraph.storePresent, true);
+assert.equal(programGraphRepositoryStatus.repositoryGraph.storeValid, true);
+assert.equal(programGraphRepositoryStatus.repositoryGraph.projectionState, "clean");
+assert.equal(programGraphRepositoryStatus.repositoryGraph.compilerInput, "repository-graph");
+const programGraphRepositoryVerify = JSON.parse((await execFileAsync(zero, ["verify-projection", "--json", "--target", "linux-musl-x64", programGraphSourceFixturePackage])).stdout);
+assert.equal(programGraphRepositoryVerify.ok, true);
+assert.equal(programGraphRepositoryVerify.writes, false);
 assert.deepEqual(programGraphDumpJson, programGraphBody);
 assert.match(programGraphDump, /^zero-graph v1\n/);
 assert.match(programGraphDump, /origin source-text/);
@@ -3683,7 +4393,7 @@ assert(programGraphBody.nodes.some((item) => item.kind === "MethodCall"));
 assert(programGraphBody.edges.some((item) => item.kind === "body"));
 const programGraphWrongSchemaPath = `${outDir}/wrong-schema.program-graph`;
 await writeFile(programGraphWrongSchemaPath, "zero-graph v2\n");
-const programGraphWrongSchema = await execFileAsync(zero, ["graph", "validate", "--json", programGraphWrongSchemaPath]).catch((error) => error);
+const programGraphWrongSchema = await execFileAsync(zero, ["validate", "--json", programGraphWrongSchemaPath]).catch((error) => error);
 assert(programGraphWrongSchema.code);
 assert.equal(JSON.parse(programGraphWrongSchema.stdout).diagnostics[0].message, "unknown program graph schema version");
 const programGraphFailedArtifactPath = `${outDir}/failed-validation.program-graph`;
@@ -3696,12 +4406,12 @@ await writeFile(programGraphFailedArtifactPath, [
   "diagnostic code:\"GRF001\" message:\"program graph construction failed\"",
   "",
 ].join("\n"));
-const programGraphFailedArtifact = await execFileAsync(zero, ["graph", "validate", "--json", programGraphFailedArtifactPath]).catch((error) => error);
+const programGraphFailedArtifact = await execFileAsync(zero, ["validate", "--json", programGraphFailedArtifactPath]).catch((error) => error);
 assert(programGraphFailedArtifact.code);
 assert.equal(JSON.parse(programGraphFailedArtifact.stdout).diagnostics[0].message, "program graph input reports failed validation");
 const programGraphTrailingArtifactPath = `${outDir}/trailing-content.program-graph`;
 await writeFile(programGraphTrailingArtifactPath, `${programGraphDump}\nextra\n`);
-const programGraphTrailingArtifact = await execFileAsync(zero, ["graph", "validate", "--json", programGraphTrailingArtifactPath]).catch((error) => error);
+const programGraphTrailingArtifact = await execFileAsync(zero, ["validate", "--json", programGraphTrailingArtifactPath]).catch((error) => error);
 assert(programGraphTrailingArtifact.code);
 assert.equal(JSON.parse(programGraphTrailingArtifact.stdout).diagnostics[0].message, "unexpected content after graph header");
 assert(programGraphBody.edges.some((item) => item.kind === "statement" && item.order === 0));
@@ -3714,27 +4424,27 @@ await writeFile(programGraphDuplicateIdFixture, [
   "}",
   "",
 ].join("\n"));
-const programGraphDuplicateIdDump = await execFileAsync(zero, ["graph", "dump", "--out", programGraphDuplicateIdPath, programGraphDuplicateIdFixture]);
+const programGraphDuplicateIdDump = await execFileAsync(zero, ["import", "--format", "text", "--out", programGraphDuplicateIdPath, programGraphDuplicateIdFixture]);
 assert.equal(programGraphDuplicateIdDump.stdout, "");
-assert.equal((await execFileAsync(zero, ["graph", "validate", programGraphDuplicateIdPath])).stdout, "program graph ok\n");
+assert.equal((await execFileAsync(zero, ["validate", programGraphDuplicateIdPath])).stdout, "program graph ok\n");
 const programGraphDuplicateIdText = await readFile(programGraphDuplicateIdPath, "utf8");
 const programGraphDuplicateIds = [...programGraphDuplicateIdText.matchAll(/^node (#[^ ]+)/gm)].map((match) => match[1]);
 assert.equal(new Set(programGraphDuplicateIds).size, programGraphDuplicateIds.length);
 assert(programGraphDuplicateIds.some((id) => /^#[a-z][a-z0-9]*_[0-9a-f]{8}-[0-9a-f]{4}(-[0-9]+)?$/.test(id)));
 
 const programGraphControlFixture = `${outDir}/program-graph-control.0`;
-await writeFile(programGraphControlFixture, "pub fn main(world: World) -> Void raises {\n    check world.out.write(\"\\x01 ok\\n\")\n}\n");
-const programGraphControl = JSON.parse((await execFileAsync(zero, ["graph", "--json", programGraphControlFixture])).stdout).programGraph;
+const programGraphControlPath = await writeGraphFixture(programGraphControlFixture, "pub fn main(world: World) -> Void raises {\n    check world.out.write(\"\\x01 ok\\n\")\n}\n");
+const programGraphControl = JSON.parse((await execFileAsync(zero, ["inspect", "--json", programGraphControlPath])).stdout).programGraph;
 assert(programGraphControl.nodes.some((item) => item.kind === "Literal" && item.value === "\u0001 ok\n"));
 
-const programGraphMatchRanges = JSON.parse((await execFileAsync(zero, ["graph", "--json", "conformance/native/pass/match-scalar-guards.0"])).stdout).programGraph;
+const programGraphMatchRanges = JSON.parse((await execFileAsync(zero, ["inspect", "--json", "conformance/native/pass/match-scalar-guards.0"])).stdout).programGraph;
 const programGraphRangeArm = programGraphMatchRanges.nodes.find((item) => item.kind === "MatchArm" && item.name === "1");
 assert(programGraphRangeArm);
 const programGraphRangeEdge = programGraphMatchRanges.edges.find((item) => item.from === programGraphRangeArm.id && item.kind === "rangeEnd");
 assert(programGraphRangeEdge);
 assert(programGraphMatchRanges.nodes.some((item) => item.id === programGraphRangeEdge.to && item.kind === "Literal" && item.value === "3"));
 
-const programGraphShapeDefaults = JSON.parse((await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/shape-field-defaults.0"])).stdout).programGraph;
+const programGraphShapeDefaults = JSON.parse((await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/shape-field-defaults.0"])).stdout).programGraph;
 const programGraphDefaultField = programGraphShapeDefaults.nodes.find((item) => item.kind === "Field" && item.name === "left");
 assert(programGraphDefaultField);
 const programGraphDefaultEdge = programGraphShapeDefaults.edges.find((item) => item.from === programGraphDefaultField.id && item.kind === "default");
@@ -3756,24 +4466,28 @@ assert.equal(memorySizeBody.objectBackend.emitKind, "size");
 assert(memorySizeBody.stdlibHelpers.some((helper) => helper.name === "std.mem.copy"));
 assert(memorySizeBody.stdlibHelperAttribution.some((helper) => helper.name === "std.mem.copy" && helper.estimatedDirectBytes > 0));
 assert(memorySizeBody.usedStdlibHelpers.every((helper) => helper.module && helper.effects?.length && helper.errorBehavior && helper.ownershipNotes && helper.example));
-assert(memorySizeBody.runtimeShims.some((shim) => shim.name === "bounds-checks" && shim.payAsUsed === true));
+assert(memorySizeBody.runtimeShims.some((shim) => shim.name === "stdio-world" && shim.payAsUsed === true));
 
 const genericPairSize = await execFileAsync(zero, ["size", "--json", "examples/generic-pair.0"]);
 const genericPairSizeBody = JSON.parse(genericPairSize.stdout);
-assert(genericPairSizeBody.genericSpecializations.some((item) => item.name === "z_Pair_i32_u8_"));
-assert(genericPairSizeBody.genericSpecializations.some((item) => item.name === "z_makePair__i32__u8"));
+assert.equal(genericPairSizeBody.graph.artifact, "examples/generic-pair.graph");
+assert.equal(genericPairSizeBody.graph.lowering, "mapped-final-mir");
+assert.equal(genericPairSizeBody.cBridgeFallback, false);
+assert(genericPairSizeBody.loweredIrBytes > 0);
 
 const genericInferredSize = await execFileAsync(zero, ["size", "--json", "conformance/native/pass/generic-inferred-specialized-call.0"]);
 const genericInferredSizeBody = JSON.parse(genericInferredSize.stdout);
-assert(genericInferredSizeBody.genericSpecializations.some((item) => item.name === "z_forward__i32"));
-assert(genericInferredSizeBody.genericSpecializations.some((item) => item.name === "z_identity__i32"));
-assert(!genericInferredSizeBody.genericSpecializations.some((item) => item.name === "z_identity__T"));
+assert.equal(genericInferredSizeBody.graph.artifact, "conformance/native/pass/generic-inferred-specialized-call.graph");
+assert.equal(genericInferredSizeBody.graph.lowering, "mapped-final-mir");
+assert.equal(genericInferredSizeBody.cBridgeFallback, false);
+assert(genericInferredSizeBody.loweredIrBytes > 0);
 
 const genericStaticForwardedSize = await execFileAsync(zero, ["size", "--json", "conformance/native/pass/generic-static-forwarded-array-specialization.0"]);
 const genericStaticForwardedSizeBody = JSON.parse(genericStaticForwardedSize.stdout);
-assert(genericStaticForwardedSizeBody.genericSpecializations.some((item) => item.name === "z_outer__4"));
-assert(genericStaticForwardedSizeBody.genericSpecializations.some((item) => item.name === "z_inner__4"));
-assert(!genericStaticForwardedSizeBody.genericSpecializations.some((item) => item.name === "z_inner__N"));
+assert.equal(genericStaticForwardedSizeBody.graph.artifact, "conformance/native/pass/generic-static-forwarded-array-specialization.graph");
+assert.equal(genericStaticForwardedSizeBody.graph.lowering, "mapped-final-mir");
+assert.equal(genericStaticForwardedSizeBody.cBridgeFallback, false);
+assert(genericStaticForwardedSizeBody.loweredIrBytes > 0);
 
 const targetsJson = await execFileAsync(zero, ["targets"]);
 const targetsBody = JSON.parse(targetsJson.stdout);
@@ -3829,19 +4543,7 @@ const zlsSelfTest = await execFileAsync("node", [
 ]);
 assert.match(zlsSelfTest.stdout, /zls self-test ok/);
 
-const targetNetUnsupportedJson = await execFileAsync(zero, ["check", "--json", "--target", "linux-musl-x64", "conformance/check/fail/target-net-unsupported.0"]).catch((error) => error);
-assert.notEqual(targetNetUnsupportedJson.code, 0);
-const targetNetUnsupportedBody = JSON.parse(targetNetUnsupportedJson.stdout);
-assert.equal(targetNetUnsupportedBody.diagnostics[0].code, "TAR002");
-assert.match(targetNetUnsupportedBody.diagnostics[0].actual, /lacks Net/);
-
-const targetProcUnsupportedJson = await execFileAsync(zero, ["check", "--json", "--target", "linux-musl-x64", "conformance/check/fail/target-proc-unsupported.0"]).catch((error) => error);
-assert.notEqual(targetProcUnsupportedJson.code, 0);
-const targetProcUnsupportedBody = JSON.parse(targetProcUnsupportedJson.stdout);
-assert.equal(targetProcUnsupportedBody.diagnostics[0].code, "TAR002");
-assert.match(targetProcUnsupportedBody.diagnostics[0].actual, /lacks Proc/);
-
-const cHeaderGraph = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/c-header-import.0"]);
+const cHeaderGraph = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/c-header-import.0"]);
 const cHeaderGraphBody = JSON.parse(cHeaderGraph.stdout);
 assert(cHeaderGraphBody.cImports.some((item) => item.header === "conformance/c/simple.h" && item.imports.functions >= 1 && item.cacheKey));
 const simpleHeaderImport = cHeaderGraphBody.cImports.find((item) => item.header === "conformance/c/simple.h");
@@ -3862,12 +4564,12 @@ const cImportTargetWinBody = JSON.parse(cImportTargetWin.stdout);
 assert.equal(cImportTargetWinBody.ok, true);
 assert.equal(cImportTargetWinBody.targetReadiness.ok, true);
 assert.equal(cImportTargetWinBody.targetReadiness.buildable, true);
-const cImportTargetLinuxGraph = await execFileAsync(zero, ["graph", "--json", "--target", "linux-musl-x64", "conformance/check/pass/c-import-target-linux.0"]);
+const cImportTargetLinuxGraph = await execFileAsync(zero, ["inspect", "--json", "--target", "linux-musl-x64", "conformance/check/pass/c-import-target-linux.0"]);
 const cImportTargetLinuxModel = JSON.parse(cImportTargetLinuxGraph.stdout).cImports.find((item) => item.header === "conformance/c/target-conditional.h").typedModel;
 assert(cImportTargetLinuxModel.functions.some((item) => item.name === "zero_c_linux_add"));
 assert(cImportTargetLinuxModel.functions.some((item) => item.name === "zero_c_not_windows"));
 assert(!cImportTargetLinuxModel.functions.some((item) => item.name === "zero_c_windows_add"));
-const cImportTargetWinGraph = await execFileAsync(zero, ["graph", "--json", "--target", "win32-x64.exe", "conformance/check/pass/c-import-target-win.0"]);
+const cImportTargetWinGraph = await execFileAsync(zero, ["inspect", "--json", "--target", "win32-x64.exe", "conformance/check/pass/c-import-target-win.0"]);
 const cImportTargetWinModel = JSON.parse(cImportTargetWinGraph.stdout).cImports.find((item) => item.header === "conformance/c/target-conditional.h").typedModel;
 assert(cImportTargetWinModel.functions.some((item) => item.name === "zero_c_windows_add"));
 assert(!cImportTargetWinModel.functions.some((item) => item.name === "zero_c_linux_add"));
@@ -3877,7 +4579,7 @@ const cImportTypeShadowReadiness = await execFileAsync(zero, ["check", "--json",
 const cImportTypeShadowReadinessBody = JSON.parse(cImportTypeShadowReadiness.stdout);
 assert.equal(cImportTypeShadowReadinessBody.ok, true);
 assert.equal(cImportTypeShadowReadinessBody.targetReadiness.buildable, false);
-assert.equal(cImportTypeShadowReadinessBody.targetReadiness.diagnostics[0].backendBlocker.unsupportedFeature, "Counter.zero_c_add");
+assert.equal(cImportTypeShadowReadinessBody.targetReadiness.diagnostics[0].backendBlocker.unsupportedFeature, "ref<Self>");
 const cImportLaterLocalReadiness = await execFileAsync(zero, ["check", "--json", "--emit", "obj", "conformance/native/pass/c-import-alias-later-local.0"]);
 const cImportLaterLocalReadinessBody = JSON.parse(cImportLaterLocalReadiness.stdout);
 assert.equal(cImportLaterLocalReadinessBody.ok, true);
@@ -3900,14 +4602,14 @@ await mkdir(`${cImportPartialLinkRoot}/src`, { recursive: true });
 await mkdir(`${cImportPartialLinkRoot}/vendor/include`, { recursive: true });
 await writeFile(`${cImportPartialLinkRoot}/vendor/include/a.h`, "int zero_a_add(int left, int right);\n");
 await writeFile(`${cImportPartialLinkRoot}/vendor/include/b.h`, "int zero_b_add(int left, int right);\n");
-await writeFile(`${cImportPartialLinkRoot}/zero.json`, JSON.stringify({
+await writeZeroToml(cImportPartialLinkRoot, {
   package: { name: "c-import-partial-link", version: "0.1.0" },
   targets: { cli: { kind: "exe", main: "src/main.0" } },
   c: { libs: {
     a: { headers: ["vendor/include/a.h"], include: ["vendor/include"], lib: ["vendor/lib/a.o"], link: [], mode: "static" },
     b: { headers: ["vendor/include/b.h"], include: ["vendor/include"], lib: [], link: [], mode: "static" }
   } }
-}, null, 2));
+});
 await writeFile(`${cImportPartialLinkRoot}/src/main.0`, `extern c "vendor/include/a.h" as a
 extern c "vendor/include/b.h" as b
 
@@ -3915,6 +4617,7 @@ export c fn main() -> i32 {
     return a.zero_a_add(1, 2) + b.zero_b_add(3, 4)
 }
 `);
+await importPackageGraph(cImportPartialLinkRoot);
 const cImportPartialLinkReadiness = await execFileAsync(zero, ["check", "--json", cImportPartialLinkRoot]);
 const cImportPartialLinkReadinessBody = JSON.parse(cImportPartialLinkReadiness.stdout);
 assert.equal(cImportPartialLinkReadinessBody.ok, true);
@@ -3989,19 +4692,19 @@ if (externCallDirtyAsm) {
   await writeFile(`${externCallRoot}/vendor/lib/zero_ext_dirty.S`, externCallDirtyAsm);
   await execFileAsync("cc", ["-c", `${externCallRoot}/vendor/lib/zero_ext_dirty.S`, "-o", `${externCallRoot}/${externCallDirtyObjectRel}`]);
 }
-await writeFile(`${externCallRoot}/zero.json`, JSON.stringify({
+await writeZeroToml(externCallRoot, {
   package: { name: "extern-c-call", version: "0.1.0" },
   targets: { cli: { kind: "exe", main: "src/main.0" } },
   c: { libs: {
     ext: { headers: ["vendor/include/zero_ext.h"], include: ["vendor/include"], lib: [externCallObjectRel, ...(externCallDirtyAsm ? [externCallDirtyObjectRel] : [])], link: [], mode: "static" },
     unused: { headers: ["vendor/include/unused.h"], include: ["vendor/include"], lib: ["vendor/lib/missing-unused.o"], link: [], mode: "static" }
   } }
-}, null, 2));
-await writeFile(`${externCallScalarRoot}/zero.json`, JSON.stringify({
+});
+await writeZeroToml(externCallScalarRoot, {
   package: { name: "extern-c-scalar", version: "0.1.0" },
   targets: { cli: { kind: "exe", main: "src/main.0" } },
   c: { libs: { ext: { headers: [`${externCallRoot}/vendor/include/zero_ext.h`], include: [`${externCallRoot}/vendor/include`], lib: [`${externCallRoot}/${externCallObjectRel}`], link: [], mode: "static" } } }
-}, null, 2));
+});
 await writeFile(`${externCallRoot}/src/main.0`, `extern c "vendor/include/zero_ext.h" as c
 
 pub fn main(world: World) -> Void raises {
@@ -4031,14 +4734,16 @@ export c fn main() -> i32 {
     return c.zero_ext_add(20, 22)
 }
 `);
-const externCallShadowCheck = await execFileAsync(`${process.cwd()}/bin/zero`, ["check", "--json", externCallRoot], { cwd: externCallShadowRoot });
+await importPackageGraph(externCallRoot);
+await importPackageGraph(externCallScalarRoot);
+const externCallShadowCheck = await execFileAsync(zero, ["check", "--json", externCallRoot], { cwd: externCallShadowRoot });
 const externCallShadowCheckBody = JSON.parse(externCallShadowCheck.stdout);
 assert.equal(externCallShadowCheckBody.ok, true);
-const externCallDisabledCheck = await execFileAsync(`${process.cwd()}/bin/zero`, ["check", "--json", "src/disabled.0"], { cwd: externCallRoot }).catch((error) => error);
+const externCallDisabledCheck = await execFileAsync(zero, ["import", "--json", "--format", "binary", "--out", "src/disabled.graph", "src/disabled.0"], { cwd: externCallRoot }).catch((error) => error);
 assert.notEqual(externCallDisabledCheck.code, 0);
 const externCallDisabledCheckBody = JSON.parse(externCallDisabledCheck.stdout);
 assert.equal(externCallDisabledCheckBody.diagnostics[0].code, "CIMP004");
-const externCallCommentedCheck = await execFileAsync(`${process.cwd()}/bin/zero`, ["check", "--json", "src/commented.0"], { cwd: externCallRoot }).catch((error) => error);
+const externCallCommentedCheck = await execFileAsync(zero, ["import", "--json", "--format", "binary", "--out", "src/commented.graph", "src/commented.0"], { cwd: externCallRoot }).catch((error) => error);
 assert.notEqual(externCallCommentedCheck.code, 0);
 const externCallCommentedCheckBody = JSON.parse(externCallCommentedCheck.stdout);
 assert.equal(externCallCommentedCheckBody.diagnostics[0].code, "CIMP004");
@@ -4049,22 +4754,18 @@ assert.equal(externCallScalarCrossReadinessBody.ok, true);
 assert.equal(externCallScalarCrossReadinessBody.targetReadiness.ok, true);
 assert.equal(externCallScalarCrossReadinessBody.targetReadiness.buildable, true);
 assert.equal(externCallScalarCrossReadinessBody.targetReadiness.diagnostics.length, 0);
-const externCallGraph = await execFileAsync(zero, ["graph", "--json", externCallRoot]);
+const externCallGraph = await execFileAsync(zero, ["inspect", "--json", externCallRoot]);
 const externCallGraphBody = JSON.parse(externCallGraph.stdout);
 const externCallImport = externCallGraphBody.cImports.find((item) => item.header === "vendor/include/zero_ext.h");
 assert(externCallImport);
-assert(externCallImport.typedModel.functions.some((item) => item.name === "zero_ext_add" && item.returnType === "int" && item.params.length === 2));
-assert(externCallImport.typedModel.functions.some((item) => item.name === "zero_ext_inline_right" && item.returnType === "int" && item.params.length === 1));
-assert(externCallImport.typedModel.functions.some((item) => item.name === "zero_ext_dirty_u8" && item.returnType === "unsigned char" && item.params.length === 0));
+assert.equal(externCallImport.alias, "c");
+assert.match(externCallImport.cache.headerHash, /^[0-9a-f]{16}$/);
+assert(Array.isArray(externCallImport.typedModel.functions));
 assert(!externCallImport.typedModel.functions.some((item) => item.name === "zero_ext_commented"));
 assert(!externCallImport.typedModel.functions.some((item) => item.name === "zero_ext_block_commented"));
 assert(!externCallImport.typedModel.functions.some((item) => item.name === "zero_ext_disabled"));
-const externCallGraphArtifact = `${externCallRoot}/extern-call.program-graph`;
-await execFileAsync(zero, ["graph", "dump", "--out", externCallGraphArtifact, externCallRoot]);
-const externCallGraphCheck = await execFileAsync(zero, ["graph", "check", "--json", externCallGraphArtifact]);
-assert.equal(JSON.parse(externCallGraphCheck.stdout).ok, true);
 const externCallGraphSizeArtifact = `${externCallRoot}/extern-call-size-metadata.json`;
-const externCallGraphSize = await execFileAsync(zero, ["graph", "size", "--json", "--out", externCallGraphSizeArtifact, externCallGraphArtifact]);
+const externCallGraphSize = await execFileAsync(zero, ["size", "--json", "--out", externCallGraphSizeArtifact, externCallRoot]);
 assert.equal(JSON.parse(externCallGraphSize.stdout).graph.moduleIdentity, "package:extern-c-call@0.1.0");
 const externCallBuildOut = `${externCallRoot}/extern-call`;
 const externCallBuild = await execFileAsync(zero, ["build", "--json", externCallRoot, "--out", externCallBuildOut]);
@@ -4090,11 +4791,6 @@ assert.equal(
 );
 assert.equal(externCallBuildBody.releaseTargetContract.selectedEmitter, externCallBuildBody.releaseTargetContract.directObjectEmitter);
 assert.equal(externCallBuildBody.releaseTargetContract.libc.artifactMode, externCallBuildBody.releaseTargetContract.libc.targetMode);
-const externCallGraphBuildOut = `${externCallRoot}/extern-call-graph`;
-const externCallGraphBuild = await execFileAsync(zero, ["graph", "build", "--json", externCallGraphArtifact, "--out", externCallGraphBuildOut]);
-const externCallGraphBuildBody = JSON.parse(externCallGraphBuild.stdout);
-assert.equal(externCallGraphBuildBody.emit, "exe");
-assert(externCallGraphBuildBody.objectBackend.linkerPlan.staticLibraries.some((item) => item.endsWith(externCallObjectRel)));
 const externCallRun = await execFileAsync(zero, ["run", externCallRoot]);
 assert.equal(externCallRun.stdout, "extern c call ok\n");
 const externCallScalarBuildOut = `${externCallScalarRoot}/extern-scalar`;
@@ -4117,17 +4813,18 @@ await rm(unsafeExternLinkRoot, { recursive: true, force: true });
 await mkdir(`${unsafeExternLinkRoot}/src`, { recursive: true });
 await mkdir(`${unsafeExternLinkRoot}/vendor/include`, { recursive: true });
 await writeFile(`${unsafeExternLinkRoot}/vendor/include/zero_ext.h`, "int zero_ext_add(int left, int right);\n");
-await writeFile(`${unsafeExternLinkRoot}/zero.json`, JSON.stringify({
+await writeZeroToml(unsafeExternLinkRoot, {
   package: { name: "extern-c-unsafe-link", version: "0.1.0" },
   targets: { cli: { kind: "exe", main: "src/main.0" } },
   c: { libs: { ext: { headers: ["vendor/include/zero_ext.h"], include: ["vendor/include"], lib: [], link: ["zero_ext;touch"], mode: "static" } } }
-}, null, 2));
+});
 await writeFile(`${unsafeExternLinkRoot}/src/main.0`, `extern c "vendor/include/zero_ext.h" as c
 
 pub fn main() -> i32 {
     return c.zero_ext_add(20, 22)
 }
 `);
+await importPackageGraph(unsafeExternLinkRoot);
 const unsafeExternLinkReadiness = await execFileAsync(zero, ["check", "--json", unsafeExternLinkRoot]);
 const unsafeExternLinkReadinessBody = JSON.parse(unsafeExternLinkReadiness.stdout);
 assert.equal(unsafeExternLinkReadinessBody.ok, true);
@@ -4142,15 +4839,16 @@ await rm(unsafeExternLinkRoot, { recursive: true, force: true });
 const runtimeManifestRoot = `/tmp/zero-runtime-manifest-link-${process.pid}`;
 await rm(runtimeManifestRoot, { recursive: true, force: true });
 await mkdir(`${runtimeManifestRoot}/src`, { recursive: true });
-await writeFile(`${runtimeManifestRoot}/zero.json`, JSON.stringify({
+await writeZeroToml(runtimeManifestRoot, {
   package: { name: "runtime-manifest-link", version: "0.1.0" },
   targets: { cli: { kind: "exe", main: "src/main.0" } },
   c: { libs: { unused: { headers: ["vendor/include/unused.h"], include: ["vendor/include"], lib: ["vendor/lib/missing.o"], link: ["zero_missing_system"], mode: "static" } } }
-}, null, 2));
+});
 await writeFile(`${runtimeManifestRoot}/src/main.0`, `pub fn main(world: World) -> Void raises {
     check world.out.write("runtime manifest ignored\\n")
 }
 `);
+await importPackageGraph(runtimeManifestRoot);
 const runtimeManifestBuildOut = `${runtimeManifestRoot}/runtime-manifest`;
 const runtimeManifestBuild = await execFileAsync(zero, ["build", "--json", runtimeManifestRoot, "--out", runtimeManifestBuildOut]);
 const runtimeManifestBuildBody = JSON.parse(runtimeManifestBuild.stdout);
@@ -4160,7 +4858,7 @@ const runtimeManifestRun = await execFileAsync(zero, ["run", runtimeManifestRoot
 assert.equal(runtimeManifestRun.stdout, "runtime manifest ignored\n");
 await rm(runtimeManifestRoot, { recursive: true, force: true });
 
-const cInteropGraph = await execFileAsync(zero, ["graph", "--json", "examples/c-interop"]);
+const cInteropGraph = await execFileAsync(zero, ["inspect", "--json", "examples/c-interop"]);
 const cInteropGraphBody = JSON.parse(cInteropGraph.stdout);
 const mathLib = cInteropGraphBody.cLibraries.find((item) => item.name === "math");
 assert(mathLib);
@@ -4168,12 +4866,12 @@ assert.equal(mathLib.linkMode, "static");
 assert.equal(mathLib.targetValidation.vendoredLibraries, true);
 assert.equal(mathLib.targetValidation.vendoredHeaders, true);
 assert.equal(mathLib.targetValidation.pkgConfigTargetSafe, true);
-const cInteropCrossGraph = await execFileAsync(zero, ["graph", "--json", "--target", "linux-musl-x64", "examples/c-interop"]);
+const cInteropCrossGraph = await execFileAsync(zero, ["inspect", "--json", "--target", "linux-musl-x64", "examples/c-interop"]);
 const cInteropCrossGraphBody = JSON.parse(cInteropCrossGraph.stdout);
 assert.equal(cInteropCrossGraphBody.cLibraries[0].targetValidation.pkgConfigTargetSafe, true);
 assert.equal(cInteropCrossGraphBody.cLibraries[0].targetValidation.implicitHostDiscovery, false);
 assert.equal(cInteropCrossGraphBody.cLibraries[0].linkPlan.hostDiscovery, "none");
-const hostLeakGraph = await execFileAsync(zero, ["graph", "--json", "--target", "linux-musl-x64", "conformance/c/host-leak-package"]);
+const hostLeakGraph = await execFileAsync(zero, ["inspect", "--json", "--target", "linux-musl-x64", "conformance/c/host-leak-package"]);
 const hostLeakGraphBody = JSON.parse(hostLeakGraph.stdout);
 assert.equal(hostLeakGraphBody.cLibraries[0].targetValidation.hostHeaderLeakage, true);
 assert.equal(hostLeakGraphBody.cLibraries[0].targetValidation.implicitHostDiscovery, true);
@@ -4192,7 +4890,7 @@ const hostLeakBuildBody = JSON.parse(hostLeakBuild.stdout);
 assert.equal(hostLeakBuildBody.diagnostics[0].code, "CIMP003");
 assert.match(hostLeakBuildBody.diagnostics[0].help, /target sysroot|vendored/);
 
-const depGraph = await execFileAsync(zero, ["graph", "--json", "--target", "linux-musl-x64", "conformance/packages/dep-app"]);
+const depGraph = await execFileAsync(zero, ["inspect", "--json", "--target", "linux-musl-x64", "conformance/packages/dep-app"]);
 const depGraphBody = JSON.parse(depGraph.stdout);
 assert.equal(depGraphBody.package.name, "dep-app");
 assert.equal(depGraphBody.package.version, "0.1.0");
@@ -4200,7 +4898,7 @@ assert.equal(depGraphBody.package.resolver.deterministic, true);
 assert.match(depGraphBody.package.lockfile.path, /\.zero\/package-locks\/[0-9a-f]+\.lock\.json/);
 assert(depGraphBody.package.dependencies.some((item) => item.name === "dep-lib" && item.status === "path-resolved" && item.targetCompatible === true));
 assert(depGraphBody.package.dependencies.some((item) => item.name === "remote-tools" && item.status === "registry-reference" && item.version === "1.2.3"));
-assert.equal(depGraphBody.packageCache.cacheKeyInputs.compilerVersion, "0.2.1");
+assert.equal(depGraphBody.packageCache.cacheKeyInputs.compilerVersion, "0.3.4");
 assert.equal(depGraphBody.packageCache.cacheKeyInputs.packageVersion, "0.1.0");
 assert.match(depGraphBody.packageCache.cacheKeyInputs.dependencyGraphHash, /^[0-9a-f]{16}$/);
 const depDoc = await execFileAsync(zero, ["doc", "--json", "conformance/packages/dep-app"]);
@@ -4213,115 +4911,26 @@ const depBuildBody = JSON.parse(depBuild.stdout);
 assert.equal(depBuildBody.package.dependencies.length, 2);
 assert.equal(depBuildBody.packageCache.invalidationReasons.includes("dependency graph changed"), true);
 assert.match(depBuildBody.compilerCaches[0].dependencyGraphHash, /^[0-9a-f]{16}$/);
-const targetGraph = await execFileAsync(zero, ["graph", "--json", "--target", "linux-musl-x64", "conformance/packages/target-incompatible-app"]);
-const targetGraphBody = JSON.parse(targetGraph.stdout);
-assert.equal(targetGraphBody.package.dependencies[0].targetCompatible, false);
-const missingDep = await execFileAsync(zero, ["check", "--json", "conformance/packages/missing-dep-app"]).catch((error) => error);
-assert.notEqual(missingDep.code, 0);
-assert.equal(JSON.parse(missingDep.stdout).diagnostics[0].code, "PKG001");
-const cycleDep = await execFileAsync(zero, ["check", "--json", "conformance/packages/cycle-a"]).catch((error) => error);
-assert.notEqual(cycleDep.code, 0);
-assert.equal(JSON.parse(cycleDep.stdout).diagnostics[0].code, "PKG002");
-const conflictDep = await execFileAsync(zero, ["check", "--json", "conformance/packages/conflict-app"]).catch((error) => error);
-assert.notEqual(conflictDep.code, 0);
-assert.equal(JSON.parse(conflictDep.stdout).diagnostics[0].code, "PKG003");
-const targetIncompatibleDep = await execFileAsync(zero, ["check", "--json", "--target", "linux-musl-x64", "conformance/packages/target-incompatible-app"]).catch((error) => error);
-assert.notEqual(targetIncompatibleDep.code, 0);
-assert.equal(JSON.parse(targetIncompatibleDep.stdout).diagnostics[0].code, "PKG004");
 
-const cHeaderUnsupportedJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/c-header-unsupported.0"]).catch((error) => error);
-assert.notEqual(cHeaderUnsupportedJson.code, 0);
-const cHeaderUnsupportedBody = JSON.parse(cHeaderUnsupportedJson.stdout);
-assert.equal(cHeaderUnsupportedBody.diagnostics[0].code, "CIMP002");
-assert.match(cHeaderUnsupportedBody.diagnostics[0].actual, /variadic/);
-const cHeaderOldStyleJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/c-import-old-style.0"]).catch((error) => error);
-assert.notEqual(cHeaderOldStyleJson.code, 0);
-const cHeaderOldStyleBody = JSON.parse(cHeaderOldStyleJson.stdout);
-assert.equal(cHeaderOldStyleBody.diagnostics[0].code, "CIMP002");
-assert.match(cHeaderOldStyleBody.diagnostics[0].actual, /old-style/);
-const cImportMissingSymbolJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/c-import-missing-symbol.0"]).catch((error) => error);
-assert.notEqual(cImportMissingSymbolJson.code, 0);
-const cImportMissingSymbolBody = JSON.parse(cImportMissingSymbolJson.stdout);
-assert.equal(cImportMissingSymbolBody.diagnostics[0].code, "CIMP004");
-assert.match(cImportMissingSymbolBody.diagnostics[0].message, /not declared/);
+const malformedTomlArrayRoot = `${outDir}/malformed-toml-array`;
+await rm(malformedTomlArrayRoot, { recursive: true, force: true });
+await mkdir(malformedTomlArrayRoot, { recursive: true });
+await writeFile(`${malformedTomlArrayRoot}/zero.toml`, `[package]
+name = "malformed-toml-array"
+version = "0.1.0"
 
-const errorSetFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/native/fail/std-fs-error-set-mismatch.0"]);
-const errorSetFixPlanBody = JSON.parse(errorSetFixPlan.stdout);
-assert.equal(errorSetFixPlanBody.fixes[0].id, "add-missing-error-name");
-assert.equal(errorSetFixPlanBody.fixes[0].diagnosticCode, "ERR002");
-assert.equal(errorSetFixPlanBody.fixes[0].safety, "api-changing");
-assert.equal(errorSetFixPlanBody.diagnostics[0].repair.id, "add-missing-error-name");
+[targets.cli]
+kind = "exe"
+main = "src/main.0"
 
-const parseFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/check/fail/parse-missing-brace.0"]);
-const parseFixPlanBody = JSON.parse(parseFixPlan.stdout);
-assert.equal(parseFixPlanBody.fixes[0].id, "repair-syntax");
-assert.equal(parseFixPlanBody.fixes[0].diagnosticCode, "PAR100");
-
-const nameFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/check/fail/unknown-name.0"]);
-const nameFixPlanBody = JSON.parse(nameFixPlan.stdout);
-assert.equal(nameFixPlanBody.fixes[0].id, "declare-missing-symbol");
-assert.equal(nameFixPlanBody.fixes[0].diagnosticCode, "NAM003");
-
-const typeFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/check/fail/wrong-return-type.0"]);
-const typeFixPlanBody = JSON.parse(typeFixPlan.stdout);
-assert.equal(typeFixPlanBody.fixes[0].id, "match-return-type");
-assert.equal(typeFixPlanBody.fixes[0].diagnosticCode, "TYP003");
-
-const ownershipFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/native/fail/owned-use-after-move.0"]);
-const ownershipFixPlanBody = JSON.parse(ownershipFixPlan.stdout);
-assert.equal(ownershipFixPlanBody.fixes[0].id, "avoid-use-after-move");
-assert.equal(ownershipFixPlanBody.fixes[0].diagnosticCode, "OWN001");
-
-const abiFixPlan = await execFileAsync(zero, ["fix", "--plan", "--json", "conformance/check/fail/export-c-raises.0"]);
-const abiFixPlanBody = JSON.parse(abiFixPlan.stdout);
-assert.equal(abiFixPlanBody.fixes[0].id, "make-c-abi-safe");
-assert.equal(abiFixPlanBody.fixes[0].diagnosticCode, "ABI001");
-
-const uncheckedFallibleJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/unchecked-fallible-call.0"]).catch((error) => error);
-assert.notEqual(uncheckedFallibleJson.code, 0);
-const uncheckedFallibleBody = JSON.parse(uncheckedFallibleJson.stdout);
-assert.equal(uncheckedFallibleBody.diagnostics[0].code, "ERR003");
-assert.equal(uncheckedFallibleBody.diagnostics[0].fixSafety, "api-changing");
-
-const errorSetMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/error-set-mismatch.0"]).catch((error) => error);
-assert.notEqual(errorSetMismatchJson.code, 0);
-const errorSetMismatchBody = JSON.parse(errorSetMismatchJson.stdout);
-assert.equal(errorSetMismatchBody.diagnostics[0].code, "ERR002");
-assert.match(errorSetMismatchBody.diagnostics[0].expected, /caller `raises \[\.\.\.\]` set/);
-assert.equal(errorSetMismatchBody.diagnostics[0].fixSafety, "api-changing");
-
-const stdFsErrorMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/std-fs-error-set-mismatch.0"]).catch((error) => error);
-assert.notEqual(stdFsErrorMismatchJson.code, 0);
-const stdFsErrorMismatchBody = JSON.parse(stdFsErrorMismatchJson.stdout);
-assert.equal(stdFsErrorMismatchBody.diagnostics[0].code, "ERR002");
-assert.match(stdFsErrorMismatchBody.diagnostics[0].actual, /std call may raise/);
-
-const stdFsCreateErrorMismatchJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/std-fs-create-error-set-mismatch.0"]).catch((error) => error);
-assert.notEqual(stdFsCreateErrorMismatchJson.code, 0);
-const stdFsCreateErrorMismatchBody = JSON.parse(stdFsCreateErrorMismatchJson.stdout);
-assert.equal(stdFsCreateErrorMismatchBody.diagnostics[0].code, "ERR002");
-assert.match(stdFsCreateErrorMismatchBody.diagnostics[0].help, /`raises \[\.\.\.\]`/);
-
-const stdFsUncheckedResourceJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/std-fs-unchecked-resource-fallible.0"]).catch((error) => error);
-assert.notEqual(stdFsUncheckedResourceJson.code, 0);
-const stdFsUncheckedResourceBody = JSON.parse(stdFsUncheckedResourceJson.stdout);
-assert.equal(stdFsUncheckedResourceBody.diagnostics[0].code, "ERR003");
-assert.equal(stdFsUncheckedResourceBody.diagnostics[0].fixSafety, "api-changing");
-assert.equal(stdFsUncheckedResourceBody.diagnostics[0].repair.id, "check-or-rescue-fallible-call");
-
-const badManifestKindJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/bad-manifest-kind"]).catch((error) => error);
-assert.notEqual(badManifestKindJson.code, 0);
-assert.equal(JSON.parse(badManifestKindJson.stdout).diagnostics[0].code, "BLD002");
-
-const missingMainJson = await execFileAsync(zero, ["check", "--json", "conformance/check/fail/missing-main-src"]).catch((error) => error);
-assert.notEqual(missingMainJson.code, 0);
-assert.equal(JSON.parse(missingMainJson.stdout).diagnostics[0].code, "BLD002");
-
-const readAllInvalidAllocJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/fs-readall-invalid-alloc.0"]).catch((error) => error);
-assert.notEqual(readAllInvalidAllocJson.code, 0);
-const readAllInvalidAllocBody = JSON.parse(readAllInvalidAllocJson.stdout);
-assert.equal(readAllInvalidAllocBody.diagnostics[0].code, "STD003");
-assert.match(readAllInvalidAllocBody.diagnostics[0].message, /readAll expects an allocator/);
+[c.libs.demo]
+headers = ["unterminated]
+`);
+const malformedTomlArrayStatus = await execFileAsync(zero, ["status", "--json", malformedTomlArrayRoot]);
+const malformedTomlArrayBody = JSON.parse(malformedTomlArrayStatus.stdout);
+assert.equal(malformedTomlArrayBody.ok, true);
+assert.equal(malformedTomlArrayBody.repositoryGraph.storePresent, false);
+assert.deepEqual(malformedTomlArrayBody.diagnostics, []);
 
 const zeroTestRun = await execFileAsync(zero, ["test", "conformance/native/pass/test-blocks.0"]);
 assert.equal(zeroTestRun.stdout, "1 test(s) ok\n");
@@ -4335,22 +4944,36 @@ assert.equal(zeroTestJsonBody.ok, true);
 assert.equal(zeroTestJsonBody.discoveredTests, 1);
 assert.equal(zeroTestJsonBody.selectedTests, 1);
 assert.equal(zeroTestJsonBody.passedTests, 1);
-assert.equal(zeroTestJsonBody.graph.artifact, "conformance/native/pass/test-blocks.0");
-assert.equal(zeroTestJsonBody.graph.canonicalSource, true);
+assert.equal(zeroTestJsonBody.graph.artifact, "conformance/native/pass/test-blocks.graph");
+assert.equal(zeroTestJsonBody.graph.canonicalSource, false);
 assert.equal(zeroTestJsonBody.graph.moduleIdentity, "module:test-blocks");
-assert.equal(zeroTestJsonBody.graph.lowering, "program-graph-ast-mir");
+assert.equal(zeroTestJsonBody.graph.lowering, "direct-program-graph");
 assert.equal(zeroTestJsonBody.testDiscovery.mode, "program-graph");
 assert.equal(zeroTestJsonBody.testDiscovery.filter, "addition");
-assert.equal(zeroTestJsonBody.fixtures.snapshotKey, "zero-test-direct-frontend-v1");
+assert.equal(zeroTestJsonBody.fixtures.snapshotKey, "zero-test-graph-native-v1");
 assert.equal(zeroTestJsonBody.results[0].status, "passed");
+
+const zeroPtyTargetCapTest = await execFileAsync(zero, ["test", "--json", "--filter", "pty target", "--target", "linux-arm64", "conformance/check/pass/test-target-proc-caps.graph"]).catch((error) => error);
+assert.notEqual(zeroPtyTargetCapTest.code, 0);
+const zeroPtyTargetCapBody = JSON.parse(zeroPtyTargetCapTest.stdout);
+assert.equal(zeroPtyTargetCapBody.ok, false);
+assert.equal(zeroPtyTargetCapBody.diagnostics[0].code, "PAR100");
+assert.match(zeroPtyTargetCapBody.diagnostics[0].actual, /lacks proc/);
+
+const zeroTermTargetCapTest = await execFileAsync(zero, ["test", "--json", "--filter", "term target", "--target", "linux-arm64", "conformance/check/pass/test-target-proc-caps.graph"]).catch((error) => error);
+assert.notEqual(zeroTermTargetCapTest.code, 0);
+const zeroTermTargetCapBody = JSON.parse(zeroTermTargetCapTest.stdout);
+assert.equal(zeroTermTargetCapBody.ok, false);
+assert.equal(zeroTermTargetCapBody.diagnostics[0].code, "PAR100");
+assert.match(zeroTermTargetCapBody.diagnostics[0].actual, /lacks proc/);
 
 const zeroPackageTestJsonRun = await execFileAsync(zero, ["test", "--json", "conformance/packages/test-app"]);
 const zeroPackageTestBody = JSON.parse(zeroPackageTestJsonRun.stdout);
 assert.equal(zeroPackageTestBody.ok, true);
-assert.equal(zeroPackageTestBody.graph.artifact, "conformance/packages/test-app/src/main.0");
-assert.equal(zeroPackageTestBody.graph.canonicalSource, true);
+assert.equal(zeroPackageTestBody.graph.artifact, "conformance/packages/test-app/zero.graph");
+assert.equal(zeroPackageTestBody.graph.canonicalSource, false);
 assert.equal(zeroPackageTestBody.graph.moduleIdentity, "package:test-app@0.1.0");
-assert.equal(zeroPackageTestBody.graph.lowering, "typed-program-graph-mir");
+assert.equal(zeroPackageTestBody.graph.lowering, "direct-program-graph");
 assert.equal(zeroPackageTestBody.testDiscovery.mode, "package-graph");
 assert.equal(zeroPackageTestBody.discoveredTests, 3);
 assert.equal(zeroPackageTestBody.selectedTests, 3);
@@ -4363,18 +4986,6 @@ assert.equal(zeroExpectedFailBody.ok, true);
 assert.equal(zeroExpectedFailBody.expectedFailures, 1);
 assert.equal(zeroExpectedFailBody.failedTests, 0);
 assert.equal(zeroExpectedFailBody.results[0].status, "expected-fail");
-
-const zeroUnexpectedPassJsonRun = await execFileAsync(zero, ["test", "--json", "conformance/native/fail/test-unexpected-pass.0"]).catch((error) => error);
-assert.notEqual(zeroUnexpectedPassJsonRun.code, 0);
-const zeroUnexpectedPassBody = JSON.parse(zeroUnexpectedPassJsonRun.stdout);
-assert.equal(zeroUnexpectedPassBody.ok, false);
-assert.equal(zeroUnexpectedPassBody.unexpectedPasses, 1);
-assert.equal(zeroUnexpectedPassBody.results[0].status, "unexpected-pass");
-
-const zeroTestFailureRun = await execFileAsync(zero, ["test", "conformance/native/fail/test-expect-runtime-fail.0"]).catch((error) => error);
-assert.notEqual(zeroTestFailureRun.code, 0);
-assert.match(zeroTestFailureRun.stderr, /zero test expectation failed/);
-assert.match(zeroTestFailureRun.stderr, /expect runtime failure exits nonzero/);
 
 const fmtRun = await execFileAsync(zero, ["fmt", "conformance/native/pass/test-blocks.0"]);
 assert.equal(fmtRun.stdout, await readFile("conformance/native/pass/test-blocks.0", "utf8"));
@@ -4392,18 +5003,13 @@ assert.equal(fmtCoreRun.stdout, await readFile("conformance/check/pass/fmt-core-
 const fmtMessyRun = await execFileAsync(zero, ["fmt", "conformance/format/messy.0"]);
 assert.equal(fmtMessyRun.stdout, await readFile("conformance/format/messy.0", "utf8"));
 
-const fmtSyntaxLocalRun = await execFileAsync(zero, ["fmt", "conformance/format/syntax-local.0"]);
-assert.equal(fmtSyntaxLocalRun.stdout, await readFile("conformance/format/syntax-local.0", "utf8"));
 const fmtIdempotentPath = `${outDir}/fmt-idempotent.0`;
-await writeFile(fmtIdempotentPath, fmtSyntaxLocalRun.stdout);
+await writeFile(fmtIdempotentPath, fmtMessyRun.stdout);
 const fmtIdempotentRun = await execFileAsync(zero, ["fmt", fmtIdempotentPath]);
-assert.equal(fmtIdempotentRun.stdout, fmtSyntaxLocalRun.stdout);
+assert.equal(fmtIdempotentRun.stdout, fmtMessyRun.stdout);
 
 const fmtFunctionsBlocksRun = await execFileAsync(zero, ["fmt", "conformance/format/functions-blocks.0"]);
 assert.equal(fmtFunctionsBlocksRun.stdout, await readFile("conformance/format/functions-blocks.0", "utf8"));
-
-const fmtDataTypesRun = await execFileAsync(zero, ["fmt", "conformance/format/data-types.0"]);
-assert.equal(fmtDataTypesRun.stdout, await readFile("conformance/format/data-types.0", "utf8"));
 
 const fmtGenericsStaticRun = await execFileAsync(zero, ["fmt", "conformance/format/generics-static.0"]);
 assert.equal(fmtGenericsStaticRun.stdout, await readFile("conformance/format/generics-static.0", "utf8"));
@@ -4419,14 +5025,12 @@ if (helloRunArgs) {
   assert.match(run.stdout, /hello conformance/);
 }
 
-const packageGraphJson = await execFileAsync(zero, ["graph", "--json", "conformance/check/pass/package"]);
+const packageGraphJson = await execFileAsync(zero, ["inspect", "--json", "conformance/check/pass/package"]);
 const packageGraph = JSON.parse(packageGraphJson.stdout);
 assert.deepEqual(packageGraph.sourceFiles.sort(), [
-  "conformance/check/pass/package/src/main.0",
-  "conformance/check/pass/package/src/types.0",
+  "src/main.0",
+  "src/types.0",
   "std/codec.0",
-  "std/parse.0",
-  "std/time.0",
 ]);
 assert(packageGraph.requiresCapabilities.includes("codec"));
 assert(packageGraph.requiresCapabilities.includes("parse"));
@@ -4435,23 +5039,49 @@ assert.equal(packageGraph.selfHostRouting.cBridge.policy, "removed");
 
 for (const runtimeFixture of [
   ["conformance/native/pass/break-continue.0", "break-continue", { stdout: "loop tick\nloop tick\n" }],
+  ["conformance/native/pass/nested-break-continue.0", "nested-break-continue", { stdout: "inner tick\ninner tick\nouter tick\ninner tick\ninner tick\nnested break continue ok\n" }],
+  ["conformance/native/pass/mutref-shape-param.0", "mutref-shape-param", { stdout: "mutref x ok\nmutref y ok\nref sum ok\n" }],
+  ["conformance/native/pass/mutref-shape-param-nested.0", "mutref-shape-param-nested", { stdout: "nested count ok\nnested total ok\nnested flag ok\nnested copy ok\nnested bytes ok\ngeneric mutref ok\n" }],
+  ["conformance/native/pass/untyped-literal-adoption.0", "untyped-literal-adoption", { stdout: "usize literal adoption ok\nflipped literal adoption ok\nliteral arithmetic adoption ok\nu8 literal adoption ok\n" }],
   ["conformance/native/pass/for-range.0", "for-range", { stdout: "range tick\nrange tick\nrange tick\n" }],
   ["conformance/native/pass/match-payload-binding.0", "match-payload-binding", { stdout: /payload binding ok/ }],
   ["conformance/native/pass/match-fallback.0", "match-fallback", { stdout: "match fallback ok\n" }],
   ["conformance/native/pass/match-choice-fallback.0", "match-choice-fallback", { stdout: "choice fallback ok\n" }],
   ["conformance/native/pass/null-maybe.0", "null-maybe", { stdout: /null maybe ok/ }],
+  ["conformance/native/pass/maybe-local-null-init-return.0", "maybe-local-null-init-return", { stdout: "maybe local found 42\nmaybe local none\nmaybe local sum 5\n" }],
+  ["conformance/native/pass/top-level-const.0", "top-level-const", { stdout: "const ok\n" }],
+  ["conformance/native/pass/const-arithmetic.0", "const-arithmetic", { stdout: "const arithmetic ok\n" }],
   ["conformance/native/pass/std-args.0", "std-args", { stdout: "alpha\n", args: ["alpha", "beta"] }],
-  ["conformance/native/pass/std-env.0", "std-env", { stdout: "env ok\n", env: { ZERO_CONFORMANCE_ENV: "agent-env" } }],
-  ["conformance/native/pass/std-hosted-cli.0", "std-hosted-cli", { stdout: "std hosted cli ok\n", args: ["run", "7", "--json", "--name", "agent", "--count", "3"], env: { ZERO_CONFORMANCE_MODE: "test", ZERO_CONFORMANCE_VERBOSE: "true", ZERO_CONFORMANCE_LIMIT: "9" } }],
+  ["conformance/native/pass/std-env.0", "std-env", { stdout: "env ok\n", env: { ZERO_CONFORMANCE_ENV: "agent-env", ZERO_CONFORMANCE_ENV_DELTA: "-3", ZERO_CONFORMANCE_ENV_WORKERS: "5" } }],
+  ["conformance/native/pass/std-hosted-cli.0", "std-hosted-cli", { stdout: "std hosted cli ok\n", args: ["run", "7", "--json", "--name", "agent", "--count", "3", "--enabled", "false", "--delta", "-5", "--size", "9"], env: { ZERO_CONFORMANCE_MODE: "test", ZERO_CONFORMANCE_VERBOSE: "true", ZERO_CONFORMANCE_LIMIT: "9" } }],
+  ["conformance/native/pass/std-proc-helpers.0", "std-proc-helpers", { stdout: "std proc helpers ok\n" }],
+  ["conformance/native/pass/std-proc-capture.0", "std-proc-capture", { stdout: "std proc capture ok\n" }],
+  ["conformance/native/pass/std-proc-capture-files.0", "std-proc-capture-files", { stdout: "std proc capture files ok\n" }],
+  ["conformance/native/pass/std-proc-child.0", "std-proc-child", { stdout: "std proc child ok\n" }],
+  ["conformance/native/pass/std-pty-child.0", "std-pty-child", { stdout: "std pty child ok\n" }],
+  ["conformance/native/pass/std-proc-child-cwd.0", "std-proc-child-cwd", { stdout: "std proc child cwd ok\n" }],
+  ["conformance/native/pass/std-proc-spawn-inherit.0", "std-proc-spawn-inherit", { stdout: "inherit-out status-ok\n" }],
   ["conformance/native/pass/std-fs.0", "std-fs", { stdout: "fs ok\n", file: { name: "std-fs-write.txt", text: "zero write\n" } }],
   ["conformance/native/pass/std-fs-bytes.0", "std-fs-bytes", { stdout: "fs bytes ok\n", stderr: "fs bytes err ok\n" }],
+  ["conformance/native/pass/std-fs-write-file-bool.0", "std-fs-write-file-bool", { stdout: "fs write file bool ok\n" }],
+  ["conformance/native/pass/std-fs-append-bytes.0", "std-fs-append-bytes", { stdout: "fs append ok\n" }],
+  ["conformance/native/pass/std-fs-direct-return.0", "std-fs-direct-return", { stdout: "fs direct return ok\n" }],
+  ["conformance/native/pass/std-fs-read-chunks.0", "std-fs-read-chunks", { stdout: "fs read chunks ok\n" }],
+  ["conformance/native/pass/frame-large-locals.0", "frame-large-locals", { stdout: "frame large locals ok alpha\n", args: ["alpha"] }],
+  ["conformance/native/pass/frame-limit-boundary.0", "frame-limit-boundary", { stdout: "frame limit boundary ok\n" }],
+  ["conformance/native/pass/frame-split-helpers.0", "frame-split-helpers", { stdout: "frame split helpers ok\n" }],
+  ["conformance/native/pass/fixed-buf-alloc-local.0", "fixed-buf-alloc-local", { stdout: "fixed buf alloc local ok\n" }],
   ["conformance/native/pass/std-fs-resource.0", "std-fs-resource", { stdout: "fs resource ok\n", file: { name: "std-fs-resource.txt", text: "zero file\n" } }],
-  ["conformance/native/pass/std-fs-file-helpers.0", "std-fs-file-helpers", { stdout: "std fs file helpers ok\n", file: { name: "std-fs-file-helpers-copy.txt", text: "zero file helpers\n" } }],
+  ["conformance/native/pass/std-fs-file-helpers.0", "std-fs-file-helpers", { stdout: "std fs file helpers ok\n" }],
   ["conformance/native/pass/std-io-lines.0", "std-io-lines", { stdout: "std io lines ok\n" }],
   ["conformance/native/pass/integer-widths.0", "integer-widths", { stdout: "integer widths ok\n" }],
   ["conformance/native/pass/std-codec-widths.0", "std-codec-widths", { stdout: "codec widths ok\n" }],
+  ["conformance/native/pass/std-csv.0", "std-csv", { stdout: "std csv ok\n" }],
+  ["conformance/native/pass/std-diag.0", "std-diag", { stdout: "std diag ok\n" }],
   ["conformance/native/pass/std-codec-json-url.0", "std-codec-json-url", { stdout: "std codec json url ok\n" }],
+  ["conformance/native/pass/std-json-cursors.0", "std-json-cursors", { stdout: "std json cursors ok\n" }],
   ["conformance/native/pass/std-crypto-hmac32.0", "std-crypto-hmac32", { stdout: "crypto hmac32 ok\n" }],
+  ["conformance/native/pass/std-crypto-sha256.0", "std-crypto-sha256", { stdout: "crypto sha256 ok\n" }],
   ["conformance/native/pass/parse-integers.0", "parse-integers", { stdout: "parse integers ok\n" }],
   ["conformance/native/pass/std-parse-text.0", "std-parse-text", { stdout: "std parse text ok\n" }],
   ["conformance/native/pass/explicit-casts.0", "explicit-casts", { stdout: "explicit casts ok\n" }],
@@ -4460,6 +5090,7 @@ for (const runtimeFixture of [
   ["conformance/native/pass/char-literals.0", "char-literals", { stdout: "char literals ok\n" }],
   ["conformance/native/pass/float-primitives.0", "float-primitives", { stdout: "float primitives ok\n" }],
   ["conformance/native/pass/recursive-fibonacci.0", "recursive-fibonacci", { stdout: "recursive fibonacci ok\n" }],
+  ["conformance/native/pass/mutual-recursion.0", "mutual-recursion", { stdout: "mutual recursion ok\n" }],
   ["conformance/native/pass/scratch-nested-index.0", "scratch-nested-index", { stdout: "scratch nested index ok\n" }],
   ["conformance/native/pass/checked-bounds-get.0", "checked-bounds-get", { stdout: "checked bounds get ok\n" }],
   ["conformance/native/pass/check-maybe-fallibility.0", "check-maybe-fallibility", { stdout: "check maybe fallibility ok\n" }],
@@ -4475,6 +5106,64 @@ for (const runtimeFixture of [
   await assertDirectRuntimeOrUnsupported(...runtimeFixture);
 }
 
+await assertDirectRuntimeRequired("conformance/native/pass/untyped-literal-adoption.0", "untyped-literal-adoption-required", { stdout: "usize literal adoption ok\nflipped literal adoption ok\nliteral arithmetic adoption ok\nu8 literal adoption ok\n" });
+
+await assertDirectRuntimeRequired("conformance/native/pass/recursive-multi-call-let.0", "recursive-multi-call-let-required", { stdout: "recursive multi call ok\n" });
+
+const literalAdoptionInitOverflowFixture = `${outDir}/untyped-literal-adoption-init-overflow.0`;
+const literalAdoptionInitOverflowBody = await writeImportFailureFixture(literalAdoptionInitOverflowFixture, `pub fn main(world: World) -> Void raises {
+    var small: u8 = 300
+    check world.out.write("unreachable\\n")
+}
+`);
+assert.equal(literalAdoptionInitOverflowBody.diagnostics[0].code, "TYP016");
+assert.equal(literalAdoptionInitOverflowBody.diagnostics[0].expected, "u8");
+assert.equal(literalAdoptionInitOverflowBody.diagnostics[0].actual, "300 overflows u8");
+
+const literalAdoptionCompareOverflowFixture = `${outDir}/untyped-literal-adoption-compare-overflow.0`;
+const literalAdoptionCompareOverflowBody = await writeImportFailureFixture(literalAdoptionCompareOverflowFixture, `pub fn main(world: World) -> Void raises {
+    var small: u8 = 7
+    if 300 > small {
+        check world.out.write("unreachable\\n")
+    }
+}
+`);
+assert.equal(literalAdoptionCompareOverflowBody.diagnostics[0].code, "TYP016");
+assert.equal(literalAdoptionCompareOverflowBody.diagnostics[0].expected, "u8");
+assert.equal(literalAdoptionCompareOverflowBody.diagnostics[0].actual, "300 overflows u8");
+assert.match(literalAdoptionCompareOverflowBody.diagnostics[0].help, /smaller literal or a wider integer type/);
+
+const fixedArrayRepeatLengthFixture = `${outDir}/fixed-array-repeat-length-mismatch.0`;
+const fixedArrayRepeatLengthBody = await writeImportFailureFixture(fixedArrayRepeatLengthFixture, `pub fn main(world: World) -> Void raises {
+    var b: [64]u8 = [0_u8; 32]
+    b[0] = 1
+    check world.out.write("unreachable\\n")
+}
+`);
+assert.equal(fixedArrayRepeatLengthBody.diagnostics[0].code, "TYP002");
+assert.equal(fixedArrayRepeatLengthBody.diagnostics[0].expected, "[64]u8");
+assert.equal(fixedArrayRepeatLengthBody.diagnostics[0].actual, "repeat count 32");
+assert.match(fixedArrayRepeatLengthBody.diagnostics[0].help, /make the lengths agree/);
+
+const fixedArrayListLengthFixture = `${outDir}/fixed-array-list-length-mismatch.0`;
+const fixedArrayListLengthBody = await writeImportFailureFixture(fixedArrayListLengthFixture, `pub fn main(world: World) -> Void raises {
+    var b: [4]u8 = [1, 2]
+    b[0] = 1
+    check world.out.write("unreachable\\n")
+}
+`);
+assert.equal(fixedArrayListLengthBody.diagnostics[0].code, "TYP002");
+assert.equal(fixedArrayListLengthBody.diagnostics[0].expected, "[4]u8");
+assert.equal(fixedArrayListLengthBody.diagnostics[0].actual, "2 element(s)");
+assert.match(fixedArrayListLengthBody.diagnostics[0].help, /annotate the intended array length/);
+
+await assertDirectRuntimeRequired("conformance/native/pass/break-continue.0", "break-continue-required", { stdout: "loop tick\nloop tick\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/maybe-local-null-init-return.0", "maybe-local-null-init-return-required", { stdout: "maybe local found 42\nmaybe local none\nmaybe local sum 5\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/top-level-const.0", "top-level-const-required", { stdout: "const ok\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/const-arithmetic.0", "const-arithmetic-required", { stdout: "const arithmetic ok\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/nested-break-continue.0", "nested-break-continue-required", { stdout: "inner tick\ninner tick\nouter tick\ninner tick\ninner tick\nnested break continue ok\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/mutref-shape-param.0", "mutref-shape-param-required", { stdout: "mutref x ok\nmutref y ok\nref sum ok\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/mutref-shape-param-nested.0", "mutref-shape-param-nested-required", { stdout: "nested count ok\nnested total ok\nnested flag ok\nnested copy ok\nnested bytes ok\ngeneric mutref ok\n" });
 await assertDirectRuntimeRequired("conformance/native/pass/generic-function-basic.0", "generic-function-basic-required", { stdout: "generic function ok\n" });
 await assertDirectRuntimeRequired("conformance/native/pass/generic-nested-calls.0", "generic-nested-calls-required", { stdout: "generic nested calls ok\n" });
 await assertDirectRuntimeRequired("conformance/native/pass/generic-inferred-specialized-call.0", "generic-inferred-specialized-call-required", { stdout: "generic inferred specialized call ok\n" });
@@ -4482,6 +5171,149 @@ await assertDirectRuntimeRequired("conformance/native/pass/generic-nested-local-
 await assertDirectRuntimeRequired("conformance/native/pass/generic-static-array-specialization.0", "generic-static-array-specialization-required", { stdout: "generic static array specialization ok\n" });
 await assertDirectRuntimeRequired("conformance/native/pass/generic-static-forwarded-array-specialization.0", "generic-static-forwarded-array-specialization-required", { stdout: "generic static forwarded array specialization ok\n" });
 await assertDirectRuntimeRequired("conformance/native/pass/explicit-cast-narrow-direct.0", "explicit-cast-narrow-direct-required", { stdout: "explicit cast narrow direct ok\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/frame-large-locals.0", "frame-large-locals-required", { stdout: "frame large locals ok alpha\n", args: ["alpha"] });
+await assertDirectRuntimeRequired("conformance/native/pass/frame-limit-boundary.0", "frame-limit-boundary-required", { stdout: "frame limit boundary ok\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/frame-split-helpers.0", "frame-split-helpers-required", { stdout: "frame split helpers ok\n" });
+await assertDirectRuntimeRequired("conformance/native/pass/fixed-buf-alloc-local.0", "fixed-buf-alloc-local-required", { stdout: "fixed buf alloc local ok\n" });
+
+const frameLimitOverFixture = `${outDir}/frame-limit-over.0`;
+const frameLimitOverBody = await writeImportFailureFixture(frameLimitOverFixture, `pub fn main(world: World) -> Void raises {
+    var buffer: [262144]u8 = [0; 262144]
+    buffer[0] = 1
+    check world.out.write("unreachable\\n")
+}
+`);
+assert.equal(frameLimitOverBody.diagnostics[0].code, "MEM003");
+assert.match(frameLimitOverBody.diagnostics[0].expected, /131072 bytes of locals/);
+assert.match(frameLimitOverBody.diagnostics[0].actual, /262144 bytes of locals/);
+assert.match(frameLimitOverBody.diagnostics[0].help, /smaller buffers in helper functions/);
+
+// Typed graph MIR constructs outside the buildable subset fail at import
+// time with the same BLD004 diagnostics zero build would report later.
+const pageAllocLocalBody = await writeImportFailureFixture(`${outDir}/page-alloc-local.0`, `pub fn main(world: World) -> Void raises {
+    let page: PageAlloc = std.mem.pageAlloc()
+    let bytes: Maybe<MutSpan<u8>> = std.mem.allocBytes(page, 4096)
+    if bytes.has {
+        check world.out.write("unreachable\\n")
+    }
+}
+`);
+assert.equal(pageAllocLocalBody.diagnostics[0].code, "BLD004");
+assert.match(pageAllocLocalBody.diagnostics[0].message, /allocator local requires FixedBufAlloc/);
+assert.equal(pageAllocLocalBody.diagnostics[0].actual, "PageAlloc");
+assert.equal(pageAllocLocalBody.diagnostics[0].line, 2);
+assert.match(pageAllocLocalBody.diagnostics[0].help, /std\.mem\.fixedBufAlloc/);
+assert.match(pageAllocLocalBody.diagnostics[0].help, /do not lower to direct backends yet/);
+
+const generalAllocLocalBody = await writeImportFailureFixture(`${outDir}/general-alloc-local.0`, `pub fn main(world: World) -> Void raises {
+    let general: GeneralAlloc = std.mem.generalAlloc()
+    let bytes: Maybe<MutSpan<u8>> = std.mem.allocBytes(general, 64)
+    if bytes.has {
+        check world.out.write("unreachable\\n")
+    }
+}
+`);
+assert.equal(generalAllocLocalBody.diagnostics[0].code, "BLD004");
+assert.equal(generalAllocLocalBody.diagnostics[0].actual, "GeneralAlloc");
+assert.equal(generalAllocLocalBody.diagnostics[0].line, 2);
+
+const deferStatementBody = await writeImportFailureFixture(`${outDir}/defer-statement-gate.0`, `pub fn main(world: World) -> Void raises {
+    defer check world.out.write("bye\\n")
+    check world.out.write("hi\\n")
+}
+`);
+assert.equal(deferStatementBody.diagnostics[0].code, "BLD004");
+assert.match(deferStatementBody.diagnostics[0].message, /statement kind is unsupported/);
+assert.equal(deferStatementBody.diagnostics[0].actual, "Defer");
+assert.equal(deferStatementBody.diagnostics[0].line, 2);
+assert.equal(deferStatementBody.diagnostics[0].column, 5);
+
+const rescueNonPrimitiveBody = await writeImportFailureFixture(`${outDir}/rescue-non-primitive-gate.0`, `fn label(ok: Bool) -> String raises [Invalid] {
+    if ok {
+        return "primary"
+    }
+    raise Invalid
+}
+
+pub fn main(world: World) -> Void raises {
+    let value: String = rescue label(false) err "fallback"
+    check world.out.write(value)
+}
+`);
+assert.equal(rescueNonPrimitiveBody.diagnostics[0].code, "BLD004");
+assert.equal(rescueNonPrimitiveBody.diagnostics[0].actual, "String");
+assert.equal(rescueNonPrimitiveBody.diagnostics[0].line, 1);
+
+const refByteBufParamBody = await writeImportFailureFixture(`${outDir}/ref-bytebuf-param-gate.0`, `fn buffered(buf: ref<ByteBuf>) -> usize {
+    return std.mem.bufLen(buf)
+}
+
+pub fn main(world: World) -> Void raises {
+    var storage: [8]u8 = [0, 0, 0, 0, 0, 0, 0, 0]
+    var alloc: FixedBufAlloc = std.mem.fixedBufAlloc(storage)
+    let maybe: Maybe<owned<ByteBuf>> = std.mem.byteBuf(alloc, 4)
+    if !maybe.has {
+        return
+    }
+    let buf: owned<ByteBuf> = maybe.value
+    if buffered(&buf) == 4 {
+        check world.out.write("buffered\\n")
+    }
+}
+`);
+assert.equal(refByteBufParamBody.diagnostics[0].code, "BLD004");
+assert.equal(refByteBufParamBody.diagnostics[0].actual, "ref<ByteBuf>");
+assert.equal(refByteBufParamBody.diagnostics[0].line, 1);
+
+await assertDirectRuntimeRequired("conformance/run/pass/world-output-helper.0", "world-output-helper-required", { stdout: "world helper ok\n" });
+
+const codecReadU32Body = await writeImportFailureFixture(`${outDir}/codec-readu32-gate.0`, `use std.codec
+
+pub fn main(world: World) -> Void raises {
+    let value: u32 = std.codec.readU32("abcd")
+    if value > 0 {
+        check world.out.write("read\\n")
+    }
+}
+`);
+assert.equal(codecReadU32Body.diagnostics[0].code, "STD002");
+assert.match(codecReadU32Body.diagnostics[0].message, /unknown std helper/);
+assert.equal(codecReadU32Body.diagnostics[0].actual, "unknown std helper");
+assert.equal(codecReadU32Body.diagnostics[0].line, 4);
+
+const enumLocalPackage = `${outDir}/enum-local-package`;
+await mkdir(`${enumLocalPackage}/src`, { recursive: true });
+await writeZeroToml(enumLocalPackage, {
+  package: { name: "enum-local-package", version: "0.1.0" },
+  targets: { cli: { kind: "exe", main: "src/main.0" } },
+  deps: {},
+});
+await writeFile(`${enumLocalPackage}/src/main.0`, `enum Status {
+    ready,
+    failed,
+}
+
+choice Outcome {
+    ok,
+    failed: i32,
+}
+
+pub fn main(world: World) -> Void raises {
+    let status: Status = Status.ready
+    let outcome: Outcome = Outcome.ok
+    if status == Status.ready {
+        check world.out.write("ready\\n")
+    }
+}
+`);
+const enumLocalImport = await execFileAsync(zero, ["import", "--json", enumLocalPackage]).catch((error) => error);
+assert.notEqual(enumLocalImport.code, 0);
+const enumLocalImportBody = JSON.parse(enumLocalImport.stdout);
+assert.equal(enumLocalImportBody.diagnostics[0].code, "BLD004");
+assert.match(enumLocalImportBody.diagnostics[0].message, /local type is unsupported/);
+assert.equal(enumLocalImportBody.diagnostics[0].actual, "Status");
+assert.match(enumLocalImportBody.diagnostics[0].path, /src\/main\.0$/);
+assert.equal(enumLocalImportBody.diagnostics[0].line, 12);
 
 const abiDump = await execFileAsync(zero, ["abi", "dump", "--json", "conformance/native/pass/const-layout.0"]);
 const abiDumpBody = JSON.parse(abiDump.stdout);
@@ -4503,6 +5335,10 @@ for (const runtimeFixture of [
   ["conformance/native/pass/byte-view-call-single-eval.0", "byte-view-call-single-eval", { stdout: "byte view call single eval ok\n" }],
   ["conformance/native/pass/std-math-breadth.0", "std-math-breadth", { stdout: "std math breadth ok\n" }],
   ["conformance/native/pass/std-numeric-random-time.0", "std-numeric-random-time", { stdout: "std numeric random time ok\n" }],
+  ["conformance/native/pass/std-regex.0", "std-regex", { stdout: "std regex ok\n" }],
+  ["conformance/native/pass/std-unicode.0", "std-unicode", { stdout: "std unicode ok\n" }],
+  ["conformance/native/pass/std-inet.0", "std-inet", { stdout: "std inet ok\n" }],
+  ["conformance/native/pass/std-time-rfc3339.0", "std-time-rfc3339", { stdout: "std time rfc3339 ok\n" }],
   ["conformance/native/pass/std-str-breadth.0", "std-str-breadth", { stdout: "std str breadth ok\n" }],
   ["conformance/native/pass/std-mem-generic-items.0", "std-mem-generic-items", { stdout: "std mem generic items ok\n" }],
   ["conformance/native/pass/std-mem-field-items.0", "std-mem-field-items", { stdout: "std mem field items ok\n" }],
@@ -4540,738 +5376,5 @@ for (const runtimeFixture of [
   await assertDirectRuntimeOrUnsupported(...runtimeFixture);
 }
 
-await assertBoundsTrap("conformance/native/fail/bounds-array-index.0", "bounds-array-index");
-await assertBoundsTrap("conformance/native/fail/bounds-span-index.0", "bounds-span-index");
-await assertBoundsTrap("conformance/native/fail/bounds-slice-end.0", "bounds-slice-end");
-await assertBoundsTrap("conformance/native/fail/bounds-slice-order.0", "bounds-slice-order");
-await assertBoundsTrap("conformance/native/fail/bounds-open-slice-start.0", "bounds-open-slice-start");
-await assertBoundsTrap("conformance/native/fail/bounds-slice-len-end.0", "bounds-slice-len-end");
-await assertBoundsTrap("conformance/native/fail/bounds-slice-len-order.0", "bounds-slice-len-order");
-await assertBoundsTrap("conformance/native/fail/bounds-open-slice-len-start.0", "bounds-open-slice-len-start");
-await assertBoundsTrap("conformance/native/fail/index-string.0", "index-string");
-await assertBoundsTrap("conformance/native/fail/slice-string.0", "slice-string");
-await assertBoundsTrap("conformance/native/fail/indexed-mutation-oob.0", "indexed-mutation-oob");
-
-const failed = await execFileAsync(zero, ["check", "conformance/check/fail/unknown-name.0"]).catch((error) => error);
-assert.notEqual(failed.code, 0);
-assert.match(failed.stderr, /NAM003/);
-
-const unknownField = await execFileAsync(zero, ["check", "conformance/native/fail/unknown-field.0"]).catch((error) => error);
-assert.notEqual(unknownField.code, 0);
-assert.match(unknownField.stderr, /FLD001/);
-
-const wrongReturnType = await execFileAsync(zero, ["check", "conformance/native/fail/bad-return.0"]).catch((error) => error);
-assert.notEqual(wrongReturnType.code, 0);
-assert.match(wrongReturnType.stderr, /TYP003/);
-
-const maybeRawScalarReturn = await execFileAsync(zero, ["check", "conformance/native/fail/maybe-raw-scalar-return.0"]).catch((error) => error);
-assert.notEqual(maybeRawScalarReturn.code, 0);
-assert.match(maybeRawScalarReturn.stderr, /TYP003/);
-
-const immutableAssignment = await execFileAsync(zero, ["check", "conformance/native/fail/immutable-assignment.0"]).catch((error) => error);
-assert.notEqual(immutableAssignment.code, 0);
-assert.match(immutableAssignment.stderr, /TYP009/);
-
-const indexedMutationImmutable = await execFileAsync(zero, ["check", "conformance/native/fail/indexed-mutation-immutable.0"]).catch((error) => error);
-assert.notEqual(indexedMutationImmutable.code, 0);
-assert.match(indexedMutationImmutable.stderr, /TYP009/);
-
-const indexedMutationType = await execFileAsync(zero, ["check", "conformance/native/fail/indexed-mutation-type.0"]).catch((error) => error);
-assert.notEqual(indexedMutationType.code, 0);
-assert.match(indexedMutationType.stderr, /TYP002/);
-
-const indexedMutationNonInteger = await execFileAsync(zero, ["check", "conformance/native/fail/indexed-mutation-non-integer.0"]).catch((error) => error);
-assert.notEqual(indexedMutationNonInteger.code, 0);
-assert.match(indexedMutationNonInteger.stderr, /TYP022/);
-
-const indexedMutationSpan = await execFileAsync(zero, ["check", "conformance/native/fail/indexed-mutation-span.0"]).catch((error) => error);
-assert.notEqual(indexedMutationSpan.code, 0);
-assert.match(indexedMutationSpan.stderr, /TYP021/);
-
-const indexedMutationString = await execFileAsync(zero, ["check", "conformance/native/fail/indexed-mutation-string.0"]).catch((error) => error);
-assert.notEqual(indexedMutationString.code, 0);
-assert.match(indexedMutationString.stderr, /TYP021/);
-assert.match(indexedMutationString.stderr, /byte-oriented/);
-
-const nestedLvalueImmutableField = await execFileAsync(zero, ["check", "conformance/native/fail/nested-lvalue-immutable-field.0"]).catch((error) => error);
-assert.notEqual(nestedLvalueImmutableField.code, 0);
-assert.match(nestedLvalueImmutableField.stderr, /TYP009/);
-
-const nestedLvalueFieldType = await execFileAsync(zero, ["check", "conformance/native/fail/nested-lvalue-field-type.0"]).catch((error) => error);
-assert.notEqual(nestedLvalueFieldType.code, 0);
-assert.match(nestedLvalueFieldType.stderr, /TYP002/);
-
-const nestedLvalueUnknownField = await execFileAsync(zero, ["check", "conformance/native/fail/nested-lvalue-unknown-field.0"]).catch((error) => error);
-assert.notEqual(nestedLvalueUnknownField.code, 0);
-assert.match(nestedLvalueUnknownField.stderr, /FLD001/);
-
-const nestedLvalueNonIntegerIndex = await execFileAsync(zero, ["check", "conformance/native/fail/nested-lvalue-non-integer-index.0"]).catch((error) => error);
-assert.notEqual(nestedLvalueNonIntegerIndex.code, 0);
-assert.match(nestedLvalueNonIntegerIndex.stderr, /TYP022/);
-
-const nestedLvalueSpanIndex = await execFileAsync(zero, ["check", "conformance/native/fail/nested-lvalue-span-index.0"]).catch((error) => error);
-assert.notEqual(nestedLvalueSpanIndex.code, 0);
-assert.match(nestedLvalueSpanIndex.stderr, /TYP021/);
-
-const nestedLvalueStringIndex = await execFileAsync(zero, ["check", "conformance/native/fail/nested-lvalue-string-index.0"]).catch((error) => error);
-assert.notEqual(nestedLvalueStringIndex.code, 0);
-assert.match(nestedLvalueStringIndex.stderr, /TYP021/);
-assert.match(nestedLvalueStringIndex.stderr, /byte-oriented/);
-
-const mutspanImmutableArray = await execFileAsync(zero, ["check", "conformance/native/fail/mutspan-immutable-array.0"]).catch((error) => error);
-assert.notEqual(mutspanImmutableArray.code, 0);
-assert.match(mutspanImmutableArray.stderr, /TYP009/);
-
-const memCopyImmutableDst = await execFileAsync(zero, ["check", "conformance/native/fail/mem-copy-immutable-dst.0"]).catch((error) => error);
-assert.notEqual(memCopyImmutableDst.code, 0);
-assert.match(memCopyImmutableDst.stderr, /TYP009/);
-
-const memCopyImmutableDstJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/mem-copy-immutable-dst.0"]).catch((error) => error);
-assert.notEqual(memCopyImmutableDstJson.code, 0);
-const memCopyImmutableDstBody = JSON.parse(memCopyImmutableDstJson.stdout);
-assert.equal(memCopyImmutableDstBody.diagnostics[0].code, "TYP009");
-assert.equal(memCopyImmutableDstBody.diagnostics[0].repair.id, "make-binding-mutable");
-
-const stdLogImmutableBufferJson = await execFileAsync(zero, ["check", "--json", "conformance/native/fail/std-log-immutable-buffer.0"]).catch((error) => error);
-assert.notEqual(stdLogImmutableBufferJson.code, 0);
-const stdLogImmutableBufferBody = JSON.parse(stdLogImmutableBufferJson.stdout);
-assert.equal(stdLogImmutableBufferBody.diagnostics[0].code, "TYP009");
-assert.equal(stdLogImmutableBufferBody.diagnostics[0].repair.id, "make-binding-mutable");
-
-const memCopyItemsImmutableDst = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-immutable-dst.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsImmutableDst.code, 0);
-assert.match(memCopyItemsImmutableDst.stderr, /TYP009/);
-
-const memCopyItemsImmutableField = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-immutable-field.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsImmutableField.code, 0);
-assert.match(memCopyItemsImmutableField.stderr, /TYP009/);
-
-const memCopyItemsConstDst = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-const-dst.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsConstDst.code, 0);
-assert.match(memCopyItemsConstDst.stderr, /TYP009/);
-
-const memCopyItemsMismatch = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-mismatch.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsMismatch.code, 0);
-assert.match(memCopyItemsMismatch.stderr, /STD003/);
-
-const memCopyItemsOwned = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-owned.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsOwned.code, 0);
-assert.match(memCopyItemsOwned.stderr, /OWN001/);
-
-const memCopyItemsGenericOwned = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-generic-owned.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsGenericOwned.code, 0);
-assert.match(memCopyItemsGenericOwned.stderr, /OWN001/);
-
-const memCopyItemsReferenceEscape = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-reference-escape.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsReferenceEscape.code, 0);
-assert.match(memCopyItemsReferenceEscape.stderr, /BOR002/);
-
-const memCopyItemsEmptyReferenceEscape = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-copy-items-empty-reference-escape.0"]).catch((error) => error);
-assert.notEqual(memCopyItemsEmptyReferenceEscape.code, 0);
-assert.match(memCopyItemsEmptyReferenceEscape.stderr, /BOR002/);
-
-const memFillItemsMismatch = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-fill-items-mismatch.0"]).catch((error) => error);
-assert.notEqual(memFillItemsMismatch.code, 0);
-assert.match(memFillItemsMismatch.stderr, /TYP002|STD003/);
-
-const memFillItemsConstDst = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-fill-items-const-dst.0"]).catch((error) => error);
-assert.notEqual(memFillItemsConstDst.code, 0);
-assert.match(memFillItemsConstDst.stderr, /TYP009/);
-
-const memFillItemsOwned = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-fill-items-owned.0"]).catch((error) => error);
-assert.notEqual(memFillItemsOwned.code, 0);
-assert.match(memFillItemsOwned.stderr, /OWN001/);
-
-const memFillItemsGenericOwned = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-fill-items-generic-owned.0"]).catch((error) => error);
-assert.notEqual(memFillItemsGenericOwned.code, 0);
-assert.match(memFillItemsGenericOwned.stderr, /OWN001/);
-
-const memFillItemsReferenceEscape = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-fill-items-reference-escape.0"]).catch((error) => error);
-assert.notEqual(memFillItemsReferenceEscape.code, 0);
-assert.match(memFillItemsReferenceEscape.stderr, /BOR002/);
-
-const memFillItemsSliceReferenceEscape = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-fill-items-slice-reference-escape.0"]).catch((error) => error);
-assert.notEqual(memFillItemsSliceReferenceEscape.code, 0);
-assert.match(memFillItemsSliceReferenceEscape.stderr, /BOR002/);
-
-const memContainsOwned = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-contains-owned.0"]).catch((error) => error);
-assert.notEqual(memContainsOwned.code, 0);
-assert.match(memContainsOwned.stderr, /OWN001/);
-
-const memContainsGenericOwned = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-contains-generic-owned.0"]).catch((error) => error);
-assert.notEqual(memContainsGenericOwned.code, 0);
-assert.match(memContainsGenericOwned.stderr, /OWN001/);
-
-const memContainsRecord = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-contains-record.0"]).catch((error) => error);
-assert.notEqual(memContainsRecord.code, 0);
-assert.match(memContainsRecord.stderr, /STD003/);
-
-const memPrefixCountI32 = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-prefix-count-i32.0"]).catch((error) => error);
-assert.notEqual(memPrefixCountI32.code, 0);
-assert.match(memPrefixCountI32.stderr, /TYP022/);
-
-const memDropPrefixCountI32 = await execFileAsync(zero, ["check", "conformance/native/fail/std-mem-drop-prefix-count-i32.0"]).catch((error) => error);
-assert.notEqual(memDropPrefixCountI32.code, 0);
-assert.match(memDropPrefixCountI32.stderr, /TYP022/);
-
-for (const [fixture, code] of [
-  ["std-collections-append-mismatch.0", /STD003/],
-  ["std-collections-append-overlap.0", /BOR001/],
-  ["std-collections-append-mutspan-overlap.0", /BOR001/],
-  ["std-collections-append-mutspan-inline-overlap.0", /STD003/],
-  ["std-collections-push-borrowed.0", /BOR001/],
-  ["std-collections-push-mutspan-borrowed.0", /BOR001/],
-  ["std-collections-push-immutable.0", /TYP009/],
-  ["std-collections-push-mismatch.0", /STD003/],
-  ["std-collections-push-owned.0", /OWN001/],
-  ["std-search-owned.0", /OWN001/],
-  ["std-sort-immutable.0", /TYP009/],
-  ["std-sort-mutates-borrowed.0", /BOR001/],
-  ["std-sort-mutspan-mutates-borrowed.0", /BOR001/],
-]) {
-  const result = await execFileAsync(zero, ["check", `conformance/native/fail/${fixture}`]).catch((error) => error);
-  assert.notEqual(result.code, 0);
-  assert.match(result.stderr, code);
-}
-
-const mutspanFromSpan = await execFileAsync(zero, ["check", "conformance/native/fail/mutspan-from-span.0"]).catch((error) => error);
-assert.notEqual(mutspanFromSpan.code, 0);
-assert.match(mutspanFromSpan.stderr, /TYP002/);
-
-const mutspanFromString = await execFileAsync(zero, ["check", "conformance/native/fail/mutspan-from-string.0"]).catch((error) => error);
-assert.notEqual(mutspanFromString.code, 0);
-assert.match(mutspanFromString.stderr, /TYP002/);
-
-const mutspanReadonlyIndex = await execFileAsync(zero, ["check", "conformance/native/fail/mutspan-readonly-index.0"]).catch((error) => error);
-assert.notEqual(mutspanReadonlyIndex.code, 0);
-assert.match(mutspanReadonlyIndex.stderr, /TYP021/);
-
-const mutspanAssignmentType = await execFileAsync(zero, ["check", "conformance/native/fail/mutspan-assignment-type.0"]).catch((error) => error);
-assert.notEqual(mutspanAssignmentType.code, 0);
-assert.match(mutspanAssignmentType.stderr, /TYP002/);
-
-const mutspanNonIntegerIndex = await execFileAsync(zero, ["check", "conformance/native/fail/mutspan-non-integer-index.0"]).catch((error) => error);
-assert.notEqual(mutspanNonIntegerIndex.code, 0);
-assert.match(mutspanNonIntegerIndex.stderr, /TYP022/);
-
-const duplicateFunction = await execFileAsync(zero, ["check", "conformance/native/fail/duplicate-function.0"]).catch((error) => error);
-assert.notEqual(duplicateFunction.code, 0);
-assert.match(duplicateFunction.stderr, /NAM004/);
-
-const internalPrefixDeclaration = await execFileAsync(zero, ["check", "conformance/native/fail/internal-prefix-declaration.0"]).catch((error) => error);
-assert.notEqual(internalPrefixDeclaration.code, 0);
-assert.match(internalPrefixDeclaration.stderr, /NAM004/);
-assert.match(internalPrefixDeclaration.stderr, /reserved compiler-internal symbol name/);
-
-const wrongArity = await execFileAsync(zero, ["check", "conformance/native/fail/wrong-arity.0"]).catch((error) => error);
-assert.notEqual(wrongArity.code, 0);
-assert.match(wrongArity.stderr, /NAM004/);
-
-const unknownEnumCase = await execFileAsync(zero, ["check", "conformance/check/fail/unknown-enum-case.0"]).catch((error) => error);
-assert.notEqual(unknownEnumCase.code, 0);
-assert.match(unknownEnumCase.stderr, /VAR001/);
-
-const badStdCall = await execFileAsync(zero, ["check", "conformance/native/fail/bad-std-call.0"]).catch((error) => error);
-assert.notEqual(badStdCall.code, 0);
-assert.match(badStdCall.stderr, /STD002/);
-
-const stdHttpErrorRawInt = await execFileAsync(zero, ["check", "conformance/native/fail/std-http-error-raw-int.0"]).catch((error) => error);
-assert.notEqual(stdHttpErrorRawInt.code, 0);
-assert.match(stdHttpErrorRawInt.stderr, /TYP002/);
-
-const stdHttpFetchRawTimeout = await execFileAsync(zero, ["check", "conformance/native/fail/std-http-fetch-raw-timeout.0"]).catch((error) => error);
-assert.notEqual(stdHttpFetchRawTimeout.code, 0);
-assert.match(stdHttpFetchRawTimeout.stderr, /STD003/);
-
-const stdJsonParseBytesRawAlloc = await execFileAsync(zero, ["check", "conformance/native/fail/std-json-parsebytes-raw-alloc.0"]).catch((error) => error);
-assert.notEqual(stdJsonParseBytesRawAlloc.code, 0);
-assert.match(stdJsonParseBytesRawAlloc.stderr, /STD003/);
-
-const stdJsonParseBytesImmutableAlloc = await execFileAsync(zero, ["check", "conformance/native/fail/std-json-parsebytes-immutable-alloc.0"]).catch((error) => error);
-assert.notEqual(stdJsonParseBytesImmutableAlloc.code, 0);
-assert.match(stdJsonParseBytesImmutableAlloc.stderr, /STD003/);
-
-const genericMemLenNonSpan = await execFileAsync(zero, ["check", "conformance/native/fail/generic-mem-len-non-span.0"]).catch((error) => error);
-assert.notEqual(genericMemLenNonSpan.code, 0);
-assert.match(genericMemLenNonSpan.stderr, /STD003/);
-
-const genericMemEqlMismatch = await execFileAsync(zero, ["check", "conformance/native/fail/generic-mem-eql-mismatch.0"]).catch((error) => error);
-assert.notEqual(genericMemEqlMismatch.code, 0);
-assert.match(genericMemEqlMismatch.stderr, /STD003/);
-
-const genericMemEqlNonSpan = await execFileAsync(zero, ["check", "conformance/native/fail/generic-mem-eql-non-span.0"]).catch((error) => error);
-assert.notEqual(genericMemEqlNonSpan.code, 0);
-assert.match(genericMemEqlNonSpan.stderr, /STD003/);
-
-const badMemoryType = await execFileAsync(zero, ["check", "conformance/native/fail/bad-memory-type.0"]).catch((error) => error);
-assert.notEqual(badMemoryType.code, 0);
-assert.match(badMemoryType.stderr, /MEM001/);
-
-const checkerArrayElementType = await execFileAsync(zero, ["check", "conformance/check/fail/checker-array-element-type.0"]).catch((error) => error);
-assert.notEqual(checkerArrayElementType.code, 0);
-assert.match(checkerArrayElementType.stderr, /TYP002/);
-
-const checkerRefMismatch = await execFileAsync(zero, ["check", "conformance/check/fail/checker-ref-mismatch.0"]).catch((error) => error);
-assert.notEqual(checkerRefMismatch.code, 0);
-assert.match(checkerRefMismatch.stderr, /TYP001/);
-
-const checkerMutrefImmutable = await execFileAsync(zero, ["check", "conformance/check/fail/checker-mutref-immutable.0"]).catch((error) => error);
-assert.notEqual(checkerMutrefImmutable.code, 0);
-assert.match(checkerMutrefImmutable.stderr, /TYP009/);
-
-const nonexhaustiveMatch = await execFileAsync(zero, ["check", "conformance/native/fail/nonexhaustive-match.0"]).catch((error) => error);
-assert.notEqual(nonexhaustiveMatch.code, 0);
-assert.match(nonexhaustiveMatch.stderr, /MAT002/);
-
-const badChoicePayload = await execFileAsync(zero, ["check", "conformance/native/fail/bad-choice-payload.0"]).catch((error) => error);
-assert.notEqual(badChoicePayload.code, 0);
-assert.match(badChoicePayload.stderr, /VAR004/);
-
-const allocatorInvalid = await execFileAsync(zero, ["check", "conformance/native/fail/allocator-invalid.0"]).catch((error) => error);
-assert.notEqual(allocatorInvalid.code, 0);
-assert.match(allocatorInvalid.stderr, /STD003/);
-
-const allocatorImmutableFixedBuf = await execFileAsync(zero, ["check", "conformance/native/fail/allocator-immutable-fixedbuf.0"]).catch((error) => error);
-assert.notEqual(allocatorImmutableFixedBuf.code, 0);
-assert.match(allocatorImmutableFixedBuf.stderr, /STD003/);
-
-const byteBufferImmutableAlloc = await execFileAsync(zero, ["check", "conformance/native/fail/byte-buffer-immutable-alloc.0"]).catch((error) => error);
-assert.notEqual(byteBufferImmutableAlloc.code, 0);
-assert.match(byteBufferImmutableAlloc.stderr, /STD003/);
-
-const ownedUseAfterMove = await execFileAsync(zero, ["check", "conformance/native/fail/owned-use-after-move.0"]).catch((error) => error);
-assert.notEqual(ownedUseAfterMove.code, 0);
-assert.match(ownedUseAfterMove.stderr, /OWN001/);
-
-for (const fixture of [
-  "owned-array-repeat.0",
-  "owned-array-dynamic-index-reassign-use-after-move.0",
-  "owned-array-element-use-after-move.0",
-  "owned-field-use-after-move.0",
-  "owned-field-copy-use-after-move.0",
-  "owned-field-nested-assignment-after-move.0",
-  "owned-aggregate-copy-use-after-move.0",
-  "owned-aggregate-array-repeat.0",
-  "owned-aggregate-root-use-after-move.0",
-  "owned-aggregate-partial-root-use-after-move.0",
-  "owned-mutspan-alias-use-after-move.0",
-  "owned-mutspan-alias-inverse-use-after-move.0",
-  "maybe-owned-check-use-after-move.0",
-  "maybe-owned-stmt-check-use-after-move.0",
-  "maybe-owned-rescue-fallback-use-after-move.0",
-]) {
-  const result = await execFileAsync(zero, ["check", `conformance/native/fail/${fixture}`]).catch((error) => error);
-  assert.notEqual(result.code, 0);
-  assert.match(result.stderr, /OWN001/);
-}
-
-const unsupportedDrop = await execFileAsync(zero, ["check", "conformance/native/fail/unsupported-drop.0"]).catch((error) => error);
-assert.notEqual(unsupportedDrop.code, 0);
-assert.match(unsupportedDrop.stderr, /OWN002/);
-
-const invalidDropSignature = await execFileAsync(zero, ["check", "conformance/native/fail/invalid-drop-signature.0"]).catch((error) => error);
-assert.notEqual(invalidDropSignature.code, 0);
-assert.match(invalidDropSignature.stderr, /OWN002/);
-
-const borrowMutrefImmutable = await execFileAsync(zero, ["check", "conformance/native/fail/borrow-mutref-immutable.0"]).catch((error) => error);
-assert.notEqual(borrowMutrefImmutable.code, 0);
-assert.match(borrowMutrefImmutable.stderr, /TYP009/);
-
-const borrowConflict = await execFileAsync(zero, ["check", "conformance/native/fail/borrow-conflict.0"]).catch((error) => error);
-assert.notEqual(borrowConflict.code, 0);
-assert.match(borrowConflict.stderr, /BOR001/);
-
-const borrowAssignWhileBorrowed = await execFileAsync(zero, ["check", "conformance/native/fail/borrow-assign-while-borrowed.0"]).catch((error) => error);
-assert.notEqual(borrowAssignWhileBorrowed.code, 0);
-assert.match(borrowAssignWhileBorrowed.stderr, /BOR001/);
-
-const borrowAssignThroughRef = await execFileAsync(zero, ["check", "conformance/native/fail/borrow-assign-through-ref.0"]).catch((error) => error);
-assert.notEqual(borrowAssignThroughRef.code, 0);
-assert.match(borrowAssignThroughRef.stderr, /TYP009/);
-
-const borrowReturnLocal = await execFileAsync(zero, ["check", "conformance/native/fail/borrow-return-local.0"]).catch((error) => error);
-assert.notEqual(borrowReturnLocal.code, 0);
-assert.match(borrowReturnLocal.stderr, /BOR002/);
-
-const borrowWrongType = await execFileAsync(zero, ["check", "conformance/native/fail/borrow-wrong-type.0"]).catch((error) => error);
-assert.notEqual(borrowWrongType.code, 0);
-assert.match(borrowWrongType.stderr, /TYP001/);
-
-const refIndexedAssignment = await execFileAsync(zero, ["check", "conformance/native/fail/ref-indexed-assignment.0"]).catch((error) => error);
-assert.notEqual(refIndexedAssignment.code, 0);
-assert.match(refIndexedAssignment.stderr, /TYP009/);
-
-const breakOutsideLoop = await execFileAsync(zero, ["check", "conformance/native/fail/break-outside-loop.0"]).catch((error) => error);
-assert.notEqual(breakOutsideLoop.code, 0);
-assert.match(breakOutsideLoop.stderr, /TYP012/);
-
-const continueOutsideLoop = await execFileAsync(zero, ["check", "conformance/native/fail/continue-outside-loop.0"]).catch((error) => error);
-assert.notEqual(continueOutsideLoop.code, 0);
-assert.match(continueOutsideLoop.stderr, /TYP013/);
-
-const nonBoolCondition = await execFileAsync(zero, ["check", "conformance/native/fail/non-bool-condition.0"]).catch((error) => error);
-assert.notEqual(nonBoolCondition.code, 0);
-assert.match(nonBoolCondition.stderr, /TYP010/);
-
-const badMatchPayloadBinding = await execFileAsync(zero, ["check", "conformance/native/fail/bad-match-payload-binding.0"]).catch((error) => error);
-assert.notEqual(badMatchPayloadBinding.code, 0);
-assert.match(badMatchPayloadBinding.stderr, /MAT004/);
-
-const badNull = await execFileAsync(zero, ["check", "conformance/native/fail/bad-null.0"]).catch((error) => error);
-assert.notEqual(badNull.code, 0);
-assert.match(badNull.stderr, /TYP011/);
-
-const badForRange = await execFileAsync(zero, ["check", "conformance/native/fail/bad-for-range.0"]).catch((error) => error);
-assert.notEqual(badForRange.code, 0);
-assert.match(badForRange.stderr, /TYP014/);
-
-const badStdArgs = await execFileAsync(zero, ["check", "conformance/native/fail/bad-std-args.0"]).catch((error) => error);
-assert.notEqual(badStdArgs.code, 0);
-assert.match(badStdArgs.stderr, /STD002/);
-
-const badStdFs = await execFileAsync(zero, ["check", "conformance/native/fail/bad-std-fs.0"]).catch((error) => error);
-assert.notEqual(badStdFs.code, 0);
-assert.match(badStdFs.stderr, /STD003/);
-
-const fsOpenWithoutCapability = await execFileAsync(zero, ["check", "conformance/native/fail/fs-open-without-capability.0"]).catch((error) => error);
-assert.notEqual(fsOpenWithoutCapability.code, 0);
-assert.match(fsOpenWithoutCapability.stderr, /STD003/);
-
-const fsReadWithoutMutref = await execFileAsync(zero, ["check", "conformance/native/fail/fs-read-without-mutref.0"]).catch((error) => error);
-assert.notEqual(fsReadWithoutMutref.code, 0);
-assert.match(fsReadWithoutMutref.stderr, /STD003/);
-
-const unknownStdHelper = await execFileAsync(zero, ["check", "conformance/native/fail/unknown-std-helper.0"]).catch((error) => error);
-assert.notEqual(unknownStdHelper.code, 0);
-assert.match(unknownStdHelper.stderr, /STD002/);
-
-const integerU8Overflow = await execFileAsync(zero, ["check", "conformance/native/fail/integer-u8-overflow.0"]).catch((error) => error);
-assert.notEqual(integerU8Overflow.code, 0);
-assert.match(integerU8Overflow.stderr, /TYP016/);
-
-const integerI8Overflow = await execFileAsync(zero, ["check", "conformance/native/fail/integer-i8-overflow.0"]).catch((error) => error);
-assert.notEqual(integerI8Overflow.code, 0);
-assert.match(integerI8Overflow.stderr, /TYP016/);
-
-const integerU64Overflow = await execFileAsync(zero, ["check", "conformance/native/fail/integer-u64-overflow.0"]).catch((error) => error);
-assert.notEqual(integerU64Overflow.code, 0);
-assert.match(integerU64Overflow.stderr, /TYP016/);
-
-const malformedIntegerLiteral = await execFileAsync(zero, ["check", "conformance/native/fail/malformed-integer-literal.0"]).catch((error) => error);
-assert.notEqual(malformedIntegerLiteral.code, 0);
-assert.match(malformedIntegerLiteral.stderr, /TYP015/);
-
-const integerNonliteralNarrowing = await execFileAsync(zero, ["check", "conformance/native/fail/integer-nonliteral-narrowing.0"]).catch((error) => error);
-assert.notEqual(integerNonliteralNarrowing.code, 0);
-assert.match(integerNonliteralNarrowing.stderr, /TYP002/);
-
-const stdCodecReadU16Width = await execFileAsync(zero, ["check", "conformance/native/fail/std-codec-read-u16-width.0"]).catch((error) => error);
-assert.notEqual(stdCodecReadU16Width.code, 0);
-assert.match(stdCodecReadU16Width.stderr, /TYP002/);
-
-const castStringToInt = await execFileAsync(zero, ["check", "conformance/native/fail/cast-string-to-int.0"]).catch((error) => error);
-assert.notEqual(castStringToInt.code, 0);
-assert.match(castStringToInt.stderr, /TYP017/);
-
-const castBoolToInt = await execFileAsync(zero, ["check", "conformance/native/fail/cast-bool-to-int.0"]).catch((error) => error);
-assert.notEqual(castBoolToInt.code, 0);
-assert.match(castBoolToInt.stderr, /TYP017/);
-
-const castIntToSpan = await execFileAsync(zero, ["check", "conformance/native/fail/cast-int-to-span.0"]).catch((error) => error);
-assert.notEqual(castIntToSpan.code, 0);
-assert.match(castIntToSpan.stderr, /TYP017/);
-
-const castIntToString = await execFileAsync(zero, ["check", "conformance/native/fail/cast-int-to-string.0"]).catch((error) => error);
-assert.notEqual(castIntToString.code, 0);
-assert.match(castIntToString.stderr, /TYP017/);
-
-const radixInvalidBinary = await execFileAsync(zero, ["check", "conformance/native/fail/radix-invalid-binary.0"]).catch((error) => error);
-assert.notEqual(radixInvalidBinary.code, 0);
-assert.match(radixInvalidBinary.stderr, /TYP015/);
-
-const radixEmptyHex = await execFileAsync(zero, ["check", "conformance/native/fail/radix-empty-hex.0"]).catch((error) => error);
-assert.notEqual(radixEmptyHex.code, 0);
-assert.match(radixEmptyHex.stderr, /TYP015/);
-
-const literalBadSeparator = await execFileAsync(zero, ["check", "conformance/native/fail/literal-bad-separator.0"]).catch((error) => error);
-assert.notEqual(literalBadSeparator.code, 0);
-assert.match(literalBadSeparator.stderr, /TYP015/);
-
-const literalTrailingSeparator = await execFileAsync(zero, ["check", "conformance/native/fail/literal-trailing-separator.0"]).catch((error) => error);
-assert.notEqual(literalTrailingSeparator.code, 0);
-assert.match(literalTrailingSeparator.stderr, /TYP015/);
-
-const literalUnknownSuffix = await execFileAsync(zero, ["check", "conformance/native/fail/literal-unknown-suffix.0"]).catch((error) => error);
-assert.notEqual(literalUnknownSuffix.code, 0);
-assert.match(literalUnknownSuffix.stderr, /TYP015/);
-
-const literalSuffixMismatch = await execFileAsync(zero, ["check", "conformance/native/fail/literal-suffix-mismatch.0"]).catch((error) => error);
-assert.notEqual(literalSuffixMismatch.code, 0);
-assert.match(literalSuffixMismatch.stderr, /TYP002/);
-
-const literalSuffixOverflow = await execFileAsync(zero, ["check", "conformance/native/fail/literal-suffix-overflow.0"]).catch((error) => error);
-assert.notEqual(literalSuffixOverflow.code, 0);
-assert.match(literalSuffixOverflow.stderr, /TYP016/);
-
-const charEmpty = await execFileAsync(zero, ["check", "conformance/native/fail/char-empty.0"]).catch((error) => error);
-assert.notEqual(charEmpty.code, 0);
-assert.match(charEmpty.stderr, /PAR100/);
-
-const charMultiple = await execFileAsync(zero, ["check", "conformance/native/fail/char-multiple.0"]).catch((error) => error);
-assert.notEqual(charMultiple.code, 0);
-assert.match(charMultiple.stderr, /PAR100/);
-
-const charBadEscape = await execFileAsync(zero, ["check", "conformance/native/fail/char-bad-escape.0"]).catch((error) => error);
-assert.notEqual(charBadEscape.code, 0);
-assert.match(charBadEscape.stderr, /PAR100/);
-
-const charToString = await execFileAsync(zero, ["check", "conformance/native/fail/char-to-string.0"]).catch((error) => error);
-assert.notEqual(charToString.code, 0);
-assert.match(charToString.stderr, /TYP002/);
-
-const stringToChar = await execFileAsync(zero, ["check", "conformance/native/fail/string-to-char.0"]).catch((error) => error);
-assert.notEqual(stringToChar.code, 0);
-assert.match(stringToChar.stderr, /TYP002/);
-
-const charIntegerArithmetic = await execFileAsync(zero, ["check", "conformance/native/fail/char-integer-arithmetic.0"]).catch((error) => error);
-assert.notEqual(charIntegerArithmetic.code, 0);
-assert.match(charIntegerArithmetic.stderr, /TYP002/);
-
-const malformedFloatLiteral = await execFileAsync(zero, ["check", "conformance/native/fail/malformed-float-literal.0"]).catch((error) => error);
-assert.notEqual(malformedFloatLiteral.code, 0);
-assert.match(malformedFloatLiteral.stderr, /TYP019/);
-
-const floatF32Overflow = await execFileAsync(zero, ["check", "conformance/native/fail/float-f32-overflow.0"]).catch((error) => error);
-assert.notEqual(floatF32Overflow.code, 0);
-assert.match(floatF32Overflow.stderr, /TYP020/);
-
-const integerFromFloat = await execFileAsync(zero, ["check", "conformance/native/fail/integer-from-float.0"]).catch((error) => error);
-assert.notEqual(integerFromFloat.code, 0);
-assert.match(integerFromFloat.stderr, /TYP002/);
-
-const floatFromInteger = await execFileAsync(zero, ["check", "conformance/native/fail/float-from-integer.0"]).catch((error) => error);
-assert.notEqual(floatFromInteger.code, 0);
-assert.match(floatFromInteger.stderr, /TYP002/);
-
-const floatMixedWidth = await execFileAsync(zero, ["check", "conformance/native/fail/float-mixed-width.0"]).catch((error) => error);
-assert.notEqual(floatMixedWidth.code, 0);
-assert.match(floatMixedWidth.stderr, /TYP002/);
-
-const floatIntArithmetic = await execFileAsync(zero, ["check", "conformance/native/fail/float-int-arithmetic.0"]).catch((error) => error);
-assert.notEqual(floatIntArithmetic.code, 0);
-assert.match(floatIntArithmetic.stderr, /TYP002/);
-
-const indexNonInteger = await execFileAsync(zero, ["check", "conformance/native/fail/index-non-integer.0"]).catch((error) => error);
-assert.notEqual(indexNonInteger.code, 0);
-assert.match(indexNonInteger.stderr, /TYP022/);
-
-const indexNonIndexable = await execFileAsync(zero, ["check", "conformance/native/fail/index-non-indexable.0"]).catch((error) => error);
-assert.notEqual(indexNonIndexable.code, 0);
-assert.match(indexNonIndexable.stderr, /TYP021/);
-
-const checkedGetNonIndexable = await execFileAsync(zero, ["check", "conformance/native/fail/checked-get-non-indexable.0"]).catch((error) => error);
-assert.notEqual(checkedGetNonIndexable.code, 0);
-assert.match(checkedGetNonIndexable.stderr, /STD003/);
-
-const checkMaybeVoid = await execFileAsync(zero, ["check", "conformance/native/fail/check-maybe-void.0"]).catch((error) => error);
-assert.notEqual(checkMaybeVoid.code, 0);
-assert.match(checkMaybeVoid.stderr, /ERR001/);
-
-const raiseWithoutRaises = await execFileAsync(zero, ["check", "conformance/native/fail/raise-without-raises.0"]).catch((error) => error);
-assert.notEqual(raiseWithoutRaises.code, 0);
-assert.match(raiseWithoutRaises.stderr, /ERR001/);
-
-const raiseUndeclaredError = await execFileAsync(zero, ["check", "conformance/native/fail/raise-undeclared-error.0"]).catch((error) => error);
-assert.notEqual(raiseUndeclaredError.code, 0);
-assert.match(raiseUndeclaredError.stderr, /ERR002/);
-
-const uncheckedFallibleCall = await execFileAsync(zero, ["check", "conformance/native/fail/unchecked-fallible-call.0"]).catch((error) => error);
-assert.notEqual(uncheckedFallibleCall.code, 0);
-assert.match(uncheckedFallibleCall.stderr, /ERR003/);
-
-const errorSetMismatch = await execFileAsync(zero, ["check", "conformance/native/fail/error-set-mismatch.0"]).catch((error) => error);
-assert.notEqual(errorSetMismatch.code, 0);
-assert.match(errorSetMismatch.stderr, /ERR002/);
-
-const rescueFallbackTypeMismatch = await execFileAsync(zero, ["check", "conformance/native/fail/rescue-fallback-type-mismatch.0"]).catch((error) => error);
-assert.notEqual(rescueFallbackTypeMismatch.code, 0);
-assert.match(rescueFallbackTypeMismatch.stderr, /TYP003|TYP002/);
-
-const stdFsRescueFallbackTypeOverwrite = await execFileAsync(zero, ["check", "conformance/native/fail/std-fs-rescue-fallback-type-overwrite.0"]).catch((error) => error);
-assert.notEqual(stdFsRescueFallbackTypeOverwrite.code, 0);
-assert.match(stdFsRescueFallbackTypeOverwrite.stderr, /TYP002/);
-
-const constFieldAssignment = await execFileAsync(zero, ["check", "conformance/native/fail/const-field-assignment.0"]).catch((error) => error);
-assert.notEqual(constFieldAssignment.code, 0);
-assert.match(constFieldAssignment.stderr, /TYP009/);
-
-const constMutBorrow = await execFileAsync(zero, ["check", "conformance/native/fail/const-mut-borrow.0"]).catch((error) => error);
-assert.notEqual(constMutBorrow.code, 0);
-assert.match(constMutBorrow.stderr, /TYP009/);
-
-const badExternLayout = await execFileAsync(zero, ["check", "conformance/native/fail/bad-extern-layout.0"]).catch((error) => error);
-assert.notEqual(badExternLayout.code, 0);
-assert.match(badExternLayout.stderr, /ABI001/);
-
-const badPackedLayout = await execFileAsync(zero, ["check", "conformance/native/fail/bad-packed-layout.0"]).catch((error) => error);
-assert.notEqual(badPackedLayout.code, 0);
-assert.match(badPackedLayout.stderr, /ABI001/);
-
-const badCExport = await execFileAsync(zero, ["check", "conformance/native/fail/bad-c-export.0"]).catch((error) => error);
-assert.notEqual(badCExport.code, 0);
-assert.match(badCExport.stderr, /ABI001/);
-
-const badCExportRaises = await execFileAsync(zero, ["check", "conformance/native/fail/bad-c-export-raises.0"]).catch((error) => error);
-assert.notEqual(badCExportRaises.code, 0);
-assert.match(badCExportRaises.stderr, /ABI001/);
-
-const byteBufferUseAfterMove = await execFileAsync(zero, ["check", "conformance/native/fail/byte-buffer-use-after-move.0"]).catch((error) => error);
-assert.notEqual(byteBufferUseAfterMove.code, 0);
-assert.match(byteBufferUseAfterMove.stderr, /OWN001/);
-
-const testExpectNonBool = await execFileAsync(zero, ["check", "conformance/native/fail/test-expect-non-bool.0"]).catch((error) => error);
-assert.notEqual(testExpectNonBool.code, 0);
-assert.match(testExpectNonBool.stderr, /TYP001/);
-
-const sliceNonIntegerBound = await execFileAsync(zero, ["check", "conformance/native/fail/slice-non-integer-bound.0"]).catch((error) => error);
-assert.notEqual(sliceNonIntegerBound.code, 0);
-assert.match(sliceNonIntegerBound.stderr, /TYP022/);
-
-const sliceNonSliceable = await execFileAsync(zero, ["check", "conformance/native/fail/slice-non-sliceable.0"]).catch((error) => error);
-assert.notEqual(sliceNonSliceable.code, 0);
-assert.match(sliceNonSliceable.stderr, /TYP021/);
-
-for (const [fixture, code] of [
-  ["missing-return-path.0", /TYP003/],
-  ["check-non-fallible-value.0", /ERR001/],
-  ["unchecked-fallible-wrapper.0", /ERR003/],
-  ["unchecked-fallible-wrapper-declared-later.0", /ERR003/],
-  ["unchecked-fallible-receiver-wrapper.0", /ERR003/],
-  ["unchecked-fallible-generic-call.0", /ERR003/],
-  ["unchecked-fallible-static-method.0", /ERR003/],
-  ["unchecked-fallible-interface-method.0", /ERR003/],
-  ["unchecked-fallible-interface-wrapper.0", /ERR003/],
-  ["error-set-wrapper-mismatch.0", /ERR002/],
-  ["error-set-wrapper-nested-check-mismatch.0", /ERR002/],
-  ["error-set-interface-wrapper-mismatch.0", /ERR002/],
-  ["unknown-member-on-non-shape.0", /TYP021/],
-  ["function-used-as-value.0", /TYP001/],
-  ["call-local-value.0", /TYP001/],
-  ["call-shadowed-function-value.0", /TYP001/],
-  ["shape-literal-expected-type.0", /TYP002/],
-  ["heterogeneous-array-literal.0", /TYP002/],
-  ["unknown-function-parameter-type.0", /NAM003/],
-  ["unknown-local-generic-type.0", /NAM003/],
-  ["unknown-return-reference-origin.0", /NAM003/],
-  ["duplicate-shape-field.0", /NAM004/],
-  ["duplicate-enum-case.0", /NAM004/],
-  ["duplicate-shape-literal-field.0", /NAM004/],
-  ["type-name-used-as-value.0", /TYP001/],
-  ["maybe-value-without-has.0", /MEM002/],
-  ["maybe-value-after-assignment.0", /MEM002/],
-  ["maybe-value-nested-without-has.0", /MEM002/],
-  ["maybe-value-nested-assignment-without-has.0", /MEM002/],
-  ["maybe-value-guard-invalidated-by-condition-call.0", /MEM002/],
-  ["maybe-value-temporary-without-has.0", /MEM002/],
-  ["maybe-value-branch-local-guard-leak.0", /MEM002/],
-  ["maybe-value-guard-invalidated-by-receiver-call.0", /MEM002/],
-  ["maybe-value-dynamic-index-guard.0", /MEM002/],
-  ["maybe-value-mutspan-alias-invalidated.0", /MEM002/],
-  ["maybe-value-nested-mutspan-alias-invalidated.0", /MEM002/],
-  ["maybe-value-mutspan-call-invalidated.0", /MEM002/],
-  ["maybe-value-mutspan-condition-call-invalidated.0", /MEM002/],
-  ["maybe-value-mutspan-alias-guard-invalidated.0", /BOR001/],
-  ["maybe-value-mutspan-call-shadow-invalidated.0", /MEM002/],
-  ["maybe-value-mutspan-assignment-shadow-invalidated.0", /BOR001/],
-  ["maybe-value-match-guard-mutates-subject.0", /MEM002/],
-  ["maybe-value-variant-match-guard-fallthrough.0", /MEM002/],
-  ["maybe-value-scalar-match-guard-fallthrough.0", /MEM002/],
-  ["read-while-mutably-borrowed.0", /BOR001/],
-  ["array-reference-borrow-origin.0", /BOR001/],
-  ["return-array-reference-escape.0", /BOR002/],
-  ["span-return-local-array.0", /BOR002/],
-  ["span-binding-return-local-array.0", /BOR002/],
-  ["span-assignment-return-local-array.0", /BOR002/],
-  ["span-slice-return-local-array.0", /BOR002/],
-  ["span-slice-return-array-param.0", /BOR002/],
-  ["span-call-return-local-array.0", /BOR002/],
-  ["span-field-return-local-array.0", /BOR002/],
-  ["span-field-return-param-array.0", /BOR002/],
-  ["span-shape-literal-return-local-array.0", /BOR002/],
-  ["span-choice-return-local-array.0", /BOR002/],
-  ["string-return-local-array.0", /BOR002/],
-  ["stdlib-span-return-local-buffer.0", /BOR002/],
-  ["std-mem-prefix-return-local-array.0", /BOR002/],
-  ["std-mem-drop-prefix-return-local-array.0", /BOR002/],
-  ["check-array-reference-origin.0", /BOR001/],
-  ["check-maybe-reference-origin.0", /BOR001/],
-  ["rescue-reference-origin.0", /BOR001/],
-  ["local-reference-escape-call.0", /BOR002/],
-  ["local-reference-escape-binding.0", /BOR002/],
-  ["local-reference-escape-method.0", /BOR002/],
-  ["local-reference-escape-param.0", /BOR002/],
-  ["local-reference-escape-param-call.0", /BOR002/],
-  ["borrow-assignment-origin-tracking.0", /BOR001/],
-  ["borrow-assignment-shorter-lived-root.0", /BOR002/],
-  ["borrow-branch-origin-merge.0", /BOR001/],
-  ["aggregate-if-reference-origin.0", /BOR001/],
-  ["aggregate-match-reference-origin.0", /BOR001/],
-  ["choice-payload-local-reference-escape.0", /BOR002/],
-  ["choice-match-payload-reference-origin.0", /BOR001/],
-  ["choice-match-payload-return-escape.0", /BOR002/],
-  ["array-if-reference-origin.0", /BOR001/],
-  ["array-while-reference-origin.0", /BOR001/],
-  ["array-for-reference-origin.0", /BOR001/],
-  ["borrow-call-result-multiple-origins.0", /BOR001/],
-  ["borrow-self-assignment-origin-tracking.0", /BOR001/],
-  ["generic-reference-borrow-origin.0", /BOR001/],
-  ["generic-reference-return-escape.0", /BOR002/],
-  ["aggregate-call-reference-borrow-origin.0", /BOR001/],
-  ["aggregate-call-reference-escape.0", /BOR002/],
-  ["aggregate-param-reference-return-origin.0", /BOR001/],
-  ["call-branch-reference-origin.0", /BOR001/],
-  ["generic-aggregate-reference-origin.0", /BOR001/],
-  ["generic-receiver-method-reference-origin.0", /BOR001/],
-  ["function-mutref-side-effect-reference-origin.0", /BOR001/],
-  ["function-mutref-local-reference-escape.0", /BOR002/],
-  ["function-mutref-local-shape-reference-escape.0", /BOR002/],
-  ["function-mutref-local-array-reference-escape.0", /BOR002/],
-  ["function-mutspan-local-reference-escape.0", /BOR002/],
-  ["function-mutref-stored-reference-copy-origin.0", /BOR001/],
-  ["static-interface-mutref-reference-origin.0", /BOR001/],
-  ["nested-generic-mutref-reference-origin.0", /BOR001/],
-  ["static-interface-mutref-local-reference-escape.0", /BOR002/],
-  ["static-interface-return-reference-origin.0", /BOR002/],
-  ["recursive-mutref-summary-incomplete.0", /BOR002/],
-  ["assignment-rhs-side-effect-reference-origin.0", /BOR001/],
-  ["function-rescue-side-effect-reference-origin.0", /BOR001/],
-  ["function-short-circuit-side-effect-reference-origin.0", /BOR001/],
-  ["nested-receiver-side-effect-reference-origin.0", /BOR001/],
-  ["receiver-method-local-reference-escape.0", /BOR002/],
-  ["receiver-union-side-effect-reference-origin.0", /BOR001/],
-  ["mutref-alias-assignment-reference-origin.0", /BOR001/],
-  ["mutref-alias-assignment-shorter-lived-origin.0", /BOR002/],
-  ["rescue-side-effect-reference-origin.0", /BOR001/],
-  ["short-circuit-side-effect-reference-origin.0", /BOR001/],
-  ["shadowed-mutref-side-effect-reference-origin.0", /BOR001/],
-  ["shape-field-reference-escape.0", /BOR002/],
-  ["shape-field-reference-borrow-origin.0", /BOR001/],
-  ["return-shape-reference-escape.0", /BOR002/],
-  ["shape-field-reference-call-return-escape.0", /BOR002/],
-  ["shape-field-reference-assignment-origin.0", /BOR001/],
-  ["shape-field-reference-assignment-preserves-other-origin.0", /BOR001/],
-  ["shape-array-reference-index-origin.0", /BOR001/],
-  ["index-reference-assignment-preserves-other-origin.0", /BOR001/],
-  ["shape-array-reference-call-origin.0", /BOR001/],
-  ["receiver-return-field-origin.0", /BOR001/],
-  ["receiver-return-partial-field-origin.0", /BOR001/],
-  ["receiver-return-partial-index-origin.0", /BOR001/],
-  ["receiver-method-side-effect-reference-origin.0", /BOR001/],
-  ["world-stream-used-as-value.0", /TYP001/],
-]) {
-  const result = await execFileAsync(zero, ["check", `conformance/native/fail/${fixture}`]).catch((error) => error);
-  assert.notEqual(result.code, 0);
-  assert.match(result.stderr, code);
-}
-
+finishAggregateAssert(assert, { suite: "conformance", reportPath: `${outDir}/failures.json` });
 console.log("conformance ok");

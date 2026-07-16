@@ -1,0 +1,10 @@
+pub fn main(world: World) -> Void raises {
+    var buf: [131040]u8 = [0; 131040]
+    buf[0] = 3
+    buf[131039] = 9
+    if buf[0] == 3_u8 && buf[131039] == 9_u8 {
+        check world.out.write("frame limit boundary ok\n")
+    } else {
+        check world.out.write("frame limit boundary failed\n")
+    }
+}

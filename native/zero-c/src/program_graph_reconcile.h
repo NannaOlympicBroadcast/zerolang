@@ -15,6 +15,14 @@ typedef struct {
   size_t identity_changed;
 } ZProgramGraphReconcileSummary;
 
+typedef enum {
+  Z_PROGRAM_GRAPH_RECONCILE_EDIT_OTHER = 0,
+  Z_PROGRAM_GRAPH_RECONCILE_EDIT_CONST,
+  Z_PROGRAM_GRAPH_RECONCILE_EDIT_SIGNATURE,
+} ZProgramGraphReconcileEditKind;
+
+bool z_program_graph_identity_refresh_compatible(const char *store_identity, const char *source_identity);
+ZProgramGraphReconcileEditKind z_program_graph_reconcile_edit_kind(const ZProgramGraph *base, const ZProgramGraph *edited);
 void z_program_graph_reconcile_summary(const ZProgramGraph *base, const ZProgramGraph *edited, ZProgramGraphReconcileSummary *out);
 void z_program_graph_append_reconcile_json(ZBuf *buf,
                                            const ZProgramGraph *base,

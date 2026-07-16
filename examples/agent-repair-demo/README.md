@@ -1,12 +1,8 @@
 # Agent Repair Demo
 
-This demo shows the intended agent loop on a real diagnostic.
-
-Broken fixture:
-
-```sh
-bin/zero check --json examples/agent-repair-demo/broken.0
-```
+This demo shows the intended agent loop on a real diagnostic. The checked-in
+example stays graph-backed; the script writes its intentionally broken input
+under `.zero/agent-repair-demo/` at runtime.
 
 Explain the diagnostic:
 
@@ -17,7 +13,7 @@ bin/zero explain --json TYP009
 Inspect the repair plan:
 
 ```sh
-bin/zero fix --plan --json examples/agent-repair-demo/broken.0
+pnpm run agent:demo
 ```
 
 Apply the suggested edit:
@@ -27,14 +23,8 @@ Apply the suggested edit:
 +    var dst: [4]u8 = [0, 0, 0, 0]
 ```
 
-Re-run check:
+Review the fixed projection:
 
 ```sh
-bin/zero check examples/agent-repair-demo/fixed.0
-```
-
-Run the scripted demo:
-
-```sh
-pnpm run agent:demo
+bin/zero check examples/agent-repair-demo/fixed.graph
 ```

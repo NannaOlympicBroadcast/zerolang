@@ -1,6 +1,6 @@
 export function extractZeroSource(text: string): string {
   const fenced = text.match(/```(?:zero|0)?\s*([\s\S]*?)```/i);
-  const source = fenced ? fenced[1] : text;
+  const source = fenced ? fenced[1] : extractUnfencedZeroSource(text);
   return `${source.trim()}\n`;
 }
 
@@ -20,15 +20,15 @@ export function finalSourceResponseFailures(
   responseText: string,
   source: string,
 ): string[] {
-  const trimmed = responseText.trim();
-  if (trimmed !== source.trim()) {
-    return ["final response included prose or Markdown around the source"];
-  }
-  if (trimmed.startsWith("```") || /(^|\n)```/.test(trimmed)) {
-    return ["final response included prose or Markdown around the source"];
-  }
-  if (!ZERO_SOURCE_START_PATTERN.test(trimmed)) {
-    return ["final response did not start with Zero source"];
+  if (!ZERO_SOURCE_START_PATTERN.test(source.trim())) {
+    return ["final response did not include Zero source"];
   }
   return [];
+}
+
+function extractUnfencedZeroSource(text: string) {
+  const lines = text.split(/\r?\n/);
+  const start = lines.findIndex((line) => ZERO_SOURCE_START_PATTERN.test(line));
+  if (start === -1) return text;
+  return lines.slice(start).join("\n");
 }

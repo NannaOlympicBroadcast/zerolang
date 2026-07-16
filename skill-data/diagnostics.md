@@ -5,24 +5,27 @@ description: Read Zero diagnostics, explanations, and typed fix plans.
 
 # Zero Diagnostics
 
-Use this when Zero code fails to parse, typecheck, build, test, or target-check. Zero diagnostics are intended for agents: start with the readable command output, then use JSON when you need stable fields, spans, or repair metadata.
+Use this when Zero code fails to parse, typecheck, build, test, or target-check.
+Zero diagnostics are intended for agents: start with the readable command
+output. Use JSON only when an automation tool needs stable fields or a debugging
+session needs exact spans, repair metadata, or machine-readable diagnostics.
 
 ## Commands
 
 ```sh
-zero check <input>
+zero check
 zero explain <diagnostic-code>
 ```
 
-Use machine-readable output when you need exact fields:
+Use machine-readable output when a tool needs exact fields:
 
 ```sh
-zero check --json <input>
+zero check --json
 zero explain --json <diagnostic-code>
-zero fix --plan --json <input>
+zero fix --plan --json
 ```
 
-`zero fix` is plan-only in this compiler. It reports candidate repairs but does not edit files.
+`zero fix` reads graph-backed inputs. It reports candidate repairs for graph diagnostics; projection-only source must be imported before repair planning.
 
 ## Diagnostic Shape
 
@@ -56,7 +59,8 @@ Apply only the edit you can justify from the source and fix plan. Treat `require
 - `NAM003`: unknown name; declare it, import it, or fix spelling.
 - `IMP001`: unknown package-local import.
 - `IMP002`: package-local import cycle.
-- `PKG001`: local dependency path lacks `zero.json`.
+- `PKG001`: local dependency path lacks `zero.toml` or a compatibility
+  `zero.json`.
 - `PKG002`: package dependency cycle.
 - `PKG003`: one package name resolves to conflicting versions.
 - `PKG004`: selected target is not supported by a dependency.
@@ -66,11 +70,15 @@ Apply only the edit you can justify from the source and fix plan. Treat `require
 - `STD002`: unknown standard-library helper; use a documented `std.<module>.<helper>` name.
 - `STD003`: standard-library capability or contract mismatch; inspect the helper signature and required capability.
 - `TYP009`: immutable value used where a mutable destination is required; make the binding `var` or pass mutable storage.
+- `MEM003`: one function's fixed locals exceed the 128 KiB frame limit; split the buffer into smaller buffers in helper functions, or process the data in fixed-size chunks.
+- `RGP007`: ambiguous source identity during import; split the text edit into smaller passes or make the change with `zero patch`.
+- `RGP008`: stale package projection while `ZERO_STALE=fail` is set; run `zero import`, or unset the variable to let the command refresh automatically.
+- `RGP009`: binary `zero.graph` store unreadable by this compiler, usually written by a different zero build; rebuild it with this binary via `zero import .` or install the matching compiler (compare `zero --version` build hashes).
 
 ## Agent Triage
 
 1. Run the failing command normally first.
-2. If the readable output is not enough, rerun with `--json` and use the span to inspect only the relevant source.
+2. If a debugging session needs exact machine fields, rerun with `--json` and use the span to inspect only the relevant source.
 3. Run `zero explain <code>` before broad refactors.
 4. If multiple diagnostics share a root cause, fix the earliest source issue.
 5. Re-run the same command after the patch.

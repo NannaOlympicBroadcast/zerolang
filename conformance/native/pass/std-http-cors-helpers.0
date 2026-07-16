@@ -1,0 +1,64 @@
+export c fn main() -> i32 {
+    let head_request: Span<u8> = "HEAD /health\n\n"
+    let options_request: Span<u8> = "OPTIONS /users\naccess-control-request-method: POST\n\n"
+    if !std.http.requestIsHead(head_request, "/health") {
+        return 11
+    }
+    if std.http.requestIsHead(options_request, "/users") {
+        return 12
+    }
+    if !std.http.requestIsOptions(options_request, "/users") {
+        return 13
+    }
+    if std.http.requestIsOptions(head_request, "/health") {
+        return 14
+    }
+    var preflight_buf: [256]u8 = [0_u8; 256]
+    let preflight: Maybe<Span<u8>> = std.http.writeCorsPreflight(preflight_buf, "*", "GET, POST, OPTIONS", "content-type, authorization")
+    if !preflight.has {
+        return 15
+    }
+    if !std.str.contains(preflight.value, "204 No Content") {
+        return 16
+    }
+    if !std.str.contains(preflight.value, "HTTP/1.1 204 No Content\r\nconnection: close\r\n") {
+        return 27
+    }
+    if !std.str.contains(preflight.value, "access-control-allow-origin: *") {
+        return 17
+    }
+    if !std.str.contains(preflight.value, "access-control-allow-methods: GET, POST, OPTIONS") {
+        return 18
+    }
+    if !std.str.contains(preflight.value, "access-control-allow-headers: content-type, authorization") {
+        return 19
+    }
+    if !std.str.contains(preflight.value, "content-length: 0") {
+        return 20
+    }
+    var json_buf: [256]u8 = [0_u8; 256]
+    let json: Maybe<Span<u8>> = std.http.writeCorsJsonResponse(json_buf, "200 OK", "{\"ok\":true}", "https://app.example")
+    if !json.has {
+        return 21
+    }
+    if !std.str.contains(json.value, "200 OK") {
+        return 22
+    }
+    if !std.str.contains(json.value, "content-type: application/json") {
+        return 23
+    }
+    if !std.str.contains(json.value, "\r\nconnection: close\r\n") {
+        return 29
+    }
+    if !std.str.contains(json.value, "access-control-allow-origin: https://app.example") {
+        return 24
+    }
+    let body: Maybe<Span<u8>> = std.http.responseBodyBytes(json.value)
+    if !body.has {
+        return 25
+    }
+    if !std.mem.eql(body.value, "{\"ok\":true}") {
+        return 26
+    }
+    return 32
+}

@@ -1,0 +1,12 @@
+pub fn main(world: World) -> Void raises {
+    var backing: [4096]u8 = [0; 4096]
+    var alloc: FixedBufAlloc = std.mem.fixedBufAlloc(backing)
+    let bytes: Maybe<MutSpan<u8>> = std.mem.allocBytes(alloc, 64)
+    if bytes.has {
+        let buf: MutSpan<u8> = bytes.value
+        buf[0] = 7
+        if buf[0] == 7 {
+            check world.out.write("fixed buf alloc local ok\n")
+        }
+    }
+}

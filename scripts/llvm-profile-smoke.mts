@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 const zero = "bin/zero";
 const outDir = ".zero/llvm-profile";
+const addInput = "examples/add.graph";
 mkdirSync(outDir, { recursive: true });
 
 function runJson(args: string[], options: { allowFailure?: boolean } = {}) {
@@ -29,7 +30,7 @@ function llvmOptimizationLevel(profile: string) {
 }
 
 function buildRow(id: string, backend: string, profile: string, emit: string, out: string, allowFailure = false) {
-  const args = ["build", "--json", "--backend", backend, "--profile", profile, "--emit", emit, "examples/add.0", "--out", out];
+  const args = ["build", "--json", "--backend", backend, "--profile", profile, "--emit", emit, addInput, "--out", out];
   const result = runJson(args, { allowFailure });
   if (result.code !== 0) {
     return {
@@ -60,7 +61,7 @@ function buildRow(id: string, backend: string, profile: string, emit: string, ou
   };
 }
 
-const size = runJson(["size", "--json", "--backend", "llvm", "examples/add.0"]).body;
+const size = runJson(["size", "--json", "--backend", "llvm", addInput]).body;
 assert.equal(size.targetSupport.backendFamily, "llvm");
 assert.equal(size.backendProfile.backendFamily, "llvm");
 assert.equal(size.backendProfile.fallbackPolicy, "none");
@@ -69,7 +70,7 @@ assert.equal(size.backendProfile.optimizationLevel, "-Oz");
 assert.equal(size.objectBackend.backendFamily, "llvm");
 assert.equal(size.backendComparison.rows.length, 4);
 
-const check = runJson(["check", "--json", "--backend", "llvm", "examples/add.0"]).body;
+const check = runJson(["check", "--json", "--backend", "llvm", addInput]).body;
 const llvmHostReady = check.targetReadiness.ok === true;
 
 const rows = [
@@ -99,7 +100,7 @@ if (llvmHostReady) {
 console.log(JSON.stringify({
   schemaVersion: 1,
   kind: "zero-llvm-profile-smoke",
-  sourceFile: "examples/add.0",
+  graphInput: addInput,
   llvmHostReady,
   rows,
 }, null, 2));

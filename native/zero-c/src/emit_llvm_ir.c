@@ -20,6 +20,9 @@ typedef struct {
   unsigned temp_index;
   unsigned label_index;
   unsigned current_label;
+  unsigned loop_cond_label;
+  unsigned loop_end_label;
+  bool in_loop;
 } LlvmEmit;
 
 static bool llvm_scalar_type_supported(IrTypeKind type) {
@@ -183,6 +186,7 @@ static void llvm_append_data_globals(ZBuf *buf, const IrProgram *program) {
 
 static bool llvm_emit_value(LlvmEmit *emit, const IrValue *value, LlvmValue *out, ZDiag *diag);
 static bool llvm_emit_call(LlvmEmit *emit, const IrValue *value, LlvmValue *out, ZDiag *diag);
+static bool llvm_emit_byte_view(LlvmEmit *emit, const IrValue *value, LlvmValue *out, ZDiag *diag);
 
 static bool llvm_emit_trap_if_false(LlvmEmit *emit, const char *cond) {
   unsigned ok_label = llvm_label(emit), trap_label = llvm_label(emit);
@@ -262,6 +266,49 @@ static bool llvm_ensure_byte_view_pair(LlvmEmit *emit, LlvmValue *value, const I
   return true;
 }
 
+static bool llvm_emit_json_error_label_byte_view(LlvmEmit *emit, const IrValue *value, LlvmValue *out, ZDiag *diag) {
+  if (!value || !value->left || value->arg_len != 4) {
+    llvm_set_diag(diag, emit->program, value ? value->line : 1, value ? value->column : 1, "LLVM IR backend JSON error label requires a status and four labels", "invalid JSON error label", "lower");
+    return false;
+  }
+  LlvmValue code;
+  if (!llvm_emit_value(emit, value->left, &code, diag)) return false;
+  if (code.type != IR_TYPE_U32) {
+    llvm_set_diag(diag, emit->program, value->line, value->column, "LLVM IR backend JSON error label status must be u32", "invalid JSON status", "lower");
+    return false;
+  }
+  LlvmValue labels[4];
+  for (unsigned i = 0; i < 4; i++) {
+    if (!value->args[i] || value->args[i]->kind != IR_VALUE_STRING_LITERAL ||
+        !llvm_emit_byte_view(emit, value->args[i], &labels[i], diag) ||
+        !llvm_ensure_byte_view_pair(emit, &labels[i], value->args[i], diag)) {
+      llvm_set_diag(diag, emit->program, value->line, value->column, "LLVM IR backend JSON error label requires string literal labels", "invalid JSON error label", "lower");
+      return false;
+    }
+  }
+  LlvmValue is0, is1, is2;
+  llvm_temp(emit, &is0, IR_TYPE_BOOL);
+  zbuf_appendf(emit->out, "  %s = icmp eq i32 %s, 0\n", is0.text, code.text);
+  llvm_temp(emit, &is1, IR_TYPE_BOOL);
+  zbuf_appendf(emit->out, "  %s = icmp eq i32 %s, 1\n", is1.text, code.text);
+  llvm_temp(emit, &is2, IR_TYPE_BOOL);
+  zbuf_appendf(emit->out, "  %s = icmp eq i32 %s, 2\n", is2.text, code.text);
+  LlvmValue ptr2, len2, ptr1, len1, ptr0, len0;
+  llvm_temp(emit, &ptr2, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = select i1 %s, ptr %s, ptr %s\n", ptr2.text, is2.text, labels[2].ptr, labels[3].ptr);
+  llvm_temp(emit, &len2, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = select i1 %s, i64 %s, i64 %s\n", len2.text, is2.text, labels[2].len, labels[3].len);
+  llvm_temp(emit, &ptr1, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = select i1 %s, ptr %s, ptr %s\n", ptr1.text, is1.text, labels[1].ptr, ptr2.text);
+  llvm_temp(emit, &len1, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = select i1 %s, i64 %s, i64 %s\n", len1.text, is1.text, labels[1].len, len2.text);
+  llvm_temp(emit, &ptr0, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = select i1 %s, ptr %s, ptr %s\n", ptr0.text, is0.text, labels[0].ptr, ptr1.text);
+  llvm_temp(emit, &len0, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = select i1 %s, i64 %s, i64 %s\n", len0.text, is0.text, labels[0].len, len1.text);
+  return llvm_make_byte_view(emit, ptr0.text, len0.text, IR_TYPE_U8, out);
+}
+
 static bool llvm_emit_byte_view(LlvmEmit *emit, const IrValue *value, LlvmValue *out, ZDiag *diag) {
   if (!value) {
     llvm_set_diag(diag, emit->program, 1, 1, "LLVM IR backend byte view is missing", "missing byte view", "emit");
@@ -326,6 +373,8 @@ static bool llvm_emit_byte_view(LlvmEmit *emit, const IrValue *value, LlvmValue 
       zbuf_appendf(emit->out, "  %s = sub i64 %s, %s\n", len.text, end.text, start.text);
       return llvm_make_byte_view(emit, ptr.text, len.text, base.element_type, out);
     }
+    case IR_VALUE_JSON_ERROR_LABEL:
+      return llvm_emit_json_error_label_byte_view(emit, value, out, diag);
     case IR_VALUE_LOCAL: {
       const IrLocal *local = llvm_local(emit->fun, value->local_index);
       if (!local || local->type != IR_TYPE_BYTE_VIEW) {
@@ -430,6 +479,25 @@ static bool llvm_emit_byte_view_len_value(LlvmEmit *emit, const IrValue *value, 
     return true;
   }
   return llvm_cast_value(emit, value, len, value->type, out, diag);
+}
+
+static bool llvm_emit_byte_view_remaining_value(LlvmEmit *emit, const IrValue *value, LlvmValue *out, ZDiag *diag) {
+  LlvmValue view;
+  if (!llvm_emit_byte_view(emit, value->left, &view, diag) || !llvm_ensure_byte_view_pair(emit, &view, value->left, diag)) return false;
+  LlvmValue offset;
+  if (!llvm_emit_usize_value(emit, value->index, &offset, diag)) return false;
+  LlvmValue past_end, diff, remaining;
+  llvm_temp(emit, &past_end, IR_TYPE_BOOL);
+  zbuf_appendf(emit->out, "  %s = icmp uge i64 %s, %s\n", past_end.text, offset.text, view.len);
+  llvm_temp(emit, &diff, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = sub i64 %s, %s\n", diff.text, view.len, offset.text);
+  llvm_temp(emit, &remaining, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = select i1 %s, i64 0, i64 %s\n", remaining.text, past_end.text, diff.text);
+  if (value->type == IR_TYPE_USIZE) {
+    *out = remaining;
+    return true;
+  }
+  return llvm_cast_value(emit, value, remaining, value->type, out, diag);
 }
 
 static bool llvm_emit_byte_view_index_load_value(LlvmEmit *emit, const IrValue *value, LlvmValue *out, ZDiag *diag) {
@@ -640,6 +708,22 @@ static bool llvm_emit_value(LlvmEmit *emit, const IrValue *value, LlvmValue *out
       zbuf_appendf(emit->out, "  %s = icmp %s %s %s, %s\n", out->text, pred, llvm_type_name(left.type), left.text, right.text);
       return true;
     }
+    case IR_VALUE_HTTP_STATUS_CLASS: {
+      LlvmValue status;
+      if (!llvm_emit_value(emit, value->left, &status, diag)) return false;
+      if (status.type != IR_TYPE_U16) {
+        llvm_set_diag(diag, emit->program, value->line, value->column, "LLVM IR backend HTTP status predicate expects a u16 status", "invalid HTTP status predicate", "lower");
+        return false;
+      }
+      LlvmValue lower_ok, upper_ok;
+      llvm_temp(emit, &lower_ok, IR_TYPE_BOOL);
+      zbuf_appendf(emit->out, "  %s = icmp uge %s %s, %u\n", lower_ok.text, llvm_type_name(status.type), status.text, (unsigned)value->int_value);
+      llvm_temp(emit, &upper_ok, IR_TYPE_BOOL);
+      zbuf_appendf(emit->out, "  %s = icmp ult %s %s, %u\n", upper_ok.text, llvm_type_name(status.type), status.text, (unsigned)value->data_len);
+      llvm_temp(emit, out, IR_TYPE_BOOL);
+      zbuf_appendf(emit->out, "  %s = and i1 %s, %s\n", out->text, lower_ok.text, upper_ok.text);
+      return true;
+    }
     case IR_VALUE_CALL:
       return llvm_emit_call(emit, value, out, diag);
     case IR_VALUE_INDEX_LOAD: {
@@ -657,9 +741,12 @@ static bool llvm_emit_value(LlvmEmit *emit, const IrValue *value, LlvmValue *out
     case IR_VALUE_STRING_LITERAL:
     case IR_VALUE_ARRAY_BYTE_VIEW:
     case IR_VALUE_BYTE_SLICE:
+    case IR_VALUE_JSON_ERROR_LABEL:
       return llvm_emit_byte_view(emit, value, out, diag);
     case IR_VALUE_BYTE_VIEW_LEN:
       return llvm_emit_byte_view_len_value(emit, value, out, diag);
+    case IR_VALUE_BYTE_VIEW_REMAINING:
+      return llvm_emit_byte_view_remaining_value(emit, value, out, diag);
     case IR_VALUE_BYTE_VIEW_INDEX_LOAD:
       return llvm_emit_byte_view_index_load_value(emit, value, out, diag);
     case IR_VALUE_BYTE_COPY:
@@ -691,6 +778,71 @@ static bool llvm_emit_world_write(LlvmEmit *emit, const IrInstr *instr, ZDiag *d
   llvm_emit_label(emit, trap_label);
   zbuf_append(emit->out, "  call void @llvm.trap()\n  unreachable\n");
   llvm_emit_label(emit, ok_label);
+  return true;
+}
+
+static bool llvm_emit_while_instr(LlvmEmit *emit, const IrInstr *instr, ZDiag *diag) {
+  unsigned cond_label = llvm_label(emit), body_label = llvm_label(emit), end_label = llvm_label(emit);
+  zbuf_appendf(emit->out, "  br label %%L%u\n", cond_label);
+  llvm_emit_label(emit, cond_label);
+  LlvmValue cond;
+  if (!llvm_emit_value(emit, instr->value, &cond, diag)) return false;
+  if (cond.type != IR_TYPE_BOOL) {
+    llvm_set_diag(diag, emit->program, instr->line, instr->column, "LLVM IR backend loop condition must be Bool", "non-Bool loop condition", "lower");
+    return false;
+  }
+  zbuf_appendf(emit->out, "  br i1 %s, label %%L%u, label %%L%u\n", cond.text, body_label, end_label);
+  llvm_emit_label(emit, body_label);
+  unsigned saved_cond_label = emit->loop_cond_label, saved_end_label = emit->loop_end_label;
+  bool saved_in_loop = emit->in_loop;
+  emit->loop_cond_label = cond_label;
+  emit->loop_end_label = end_label;
+  emit->in_loop = true;
+  bool body_term = false;
+  bool body_ok = llvm_emit_instrs(emit, instr->then_instrs, instr->then_len, &body_term, diag);
+  emit->loop_cond_label = saved_cond_label;
+  emit->loop_end_label = saved_end_label;
+  emit->in_loop = saved_in_loop;
+  if (!body_ok) return false;
+  if (!body_term) zbuf_appendf(emit->out, "  br label %%L%u\n", cond_label);
+  llvm_emit_label(emit, end_label);
+  return true;
+}
+
+static bool llvm_emit_array_fill_instr(LlvmEmit *emit, const IrInstr *instr, ZDiag *diag) {
+  if (instr->array_index >= emit->fun->local_len) {
+    llvm_set_diag(diag, emit->program, instr->line, instr->column, "LLVM IR backend array fill target is out of range", "invalid array local", "emit");
+    return false;
+  }
+  const IrLocal *local = &emit->fun->locals[instr->array_index];
+  if (!local->is_array || local->array_len == 0 || !llvm_array_element_supported(local->element_type)) {
+    llvm_set_diag(diag, emit->program, instr->line, instr->column, "LLVM IR backend array fill requires a supported fixed-array local", "unsupported array fill", "lower");
+    return false;
+  }
+  LlvmValue fill;
+  if (!llvm_emit_value(emit, instr->value, &fill, diag)) return false;
+  if (fill.type != local->element_type) {
+    if (!llvm_cast_value(emit, instr->value, fill, local->element_type, &fill, diag)) return false;
+  }
+  unsigned pre_label = llvm_label(emit), loop_label = llvm_label(emit), body_label = llvm_label(emit), end_label = llvm_label(emit);
+  zbuf_appendf(emit->out, "  br label %%L%u\n", pre_label);
+  llvm_emit_label(emit, pre_label);
+  zbuf_appendf(emit->out, "  br label %%L%u\n", loop_label);
+  llvm_emit_label(emit, loop_label);
+  LlvmValue index, done, next, ptr;
+  llvm_temp(emit, &index, IR_TYPE_USIZE);
+  llvm_temp(emit, &next, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = phi i64 [0, %%L%u], [%s, %%L%u]\n", index.text, pre_label, next.text, body_label);
+  llvm_temp(emit, &done, IR_TYPE_BOOL);
+  zbuf_appendf(emit->out, "  %s = icmp eq i64 %s, %u\n", done.text, index.text, local->array_len);
+  zbuf_appendf(emit->out, "  br i1 %s, label %%L%u, label %%L%u\n", done.text, end_label, body_label);
+  llvm_emit_label(emit, body_label);
+  llvm_temp(emit, &ptr, IR_TYPE_USIZE);
+  zbuf_appendf(emit->out, "  %s = getelementptr inbounds [%u x %s], ptr %%slot%u, i64 0, i64 %s\n", ptr.text, local->array_len, llvm_type_name(local->element_type), local->index, index.text);
+  zbuf_appendf(emit->out, "  store %s %s, ptr %s, align %u\n", llvm_type_name(local->element_type), fill.text, ptr.text, llvm_type_bits(local->element_type) >= 8 ? llvm_type_bits(local->element_type) / 8 : 1);
+  zbuf_appendf(emit->out, "  %s = add i64 %s, 1\n", next.text, index.text);
+  zbuf_appendf(emit->out, "  br label %%L%u\n", loop_label);
+  llvm_emit_label(emit, end_label);
   return true;
 }
 
@@ -750,26 +902,22 @@ static bool llvm_emit_instr(LlvmEmit *emit, const IrInstr *instr, bool *terminat
       *terminated = then_term && else_term;
       return true;
     }
-    case IR_INSTR_WHILE: {
-      unsigned cond_label = llvm_label(emit), body_label = llvm_label(emit), end_label = llvm_label(emit);
-      zbuf_appendf(emit->out, "  br label %%L%u\n", cond_label);
-      llvm_emit_label(emit, cond_label);
-      LlvmValue cond;
-      if (!llvm_emit_value(emit, instr->value, &cond, diag)) return false;
-      if (cond.type != IR_TYPE_BOOL) {
-        llvm_set_diag(diag, emit->program, instr->line, instr->column, "LLVM IR backend loop condition must be Bool", "non-Bool loop condition", "lower");
+    case IR_INSTR_WHILE:
+      return llvm_emit_while_instr(emit, instr, diag);
+    case IR_INSTR_BREAK:
+    case IR_INSTR_CONTINUE: {
+      if (!emit->in_loop) {
+        llvm_set_diag(diag, emit->program, instr->line, instr->column, "LLVM IR backend break or continue requires an enclosing loop", "loop exit outside a loop", "lower");
         return false;
       }
-      zbuf_appendf(emit->out, "  br i1 %s, label %%L%u, label %%L%u\n", cond.text, body_label, end_label);
-      llvm_emit_label(emit, body_label);
-      bool body_term = false;
-      if (!llvm_emit_instrs(emit, instr->then_instrs, instr->then_len, &body_term, diag)) return false;
-      if (!body_term) zbuf_appendf(emit->out, "  br label %%L%u\n", cond_label);
-      llvm_emit_label(emit, end_label);
+      zbuf_appendf(emit->out, "  br label %%L%u\n", instr->kind == IR_INSTR_BREAK ? emit->loop_end_label : emit->loop_cond_label);
+      *terminated = true;
       return true;
     }
     case IR_INSTR_WORLD_WRITE:
       return llvm_emit_world_write(emit, instr, diag);
+    case IR_INSTR_ARRAY_FILL:
+      return llvm_emit_array_fill_instr(emit, instr, diag);
     case IR_INSTR_INDEX_STORE: {
       if (instr->array_index >= emit->fun->local_len) {
         llvm_set_diag(diag, emit->program, instr->line, instr->column, "LLVM IR backend indexed store array is out of range", "invalid array local", "emit");

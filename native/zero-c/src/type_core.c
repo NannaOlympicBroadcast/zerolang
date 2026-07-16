@@ -49,16 +49,21 @@ typedef struct {
   ZTypeParseError error;
 } TypeParserMark;
 
+static void type_allocation_fatal(void) {
+  fprintf(stderr, "zero: fatal: out of memory while parsing types\n");
+  exit(70);
+}
+
 static void *type_reallocarray(void *ptr, size_t count, size_t size) {
-  if (size != 0 && count > SIZE_MAX / size) abort();
+  if (size != 0 && count > SIZE_MAX / size) type_allocation_fatal();
   void *next = realloc(ptr, count * size);
-  if (!next) abort();
+  if (!next) type_allocation_fatal();
   return next;
 }
 
 static char *type_strndup(const char *text, size_t len) {
   char *out = malloc(len + 1);
-  if (!out) abort();
+  if (!out) type_allocation_fatal();
   memcpy(out, text, len);
   out[len] = 0;
   return out;

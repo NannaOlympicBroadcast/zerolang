@@ -1,4 +1,7 @@
 import "./globals.css";
+import "@xyflow/react/dist/style.css";
+import { Analytics } from "@vercel/analytics/next";
+import { SpeedInsights } from "@vercel/speed-insights/next";
 import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 import { ThemeProvider } from "@/components/theme-provider";
@@ -50,6 +53,8 @@ export default async function RootLayout({ children }: Readonly<{ children: Reac
           {children}
           <DocsChat />
         </ThemeProvider>
+        <Analytics />
+        <SpeedInsights />
       </body>
     </html>
   );

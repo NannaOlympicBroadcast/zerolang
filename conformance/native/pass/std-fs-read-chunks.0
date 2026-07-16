@@ -1,0 +1,42 @@
+pub fn main(world: World) -> Void raises {
+    let path: String = "conformance/fixtures/std-fs-read.txt"
+    var out_buf: [16]u8 = [0_u8; 16]
+    var chunk: [4]u8 = [0_u8; 4]
+    var offset: usize = 0
+    var total: usize = 0
+    var saw_truncation: Bool = true
+    var ok: Bool = true
+    var done: Bool = false
+    while ok && !done {
+        let read: Maybe<usize> = std.fs.readBytesAt(path, offset, chunk)
+        if !read.has {
+            ok = false
+        } else {
+            total = read.value
+            if total <= 4 {
+                saw_truncation = false
+            }
+            var valid: usize = 0
+            if offset < total {
+                valid = total - offset
+                if valid > 4 {
+                    valid = 4
+                }
+            }
+            let copied: usize = std.mem.copy(out_buf[offset..], chunk[..valid])
+            if copied != valid {
+                ok = false
+            }
+            offset = offset + valid
+            if offset >= total {
+                done = true
+            }
+        }
+    }
+    let whole: Maybe<usize> = std.fs.readBytes(path, out_buf)
+    if ok && saw_truncation && total == 10 && whole.has && whole.value == 10 && std.mem.eqlBytes(out_buf[..total], std.mem.span("zero file\n")) {
+        check world.out.write("fs read chunks ok\n")
+    } else {
+        check world.out.write("fs read chunks failed\n")
+    }
+}

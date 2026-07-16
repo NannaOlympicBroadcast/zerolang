@@ -17,6 +17,13 @@ describe("eval source helpers", () => {
     assert.equal(source, "pub fn main() -> Void {}\n");
   });
 
+  it("extracts unfenced source after prose", () => {
+    const source = extractZeroSource(
+      "The program checks cleanly.\n\npub fn main() -> Void {}",
+    );
+    assert.equal(source, "pub fn main() -> Void {}\n");
+  });
+
   it("reports missing source patterns", () => {
     assert.deepEqual(sourcePatternFailures("hello", [/hello/, /zero/]), [
       "/zero/",
@@ -51,23 +58,23 @@ describe("eval source helpers", () => {
     }
   });
 
-  it("rejects prose or Markdown around final source", () => {
+  it("accepts prose or Markdown around extractable final source", () => {
     assert.deepEqual(
       finalSourceResponseFailures(
         "Here is the source:\n\n```zero\npub fn main() -> Void {}\n```",
         "pub fn main() -> Void {}\n",
       ),
-      ["final response included prose or Markdown around the source"],
+      [],
     );
   });
 
-  it("rejects unfenced prose before source", () => {
+  it("rejects final responses without Zero source", () => {
     assert.deepEqual(
       finalSourceResponseFailures(
-        "The program checks cleanly.\n\npub fn main() -> Void {}",
-        "The program checks cleanly.\n\npub fn main() -> Void {}\n",
+        "The program checks cleanly.",
+        "The program checks cleanly.\n",
       ),
-      ["final response did not start with Zero source"],
+      ["final response did not include Zero source"],
     );
   });
 });

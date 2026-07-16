@@ -6,17 +6,22 @@
 
 #define UNIFY_BINDER_PATH_MAX 64
 
+static void unify_allocation_fatal(void) {
+  fprintf(stderr, "zero: fatal: out of memory while unifying types\n");
+  exit(70);
+}
+
 static void *unify_reallocarray(void *ptr, size_t count, size_t size) {
-  if (size != 0 && count > ((size_t)-1) / size) abort();
+  if (size != 0 && count > ((size_t)-1) / size) unify_allocation_fatal();
   void *next = realloc(ptr, count * size);
-  if (!next) abort();
+  if (!next) unify_allocation_fatal();
   return next;
 }
 
 static char *unify_strdup(const char *text) {
   size_t len = strlen(text ? text : "");
   char *out = malloc(len + 1);
-  if (!out) abort();
+  if (!out) unify_allocation_fatal();
   memcpy(out, text ? text : "", len);
   out[len] = 0;
   return out;

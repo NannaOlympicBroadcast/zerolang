@@ -1,0 +1,60 @@
+pub fn jsonResponse(response: MutSpan<u8>, status: u16, body: Span<u8>) -> Maybe<Span<u8>> {
+    return std.http.writeJsonResponse(response, status, body)
+}
+
+pub fn notFound(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return std.http.writeJsonNotFound(response, "{\"error\":\"not_found\",\"resource\":\"crm\"}")
+}
+
+pub fn methodNotAllowed(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return std.http.writeJsonMethodNotAllowed(response, "{\"error\":\"method_not_allowed\"}")
+}
+
+pub fn badRequest(response: MutSpan<u8>, field: Span<u8>) -> Maybe<Span<u8>> {
+    if std.mem.eql(field, "tenant") {
+        return std.http.writeJsonBadRequest(response, "{\"error\":\"bad_request\",\"field\":\"tenant\"}")
+    }
+    if std.mem.eql(field, "json") {
+        return std.http.writeJsonBadRequest(response, "{\"error\":\"bad_request\",\"field\":\"body\"}")
+    }
+    if std.mem.eql(field, "id") {
+        return std.http.writeJsonBadRequest(response, "{\"error\":\"bad_request\",\"field\":\"id\"}")
+    }
+    return std.http.writeJsonBadRequest(response, "{\"error\":\"bad_request\"}")
+}
+
+pub fn tenantOk(request: Span<u8>) -> Bool {
+    let tenant: Maybe<Span<u8>> = std.http.requestQueryValue(request, "tenant")
+    return tenant.has
+}
+
+pub fn bodyIsJson(request: Span<u8>, max_bytes: usize) -> Bool {
+    let body: Maybe<Span<u8>> = std.http.requestJsonBodyWithin(request, max_bytes)
+    return body.has
+}
+
+pub fn bodyHasU32(request: Span<u8>, field: Span<u8>, max_bytes: usize) -> Bool {
+    let body: Maybe<Span<u8>> = std.http.requestJsonBodyWithin(request, max_bytes)
+    if !body.has {
+        return false
+    }
+    let value: Maybe<u32> = std.json.u32(body.value, field)
+    return value.has
+}
+
+pub fn responseBody(output: Span<u8>) -> Span<u8> {
+    let body: Maybe<Span<u8>> = std.http.responseBodyBytes(output)
+    if body.has {
+        return body.value
+    }
+    let end: usize = std.mem.len(output)
+    return output[end..]
+}
+
+pub fn responseHasStatus(output: Span<u8>, status: Span<u8>) -> Bool {
+    return std.str.contains(output, status)
+}
+
+pub fn responseBodyEquals(output: Span<u8>, expected: Span<u8>) -> Bool {
+    return std.mem.eql(responseBody(output), expected)
+}

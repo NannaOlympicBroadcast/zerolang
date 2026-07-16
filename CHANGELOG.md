@@ -1,8 +1,72 @@
 # Changelog
 
-## 0.2.1
+## 0.3.4
 
 <!-- release:start -->
+
+- Makes graph patching the primary agent edit loop with stdin patch bodies, `--replace-in-fn`, expression replacement by handle, structural rewrites, declaration-level edits, helper/test patch ops, and inline handle diagnostics across view, query, and patch commands.
+- Improves graph/source reconciliation with patch-specific stale-refresh tips, once-per-state notes, accepted whole-file rewrites when function sets are preserved, and clearer unsupported graph-test and non-entry `World` helper diagnostics.
+- Speeds up graph workflows with memoized repository store loads, adjacency orders, semantic check verdicts, static const classification, pre-merge MIR cache keys, and reusable runtime object cache artifacts.
+- Reduces direct backend output and broadens native coverage with constant array-fill loop lowering, COFF x64 HTTP request-body extraction, chunked file reads via `std.fs.readBytesAt`, and total-file-size reporting for fixed-buffer reads.
+- Refreshes bundled skills, CLI help, docs, command contracts, conformance fixtures, compiler metrics, and validation guidance around the patch-first agent workflow.
+- Hardens release checks with runtime object cache cleanup, graph patch routing coverage, examples gate teardown retries, and additional package cache/version assertions.
+
+### Contributors
+
+- @ctate
+
+<!-- release:end -->
+
+## 0.3.3
+
+- Makes package graph stores refresh from edited projections across compiler commands, classifies source/store sync by content instead of mtimes, and gives stale, diverged, and ambiguous reconcile states deterministic diagnostics and repairs.
+- Improves agent-facing inspection and edit loops with scoped `zero query` output, `zero view --fn`, `zero diff --fn`, `zero patch --replace-fn --body-file`, focused command help, and smaller version-matched skill topics with section-scoped stdlib fetches.
+- Expands standard-library coverage with `std.regex`, `std.inet`, `std.unicode`, and RFC 3339 helpers in `std.time`, including docs, skill references, and runtime conformance fixtures.
+- Hardens direct backend correctness for shape references, large stack frames, fallible `Void` mains, file reads, trap stderr, top-level consts, null `Maybe` locals, fixed-array lengths, and untyped integer literal adoption.
+- Speeds up large graph workflows with indexed reconciliation, stdlib merges, projection validation caches, graph lowering indexes, and borrow-contract scans while preserving deterministic graph hashes and artifacts.
+- Adds graph-store diagnostic codes and complete `zero explain` coverage, buildability gating for unsupported checked constructs, example package gates, sanitizer smoke, package build determinism contracts, and git build hashes in `zero --version`.
+
+### Contributors
+
+- @ctate
+
+## 0.3.2
+
+- Adds `break` and `continue` support to the direct backend and `zero test`, lowering both through typed MIR and all direct emitters with conformance coverage and required runtime checks.
+- Speeds up graph validation with indexed node-hash tables, a reusable adjacency index, and deduplicated store validation, making `zero import` on large programs roughly 12x faster.
+
+### Contributors
+
+- @ctate
+
+## 0.3.1
+
+- Hardens compiler, runtime, and toolchain I/O boundaries with checked file reads and writes, directory rejection, atomic output staging, safer executable finalization, mapped-MIR and binary graph parser validation, and regular-file checks for generated compiler/linker outputs.
+- Removes remaining shell-based native execution surfaces in favor of argv-based process helpers, safer tool resolution, guarded child setup, validated compiler overrides, and explicit metrics coverage for process and shell-call regressions.
+- Expands and hardens the real `std.http.listen` runtime with per-request spooling, private temp lifecycles, oversized request handling, socket deadlines, structured JSON error responses, and native smoke coverage for listener behavior.
+- Grows graph-backed standard-library coverage with environment, filesystem, process, time, random, crypto, URL, JSON, HTTP text/HTML, redirect, array writer, object writer, CLI argument, and HTTP JSON error helpers.
+- Improves graph row patch authoring with grouped expressions, compact casts and checks, logical OR, else-if branches, bare returns, natural call arguments, stronger invalid-row diagnostics, and refreshed bundled skill guidance.
+- Adds graph build performance instrumentation and budgets, stdlib graph merge caching, agent-scale and Rosetta challenge evals, parallel CI validation jobs, sharded native checks, deep validation profiles, and local aggregate agent checks.
+
+### Contributors
+
+- @ctate
+
+## 0.3.0
+
+- Makes graph-first package authoring the normal workflow: repository `zero.graph` stores are the compiler input, `.0` files are human-readable projections, `zero init` owns project creation, `zero diff` supports graph review, and source projection inputs are rejected at the compiler boundary.
+- Adds binary repository graph stores and graph-backed standard-library modules, with source-free status/verify, import/export, merge, query, patch, source-map, reconciliation, metadata, drift detection, and checked-in binary graph fixtures for examples, stdlib, and conformance.
+- Advances graph-native compiler execution across check, build, run, test, size, doc, dev, time, package dependency, benchmark, and validation paths, including typed graph-to-MIR lowering, mapped final-MIR cache reuse, graph semantic/resolution/ownership facts, and graph-native test execution.
+- Introduces explicit experimental LLVM backend support with backend selection contracts, textual LLVM IR emission, host executable builds, toolchain diagnostics, profile facts, and no-fallback release policy.
+- Expands web API support in `std.http` with routing, JSON response/body validation, CORS, OPTIONS, path segment, bearer token, cookie/session helpers, HTTP listener/client graph lowering, and CRM/router/ping-pong examples.
+- Hardens direct backend and compiler internals with C API contracts, unsafe C link validation, target manifest matching, ABI layout tables, direct emit-kind handling, buildability value/target checks, TOML manifests, and stricter metrics guardrails.
+- Refreshes public docs, README, bundled skills, graph-first examples, command contracts, conformance, docs tests, aggregate validation, and sandboxed conformance workers around the current agent-facing workflow.
+
+### Contributors
+
+- @ctate
+
+## 0.2.1
 
 - Adds extern C call support with target-aware header preprocessing, stricter link-plan validation, direct object linking, graph metadata fixes, and diagnostics for missing or unsafe C import inputs.
 - Expands the standard library across memory, collections, search, sort, ASCII, formatting, text, parsing, math, random, time, codec, JSON, URL, hosted I/O, filesystem, HTTP, testing, and logging helpers.
@@ -17,8 +81,6 @@
 - @ihasq
 - @PeterXMR
 
-<!-- release:end -->
-
 ## 0.2.0
 
 - Makes canonical `.0` text the native source surface, with a parser, formatter, Program import path, diagnostics, docs, examples, stdlib sources, benchmarks, conformance fixtures, and command snapshots aligned around that format.
@@ -27,7 +89,7 @@
 - Expands direct backend coverage with darwin-x64 Mach-O executable support, shared AArch64 ELF/COFF emission, target-readiness reporting, byte-view ABI fixes, and stronger cross-target buildability checks.
 - Adds source-backed `std.path`, `std.str`, and `std.math` modules with docs, examples, Rosetta coverage, and direct target validation.
 - Exposes resolved call-resolution and stdlib helper facts in graph JSON, tightening generic return typing, member call facts, std helper validation, and package cache metadata.
-- Grows Rosetta and compiler smoke coverage, graph command contracts, metrics budgets, CLI docs, skills, and docs tests around the current agent edit loop.
+- Grows Rosetta and compiler smoke coverage, graph command contracts, metrics budgets, CLI docs, and skills around the current agent edit loop.
 
 ### Contributors
 

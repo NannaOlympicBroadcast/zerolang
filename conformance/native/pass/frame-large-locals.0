@@ -1,0 +1,16 @@
+pub fn main(world: World) -> Void raises {
+    let first: Maybe<String> = std.args.get(1)
+    var pad: [16384]u8 = [0; 16384]
+    var buf: [32768]u8 = [0; 32768]
+    pad[16383] = 7
+    buf[32767] = 5
+    let read: Maybe<usize> = std.fs.readBytes("conformance/fixtures/std-fs-read.txt", pad)
+    let missing: Maybe<usize> = std.fs.readBytes("conformance/fixtures/missing.bin", buf)
+    if first.has && read.has && read.value == 10 && !missing.has && pad[0] == 122_u8 && pad[16383] == 7_u8 && buf[32767] == 5_u8 {
+        check world.out.write("frame large locals ok ")
+        check world.out.write(first.value)
+        check world.out.write("\n")
+    } else {
+        check world.out.write("frame large locals failed\n")
+    }
+}

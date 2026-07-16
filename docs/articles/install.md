@@ -1,6 +1,10 @@
-## Install Zero
+## Install The Compiler
 
-Install the latest Zero release:
+Install Zerolang when you want an agent to build graph-first programs on your
+machine. The compiler is experimental. Use it in isolated workspaces and avoid
+production data.
+
+## Install The Latest Release
 
 ```sh
 curl -fsSL https://zerolang.ai/install.sh | bash
@@ -8,50 +12,46 @@ export PATH="$HOME/.zero/bin:$PATH"
 zero --version
 ```
 
-The installer downloads the latest matching binary from
-`github.com/vercel-labs/zero`, verifies it against the release checksum file,
-and writes it to `$HOME/.zero/bin/zero`. Set `ZERO_INSTALL_DIR` to choose a
-different install directory. On Linux it installs the static musl build by
-default; set `ZERO_LINUX_FLAVOR=gnu` to install the glibc-targeted build.
+The installer downloads the latest release asset for your platform and checks
+the release checksum file before installing the binary.
 
-Use `zero doctor` to check the local environment:
+## Verify The Environment
 
 ```sh
 zero doctor
-zero doctor --json
+zero targets
+zero skills
 ```
 
-Supported native executable builds use direct emitters, so a C compiler is not
-required for the normal path.
+`zero doctor --json` includes host and toolchain readiness. `zero targets --json`
+includes `targetToolchains`, target aliases, hosted capability facts, and
+cross-target support notes.
 
-`zero doctor` still checks the pieces that affect real builds:
+## Load Version-Matched Agent Knowledge
 
-- PATH health
-- workspace write access
-- bundled target support
-- target SDK/sysroot readiness
-- interop tool readiness
-
-`zero doctor --json` includes `targetToolchains`, a per-target readiness matrix
-for relevant tools. Native direct emitters are the current artifact path.
+Agents should not rely on a stale external Zero guide. Ask the installed
+compiler for the skills bundled with that exact binary:
 
 ```sh
-zero build --emit exe --target linux-musl-x64 examples/hello.0 --out .zero/out/hello
+zero skills
+zero skills get agent
+zero skills get graph
+zero skills get language
+zero skills get stdlib
 ```
 
-To build the compiler from a local checkout instead, use the repository wrapper:
+The thin external Zero skill is only a bootstrap stub. The compiler-bundled
+skills are the current command and language reference for that release.
+
+## Repository Checkout
+
+When working inside the Zero compiler repository, build the local compiler and
+then use the checkout's `zero` binary for experiments:
 
 ```sh
 pnpm install
 make -C native/zero-c
-bin/zero --version
+zero --version
 ```
 
-The repository validation commands are:
-
-```sh
-pnpm run conformance
-pnpm run native:test
-pnpm run docs:test
-ZERO_BENCH_RUNS=1 pnpm run bench
-```
+The repository contributor notes cover checkout-specific wrapper commands.

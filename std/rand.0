@@ -1,0 +1,22 @@
+fn rand_fixed_hex32(buffer: MutSpan<u8>, value: u32) -> Maybe<Span<u8>> {
+    if std.mem.len(buffer) < 8 {
+        return null
+    }
+    var place: u32 = 268435456_u32
+    var index: usize = 0
+    while index < 8 {
+        let digit: u8 = ((value / place) % 16_u32) as u8
+        if digit < 10_u8 {
+            buffer[index] = 48_u8 + digit
+        } else {
+            buffer[index] = 87_u8 + digit
+        }
+        place = place / 16_u32
+        index = index + 1
+    }
+    return buffer[..8]
+}
+
+fn rand_entropy_hex32(buffer: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return rand_fixed_hex32(buffer, std.rand.entropyU32())
+}

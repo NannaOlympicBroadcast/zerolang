@@ -1,71 +1,102 @@
-## Standard Library Reference
+## Graph-Backed Library Surface
 
-Zero's standard library is pay-as-used and capability-aware. Importing memory
-helpers does not pull in hosted filesystem helpers.
+The Zerolang standard library is graph-backed. The compiler uses binary `std/*.graph`
+stores. Sibling `std/*.0` files are human-readable projections for review, not
+the normal compile path.
 
-Hosted APIs report their target requirements in `zero graph` and `zero size`.
+Agents should learn the callable surface from the installed compiler:
 
-Runnable modules:
-
-- `std.mem`: spans, byte equality, copy/fill, fixed-buffer allocators, byte buffers, and arena-style reset helpers.
-- `std.collections`: fixed-capacity collection operations over caller-owned storage and explicit lengths.
-- `std.search`: scalar span search, lower-bound, and binary-search helpers.
-- `std.sort`: in-place insertion sort and sortedness checks over caller-owned scalar storage.
-- `std.ascii`: byte predicates, ASCII case conversion, and digit value helpers.
-- `std.fmt`: caller-buffer formatting for booleans and integer text.
-- `std.text`: byte-backed ASCII and UTF-8 validation and counting.
-- `std.io`: buffered reader/writer metadata, cursor writes, line scanning, and byte copy helpers over caller-owned storage.
-- `std.args`: hosted process argument count, lookup, option search, fallback, and typed `u32` parsing.
-- `std.cli`: hosted flag and option helpers for command-line programs.
-- `std.env`: hosted environment lookup, fallback, and typed bool/`u32` parsing.
-- `std.fs`: hosted file lifecycle helpers, owned file handles, byte reads/writes, explicit file copy, remove, rename, and close.
-- `std.math`: fixed-width integer min/max/clamp, checked and saturating arithmetic, and small number-theory routines.
-- `std.path`: fixed-buffer lexical path helpers.
-- `std.str`: allocation-free byte-string helpers over spans and caller-owned storage.
-- `std.testing`: Bool-returning helpers for test blocks and byte-output checks.
-- `std.parse`: allocation-free byte scanners and integer/bool parsers.
-- `std.codec`: byte-oriented integer encoding, endian reads/writes, varint, base64, hex, and CRC-32 helpers.
-- `std.json`: validation, structured status codes, field lookup, explicit-allocator parsing, and caller-buffer writing.
-- `std.log`: explicit-buffer JSON Lines record formatting.
-- `std.url`: lexical URL splitting, percent/query encoding, query lookup, and append helpers.
-- `std.time`: duration construction, conversion, comparison, and target-gated clock helpers.
-- `std.rand`: explicit deterministic random sources, random bits, and target entropy helpers.
-- `std.proc`: host process status helpers behind the process capability.
-- `std.crypto`: small hash, keyed hash, constant-time equality, and entropy helpers.
-- `std.net`: network capability metadata, localhost/loopback address builders, timeouts, and bootstrap connection/listener handles.
-- `std.http`: HTTP status helpers, request/response envelope writers, request parsers, client/server metadata, TLS-boundary helpers, hosted fetch, response-body borrowing, and header-value lookup.
-
-Each module page documents target support, allocation behavior, error behavior,
-ownership notes, and runnable examples.
-
-Use the CLI to inspect what a program actually retains:
-
-| Command | Shows |
-| --- | --- |
-| `zero graph --json <input>` | Required capabilities and imported helpers. |
-| `zero size --json <input>` | Helper metadata and retained helper cost. |
-| `zero mem --json <input>` | `memoryBudgets`, `allocatorFacts`, `allocationInstrumentation`, and `collectionFacts`. |
-
-The `stdlibHelpers` and `usedStdlibHelpers` JSON entries include `module`,
-`effects`, `allocationBehavior`, `targetSupport`, `errorBehavior`,
-`ownershipNotes`, `example`, and `apiStability` for each public helper.
-
-## Metadata Contract
-
-Public standard library symbols document the fields agents need to call them
-safely:
-
-```text
-symbol: std.fs.readAllOrRaise
-effects: fs
-allocation behavior: caller allocator
-target support: host
-error behavior: `raises [NotFound, TooLarge, Io]`
-ownership notes: returns owned<ByteBuf>
-example: examples/readall-cli/
+```sh
+zero skills get stdlib
 ```
 
-Module pages may group related symbols when their metadata is identical.
+Humans should use this page to decide which module to ask for.
 
-Keep these labels visible: effects, allocation behavior, target support, error
-behavior, ownership notes, and example.
+## Expected Usage
+
+```json-render
+{
+  "messages": [
+    {
+      "role": "user",
+      "text": "make a small json http api"
+    },
+    {
+      "role": "assistant",
+      "text": "I’ll use the HTTP and JSON helpers and run a couple route checks."
+    },
+    {
+      "role": "tools",
+      "calls": [
+        {
+          "command": "zero skills get stdlib",
+          "output": "stdlib helpers: std.http.writeJsonOk, std.http.requestIsGet, std.json.field, ..."
+        },
+        {
+          "command": "zero query --find handle",
+          "output": "fn handle(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>>"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## Module Groups
+
+Core data and memory:
+
+- `std.mem`: spans, byte equality, copy/fill, allocators, byte buffers, and fixed-capacity vectors.
+- `std.collections`: fixed-capacity collection operations over caller-owned storage.
+- `std.search`: scalar span search and binary search.
+- `std.sort`: in-place sorting over caller-owned scalar storage.
+- `std.ascii`, `std.text`, `std.str`: byte-backed text helpers.
+- `std.unicode`: strict UTF-8 codepoint decode/encode iteration and codepoint classes.
+- `std.parse`, `std.fmt`, `std.codec`, `std.math`: parsers, formatters, codecs, and numeric helpers.
+- `std.regex`: compile-once regular expression matching for a documented subset.
+- `std.inet`: IPv4, IPv6, and hostname literal validation and parsing.
+
+Program surfaces:
+
+- `std.args`, `std.cli`, `std.env`: command-line and environment helpers.
+- `std.io`, `std.fs`, `std.path`: caller-buffer I/O, hosted filesystem helpers, and lexical paths.
+- `std.json`, `std.toml`, `std.url`, `std.csv`, `std.log`: data formats and structured output.
+- `std.testing`: test-block predicates.
+
+Runtime and web:
+
+- `std.time`, `std.rand`, `std.proc`, `std.term`, `std.crypto`: hosted/runtime helper surfaces, terminal sequences, key decoding, terminal metadata, and raw terminal mode.
+- `std.net`, `std.http`: network metadata, HTTP client/server metadata, request parsing, response writing, hosted fetch, and local listen support.
+
+## Inspect What A Program Uses
+
+```sh
+zero inspect --json examples/crm-api
+zero size --json examples/crm-api
+zero mem --json examples/allocator-collections.graph
+```
+
+Useful JSON fields include:
+
+- `usedStdlibHelpers`
+- `stdlibHelpers`
+- `effects`
+- `allocationBehavior`
+- `targetSupport`
+- `errorBehavior`
+- `ownershipNotes`
+- `apiStability`
+
+## Allocation And Capability Rule
+
+Standard library helpers should make ownership, effects, and target support
+visible. Hosted APIs such as filesystem, process, time, random, network, and
+HTTP require target capabilities. Buffer-oriented helpers should write into
+caller-owned storage rather than silently allocating.
+
+## Projections In Module Pages
+
+Module pages include `.0` snippets because humans need readable examples. Treat
+those snippets as projection examples. Agents should patch user programs
+through graph commands and use `zero export` only when a human asks to review
+the resulting projection.

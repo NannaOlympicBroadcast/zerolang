@@ -1,14 +1,27 @@
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "zero.h"
+#include "manifest_toml.h"
+#include "process_exec.h"
 
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#if !defined(_WIN32)
+#include <fcntl.h>
+#endif
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 static void z_allocation_fatal(const char *operation) {
   fprintf(stderr, "zero: fatal: out of memory while %s\n", operation ? operation : "allocating memory");
@@ -76,6 +89,7 @@ void zbuf_append(ZBuf *buf, const char *text) {
 }
 
 void zbuf_appendf(ZBuf *buf, const char *fmt, ...) {
+  if (!fmt) return;
   va_list args;
   va_start(args, fmt);
   va_list copy;
@@ -87,8 +101,9 @@ void zbuf_appendf(ZBuf *buf, const char *fmt, ...) {
     return;
   }
   char *tmp = z_checked_malloc((size_t)needed + 1);
-  vsnprintf(tmp, (size_t)needed + 1, fmt, args);
+  int written = vsnprintf(tmp, (size_t)needed + 1, fmt, args);
   va_end(args);
+  if (written < 0 || written > needed) { free(tmp); return; }
   zbuf_append(buf, tmp);
   free(tmp);
 }
@@ -113,12 +128,17 @@ char *z_strndup(const char *text, size_t len) {
   return copy;
 }
 
-static void diag_io(ZDiag *diag, const char *path, const char *action) {
+static void diag_io_at(ZDiag *diag, const char *diag_path, const char *io_path, const char *action) {
+  if (!diag) return;
   diag->code = 1;
-  diag->path = path;
+  z_diag_set_path_copy(diag, diag_path);
   diag->line = 1;
   diag->column = 1;
-  snprintf(diag->message, sizeof(diag->message), "failed to %s '%s': %s", action, path, strerror(errno));
+  snprintf(diag->message, sizeof(diag->message), "failed to %s '%s': %s", action, io_path ? io_path : "", strerror(errno));
+}
+
+static void diag_io(ZDiag *diag, const char *path, const char *action) {
+  diag_io_at(diag, path, path, action);
 }
 
 static int zero_mkdir(const char *path) {
@@ -129,33 +149,43 @@ static int zero_mkdir(const char *path) {
 #endif
 }
 
-char *z_read_file(const char *path, ZDiag *diag) {
-  FILE *file = fopen(path, "rb");
-  if (!file) {
-    diag_io(diag, path, "read");
-    return NULL;
+static bool existing_path_is_directory(const char *path, const char *diag_path, ZDiag *diag) {
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    diag_io_at(diag, diag_path, path, "inspect");
+    return false;
   }
-  fseek(file, 0, SEEK_END);
-  long size = ftell(file);
-  if (size < 0) {
-    diag_io(diag, path, "read");
-    fclose(file);
-    return NULL;
+  if (!S_ISDIR(st.st_mode)) {
+    if (diag) {
+      diag->code = 1;
+      z_diag_set_path_copy(diag, diag_path);
+      diag->line = 1;
+      diag->column = 1;
+      diag->length = 1;
+      snprintf(diag->message, sizeof(diag->message), "path component is not a directory: '%s'", path ? path : "");
+    }
+    return false;
   }
-  rewind(file);
-  char *data = z_checked_malloc((size_t)size + 1);
-  size_t read = fread(data, 1, (size_t)size, file);
-  fclose(file);
-  data[read] = 0;
-  return data;
+  return true;
 }
 
-static bool mkdir_parents(const char *path) {
+static bool mkdir_parent_one(const char *path, const char *diag_path, ZDiag *diag) {
+  if (!path || !path[0]) return true;
+  if (zero_mkdir(path) == 0) return true;
+  if (errno == EEXIST) return existing_path_is_directory(path, diag_path, diag);
+  diag_io_at(diag, diag_path, path, "create directory");
+  return false;
+}
+
+static bool mkdir_parents(const char *path, ZDiag *diag) {
   char *copy = z_strdup(path);
   for (char *cursor = copy + 1; *cursor; cursor++) {
     if (*cursor == '/') {
       *cursor = 0;
-      zero_mkdir(copy);
+      if (!mkdir_parent_one(copy, path, diag)) {
+        free(copy);
+        return false;
+      }
       *cursor = '/';
     }
   }
@@ -163,38 +193,190 @@ static bool mkdir_parents(const char *path) {
   return true;
 }
 
-bool z_write_file(const char *path, const char *text, ZDiag *diag) {
-  mkdir_parents(path);
-  FILE *file = fopen(path, "wb");
-  if (!file) {
+static unsigned long long z_write_process_id(void) {
+#if defined(_WIN32)
+  return (unsigned long long)_getpid();
+#else
+  return (unsigned long long)getpid();
+#endif
+}
+
+static char *atomic_write_temp_path(const char *path, unsigned long long attempt) {
+  static unsigned long long counter = 0;
+  ZBuf temp;
+  zbuf_init(&temp);
+  zbuf_append(&temp, path);
+  zbuf_appendf(&temp, ".zero-tmp-%llu-%llu-%llu", z_write_process_id(), counter++, attempt);
+  return temp.data;
+}
+
+static FILE *open_atomic_write_temp(const char *path, char **temp_path_out, ZDiag *diag) {
+  for (unsigned long long attempt = 0; attempt < 100; attempt++) {
+    char *temp_path = atomic_write_temp_path(path, attempt);
+#if defined(_WIN32)
+    FILE *probe = fopen(temp_path, "rb");
+    if (probe) {
+      fclose(probe);
+      free(temp_path);
+      continue;
+    }
+    FILE *file = fopen(temp_path, "wb");
+    if (!file) {
+      diag_io_at(diag, path, temp_path, "create temporary file");
+      free(temp_path);
+      return NULL;
+    }
+#else
+    int fd = open(temp_path, O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0) {
+      if (errno == EEXIST) {
+        free(temp_path);
+        continue;
+      }
+      diag_io_at(diag, path, temp_path, "create temporary file");
+      free(temp_path);
+      return NULL;
+    }
+    FILE *file = fdopen(fd, "wb");
+    if (!file) {
+      int saved_errno = errno == 0 ? EIO : errno;
+      close(fd);
+      remove(temp_path);
+      errno = saved_errno;
+      diag_io_at(diag, path, temp_path, "create temporary file");
+      free(temp_path);
+      return NULL;
+    }
+#endif
+    *temp_path_out = temp_path;
+    return file;
+  }
+  errno = EEXIST;
+  diag_io_at(diag, path, path, "create temporary file");
+  return NULL;
+}
+
+static bool atomic_output_path_ready(const char *path, ZDiag *diag);
+
+static bool close_atomic_write(FILE *file, const char *path, char *temp_path, ZDiag *diag) {
+  if (fclose(file) != 0) {
+    diag_io_at(diag, path, temp_path, "write");
+    remove(temp_path);
+    free(temp_path);
+    return false;
+  }
+  if (!atomic_output_path_ready(path, diag)) {
+    remove(temp_path);
+    free(temp_path);
+    return false;
+  }
+#if defined(_WIN32)
+  remove(path);
+#endif
+  if (rename(temp_path, path) != 0) {
+    diag_io_at(diag, path, path, "replace");
+    remove(temp_path);
+    free(temp_path);
+    return false;
+  }
+  free(temp_path);
+  return true;
+}
+
+static void diag_output_path_contract(ZDiag *diag, const char *path, const char *actual) {
+  if (!diag) return;
+  diag->code = 1;
+  z_diag_set_path_copy(diag, path);
+  diag->line = 1;
+  diag->column = 1;
+  diag->length = 1;
+  snprintf(diag->message, sizeof(diag->message), "refusing to replace unsafe output path: '%s'", path ? path : "");
+  snprintf(diag->expected, sizeof(diag->expected), "missing path or regular output file");
+  snprintf(diag->actual, sizeof(diag->actual), "%s", actual ? actual : "unsafe output path");
+  snprintf(diag->help, sizeof(diag->help), "choose a regular file output path; directories and symlinks are rejected");
+}
+
+#if defined(_WIN32)
+static bool atomic_output_path_ready_windows(const char *path, ZDiag *diag) {
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    if (errno == ENOENT) return true;
+    diag_io(diag, path, "inspect");
+    return false;
+  }
+  if ((st.st_mode & _S_IFDIR) != 0) {
+    diag_output_path_contract(diag, path, "directory output path");
+    return false;
+  }
+  if ((st.st_mode & _S_IFREG) == 0) {
+    diag_output_path_contract(diag, path, "non-regular output path");
+    return false;
+  }
+  return true;
+}
+#else
+static bool atomic_output_path_ready_posix(const char *path, ZDiag *diag) {
+  struct stat st;
+  if (lstat(path, &st) != 0) {
+    if (errno == ENOENT) return true;
+    diag_io(diag, path, "inspect");
+    return false;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    diag_output_path_contract(diag, path, "symlink output path");
+    return false;
+  }
+  if (!S_ISREG(st.st_mode)) {
+    diag_output_path_contract(diag, path, "non-regular output path");
+    return false;
+  }
+  return true;
+}
+#endif
+
+static bool atomic_output_path_ready(const char *path, ZDiag *diag) {
+#if defined(_WIN32)
+  return atomic_output_path_ready_windows(path, diag);
+#else
+  return atomic_output_path_ready_posix(path, diag);
+#endif
+}
+
+static bool write_atomic_bytes(const char *path, const unsigned char *data, size_t len, ZDiag *diag) {
+  if (!path || !path[0] || (!data && len > 0)) {
+    errno = EINVAL;
     diag_io(diag, path, "write");
     return false;
   }
-  fputs(text, file);
-  fclose(file);
-  return true;
+  if (!mkdir_parents(path, diag)) return false;
+  if (!atomic_output_path_ready(path, diag)) return false;
+  char *temp_path = NULL;
+  FILE *file = open_atomic_write_temp(path, &temp_path, diag);
+  if (!file) return false;
+  if (len > 0 && fwrite(data, 1, len, file) != len) {
+    int saved_errno = errno == 0 ? EIO : errno;
+    fclose(file);
+    remove(temp_path);
+    errno = saved_errno;
+    diag_io_at(diag, path, temp_path, "write");
+    free(temp_path);
+    return false;
+  }
+  return close_atomic_write(file, path, temp_path, diag);
+}
+
+bool z_write_file(const char *path, const char *text, ZDiag *diag) {
+  const char *data = text ? text : "";
+  return write_atomic_bytes(path, (const unsigned char *)data, strlen(data), diag);
 }
 
 bool z_write_binary_file(const char *path, const unsigned char *data, size_t len, ZDiag *diag) {
-  mkdir_parents(path);
-  FILE *file = fopen(path, "wb");
-  if (!file) {
-    diag_io(diag, path, "write");
-    return false;
-  }
-  if (len > 0 && fwrite(data, 1, len, file) != len) {
-    diag_io(diag, path, "write");
-    fclose(file);
-    return false;
-  }
-  fclose(file);
-  return true;
+  return write_atomic_bytes(path, data, len, diag);
 }
 
-static bool ends_with(const char *text, const char *suffix) {
-  size_t text_len = strlen(text);
-  size_t suffix_len = strlen(suffix);
-  return text_len >= suffix_len && strcmp(text + text_len - suffix_len, suffix) == 0;
+static bool basename_is(const char *path, const char *name) {
+  const char *base = strrchr(path ? path : "", '/');
+  return strcmp(base ? base + 1 : (path ? path : ""), name) == 0;
 }
 
 static char *dirname_of(const char *path) {
@@ -499,6 +681,33 @@ static char *json_get_array_path(const char *json, const char **path, size_t pat
   return json_array_from_value_span(start, end);
 }
 
+static bool json_get_bool_path(const char *json, const char **path, size_t path_len, bool *present, bool *value, ZDiag *diag, const char *field_name) {
+  if (present) *present = false;
+  if (value) *value = false;
+  const char *start = NULL;
+  const char *end = NULL;
+  if (!json_get_span_path(json, path, path_len, &start, &end)) return true;
+  if (present) *present = true;
+  start = json_skip_ws(start);
+  while (end > start && isspace((unsigned char)end[-1])) end--;
+  if ((size_t)(end - start) == 4 && strncmp(start, "true", 4) == 0) {
+    if (value) *value = true;
+    return true;
+  }
+  if ((size_t)(end - start) == 5 && strncmp(start, "false", 5) == 0) return true;
+  if (diag) {
+    diag->code = 2002;
+    diag->line = 1;
+    diag->column = 1;
+    diag->length = 1;
+    snprintf(diag->message, sizeof(diag->message), "%s must be a boolean", field_name ? field_name : "manifest field");
+    snprintf(diag->expected, sizeof(diag->expected), "true or false");
+    snprintf(diag->actual, sizeof(diag->actual), "non-boolean value");
+    snprintf(diag->help, sizeof(diag->help), "use a boolean manifest value");
+  }
+  return false;
+}
+
 static void manifest_push_c_lib(ZManifest *manifest, ZManifestCLib lib) {
   manifest->c_libs = z_checked_reallocarray(manifest->c_libs, manifest->c_lib_count + 1, sizeof(ZManifestCLib));
   manifest->c_libs[manifest->c_lib_count++] = lib;
@@ -568,28 +777,40 @@ static void parse_manifest_dependencies_object(const char *deps, ZManifest *out)
 
 bool z_parse_manifest_json(const char *manifest, ZManifest *out, ZDiag *diag) {
   memset(out, 0, sizeof(*out));
-  if (*json_skip_ws(manifest) != '{') {
+  const char *trimmed_manifest = json_skip_ws(manifest ? manifest : "");
+  if (*trimmed_manifest == 0) {
     if (diag) {
       diag->code = 2002;
       diag->line = 1;
       diag->column = 1;
-      snprintf(diag->message, sizeof(diag->message), "zero.json must be a JSON object");
-      snprintf(diag->expected, sizeof(diag->expected), "JSON object with targets.cli.main");
-      snprintf(diag->help, sizeof(diag->help), "create zero.json with package and targets metadata");
+      snprintf(diag->message, sizeof(diag->message), "package manifest is empty");
+      snprintf(diag->expected, sizeof(diag->expected), "zero.json object or zero.toml tables with targets.cli.main");
+      snprintf(diag->help, sizeof(diag->help), "create zero.toml or zero.json with package and targets metadata");
     }
     return false;
   }
+  if (*trimmed_manifest != '{') return z_parse_manifest_toml(manifest, out, diag);
 
   const char *package_name_path[] = {"package", "name"};
   const char *package_version_path[] = {"package", "version"};
   const char *main_path[] = {"targets", "cli", "main"};
   const char *graph_path[] = {"targets", "cli", "graph"};
   const char *kind_path[] = {"targets", "cli", "kind"};
+  const char *compiler_input_path[] = {"repositoryGraph", "compilerInput"};
   out->package_name = json_get_string_path(manifest, package_name_path, 2);
   out->package_version = json_get_string_path(manifest, package_version_path, 2);
   out->main_path = json_get_string_path(manifest, main_path, 3);
   out->graph_path = json_get_string_path(manifest, graph_path, 3);
   out->kind = json_get_string_path(manifest, kind_path, 3);
+  if (!json_get_bool_path(manifest,
+                          compiler_input_path,
+                          2,
+                          &out->repository_graph_compiler_input_present,
+                          &out->repository_graph_compiler_input,
+                          diag,
+                          "repositoryGraph.compilerInput")) {
+    return false;
+  }
 
   const char *dependencies_path[] = {"dependencies"};
   const char *deps_alias_path[] = {"deps"};
@@ -691,8 +912,23 @@ void z_free_manifest(ZManifest *manifest) {
 
 char *z_manifest_path_for_input(const char *input_path) {
   if (!input_path || !input_path[0]) return NULL;
-  if (strcmp(input_path, "zero.json") == 0 || ends_with(input_path, "/zero.json")) return z_strdup(input_path);
-  char *manifest_path = join_path(input_path, "zero.json");
+  if (basename_is(input_path, "zero.toml")) return z_strdup(input_path);
+  if (basename_is(input_path, "zero.json")) return z_strdup(input_path);
+  char *manifest_path = join_path(input_path, "zero.toml");
+  if (file_exists(manifest_path)) return manifest_path;
+  free(manifest_path);
+  manifest_path = join_path(input_path, "zero.json");
+  if (file_exists(manifest_path)) return manifest_path;
+  free(manifest_path);
+  return NULL;
+}
+
+char *z_manifest_path_for_root(const char *root) {
+  if (!root || !root[0]) return NULL;
+  char *manifest_path = join_path(root, "zero.toml");
+  if (file_exists(manifest_path)) return manifest_path;
+  free(manifest_path);
+  manifest_path = join_path(root, "zero.json");
   if (file_exists(manifest_path)) return manifest_path;
   free(manifest_path);
   return NULL;
@@ -730,7 +966,6 @@ bool z_resolve_manifest_graph_artifact_path(const char *input_path, char **out_a
 
   char *manifest = z_read_file(manifest_path, diag);
   if (!manifest) {
-    if (diag) diag->path = z_strdup(manifest_path);
     free(manifest_path);
     return false;
   }
@@ -750,10 +985,10 @@ bool z_resolve_manifest_graph_artifact_path(const char *input_path, char **out_a
     if (require_graph) {
       set_manifest_graph_diag(diag,
                               manifest_path,
-                              "zero.json is missing targets.cli.graph",
+                              "package manifest is missing targets.cli.graph",
                               "targets.cli.graph pointing at a derived ProgramGraph artifact",
                               "missing targets.cli.graph",
-                              "run zero graph import --out <module.program-graph> <source>, then set targets.cli.graph");
+                              "run zero import --out <module.program-graph> <source>, then set targets.cli.graph");
       ok = false;
     }
   } else {
@@ -792,12 +1027,16 @@ static char *dependency_manifest_path(const char *current_manifest_path, const c
     dep_root = join_path(base, dependency_path);
     free(base);
   }
-  if (ends_with(dep_root, "zero.json")) {
+  if (basename_is(dep_root, "zero.toml") || basename_is(dep_root, "zero.json")) {
     char *normalized = normalize_path_text(dep_root);
     free(dep_root);
     return normalized;
   }
-  char *manifest = join_path(dep_root, "zero.json");
+  char *manifest = join_path(dep_root, "zero.toml");
+  if (!file_exists(manifest)) {
+    free(manifest);
+    manifest = join_path(dep_root, "zero.json");
+  }
   free(dep_root);
   char *normalized = normalize_path_text(manifest);
   free(manifest);
@@ -819,7 +1058,7 @@ static void set_package_diag(ZDiag *diag, int code, const char *path, const char
   snprintf(diag->message, sizeof(diag->message), "%s", message ? message : "package dependency error");
   snprintf(diag->expected, sizeof(diag->expected), "%s", expected ? expected : "valid package dependency graph");
   snprintf(diag->actual, sizeof(diag->actual), "%s", actual ? actual : "invalid package dependency graph");
-  snprintf(diag->help, sizeof(diag->help), "%s", help ? help : "repair zero.json dependency metadata");
+  snprintf(diag->help, sizeof(diag->help), "%s", help ? help : "repair package manifest dependency metadata");
 }
 
 static unsigned long long source_dependency_graph_hash(const SourceInput *input) {
@@ -923,7 +1162,7 @@ static bool resolve_manifest_dependencies(const char *manifest_path, const ZMani
     }
     char *dep_manifest_path = dependency_manifest_path(manifest_path, dep->path);
     if (!dep_manifest_path || !file_exists(dep_manifest_path)) {
-      set_package_diag(diag, 9001, manifest_path, "package dependency manifest not found", "dependency path containing zero.json", dep->path, "create the dependency package or update the dependency path");
+      set_package_diag(diag, 9001, manifest_path, "package dependency manifest not found", "dependency path containing zero.toml or zero.json", dep->path, "create the dependency package or update the dependency path");
       free(dep_manifest_path);
       return false;
     }
@@ -939,7 +1178,8 @@ static bool resolve_manifest_dependencies(const char *manifest_path, const ZMani
     }
     ZManifest parsed_dep = {0};
     if (!z_parse_manifest_json(dep_manifest_text, &parsed_dep, diag)) {
-      diag->path = dep_manifest_path;
+      z_diag_set_path_copy(diag, dep_manifest_path);
+      free(dep_manifest_path);
       free(dep_manifest_text);
       return false;
     }
@@ -977,14 +1217,14 @@ bool z_map_source_diag(const SourceInput *input, ZDiag *diag) {
   if (!input || !diag || diag->line <= 0 || input->source_line_count == 0) return false;
   size_t index = (size_t)diag->line - 1;
   if (index >= input->source_line_count) return false;
-  diag->path = input->source_line_paths[index];
+  z_diag_set_path_copy(diag, input->source_line_paths[index]);
   diag->line = input->source_line_numbers[index] > 0 ? input->source_line_numbers[index] : 1;
   for (size_t i = 0; i < diag->borrow_trace_count; i++) {
     ZBorrowTrace *trace = &diag->borrow_traces[i];
     if (trace->binding_line <= 0) continue;
     size_t binding_index = (size_t)trace->binding_line - 1;
     if (binding_index >= input->source_line_count) continue;
-    trace->binding_decl_path = input->source_line_paths[binding_index];
+    trace->binding_decl_path = input->source_line_paths[binding_index] ? z_strdup(input->source_line_paths[binding_index]) : NULL;
     trace->binding_line = input->source_line_numbers[binding_index] > 0 ? input->source_line_numbers[binding_index] : 1;
   }
   return true;
@@ -1000,6 +1240,7 @@ void z_free_source(SourceInput *input) {
   free(input->lockfile_path);
   free(input->program_graph_hash);
   free(input->program_graph_module_identity);
+  free(input->mapped_mir_cache_path);
   for (size_t i = 0; i < input->source_file_count; i++) free(input->source_files[i]);
   for (size_t i = 0; i < input->source_line_count; i++) free(input->source_line_paths[i]);
   for (size_t i = 0; i < input->import_count; i++) free(input->imports[i]);
@@ -1066,39 +1307,60 @@ char *z_default_out_path(const char *source_file) {
   return buf.data;
 }
 
-static bool command_exists(const char *command) {
-  ZBuf probe;
-  zbuf_init(&probe);
-  zbuf_append(&probe, "command -v ");
-  zbuf_append_char(&probe, '\'');
-  for (size_t i = 0; command && command[i]; i++) {
-    if (command[i] == '\'') zbuf_append(&probe, "'\\''");
-    else zbuf_append_char(&probe, command[i]);
-  }
-  zbuf_append(&probe, "' >/dev/null 2>&1");
-  bool ok = system(probe.data) == 0;
-  zbuf_free(&probe);
-  return ok;
-}
-
-static void append_shell_quoted_arg(ZBuf *cmd, const char *value) {
-  zbuf_append_char(cmd, '\'');
-  for (size_t i = 0; value && value[i]; i++) {
-    if (value[i] == '\'') zbuf_append(cmd, "'\\''");
-    else zbuf_append_char(cmd, value[i]);
-  }
-  zbuf_append_char(cmd, '\'');
-}
-
 static bool path_exists_for_cc(const char *path, bool directory) {
   struct stat st;
   return path && path[0] && stat(path, &st) == 0 && (directory ? S_ISDIR(st.st_mode) : S_ISREG(st.st_mode));
 }
 
-static bool remove_existing_tool_output(const char *path) {
-  if (!path || !path[0]) return false;
-  if (remove(path) == 0) return true;
-  return errno == ENOENT;
+static bool command_name_safe(const char *command) {
+  if (!command || !command[0]) return false;
+  for (size_t i = 0; command[i]; i++) {
+    unsigned char ch = (unsigned char)command[i];
+    if (!(isalnum(ch) || ch == '_' || ch == '-' || ch == '.' || ch == '+')) return false;
+  }
+  return true;
+}
+
+static bool command_exists(const char *command) {
+  return z_process_command_available(command);
+}
+
+bool z_toolchain_compiler_override_safe(const char *compiler) {
+  if (!compiler || !compiler[0]) return false;
+  for (size_t i = 0; compiler[i]; i++) {
+    unsigned char ch = (unsigned char)compiler[i];
+    if (!(isalnum(ch) || ch == '_' || ch == '-' || ch == '.' || ch == '+' || ch == '/' || ch == '\\' || ch == ':' || ch == '@')) return false;
+  }
+  return true;
+}
+
+static bool run_tool_silent(const char *tool, const char *arg) {
+  if (!command_name_safe(tool) || !arg || !arg[0]) return false;
+  ZProcessArgv argv;
+  z_process_argv_init(&argv);
+  bool ok = z_process_argv_push(&argv, tool) && z_process_argv_push(&argv, arg);
+  if (ok) ok = z_process_run_argv(&argv, true, true, false);
+  z_process_argv_free(&argv);
+  return ok;
+}
+
+static bool zargv_append_toolchain_driver(ZProcessArgv *argv, const ZToolchainPlan *plan, bool *uses_zig_env) {
+  if (!argv || !plan) return false;
+  if (uses_zig_env) *uses_zig_env = false;
+  if (strcmp(plan->driver_kind, "override-cc") == 0) {
+    return z_process_argv_push(argv, plan->compiler);
+  }
+  if (strcmp(plan->driver_kind, "host-cc") == 0) {
+    return z_process_argv_push(argv, "cc");
+  }
+  if (!z_process_ensure_dir(".zero") ||
+      !z_process_ensure_dir(".zero/zig-global-cache") ||
+      !z_process_ensure_dir(".zero/zig-local-cache")) return false;
+  if (uses_zig_env) *uses_zig_env = true;
+  return z_process_argv_push(argv, "zig") &&
+         z_process_argv_push(argv, "cc") &&
+         z_process_argv_push(argv, "-target") &&
+         z_process_argv_push(argv, plan->target_triple);
 }
 
 static bool profile_should_strip_artifact(const char *profile);
@@ -1162,7 +1424,11 @@ ZToolchainPlan z_plan_toolchain(const char *cc, const char *profile, const ZTarg
 }
 
 static bool validate_toolchain_plan(const ZToolchainPlan *plan, const ZTargetInfo *target) {
-  if (strcmp(plan->driver_kind, "override-cc") == 0) return true;
+  if (strcmp(plan->driver_kind, "override-cc") == 0) {
+    if (z_toolchain_compiler_override_safe(plan->compiler)) return true;
+    fprintf(stderr, "compiler override contains unsafe shell characters; pass a compiler path or command name without flags or shell syntax\n");
+    return false;
+  }
 
   if (plan->requires_sysroot && strcmp(plan->sysroot_status, "present") != 0) {
     if (strcmp(plan->sysroot_status, "host-leakage") == 0) {
@@ -1201,38 +1467,22 @@ static bool profile_should_strip_artifact(const char *profile) {
   return !profile || strcmp(profile, "release") == 0 || strcmp(profile, "release-small") == 0 || strcmp(profile, "small") == 0 || strcmp(profile, "tiny") == 0;
 }
 
-static void append_toolchain_driver_command(ZBuf *cmd, const ZToolchainPlan *plan) {
-  if (strcmp(plan->driver_kind, "override-cc") == 0) {
-    append_shell_quoted_arg(cmd, plan->compiler);
-  } else if (strcmp(plan->driver_kind, "host-cc") == 0) {
-    zbuf_append(cmd, "cc");
-  } else {
-    zbuf_append(cmd, "mkdir -p .zero/zig-global-cache .zero/zig-local-cache && ZIG_GLOBAL_CACHE_DIR=.zero/zig-global-cache ZIG_LOCAL_CACHE_DIR=.zero/zig-local-cache zig cc");
-    zbuf_append(cmd, " -target ");
-    append_shell_quoted_arg(cmd, plan->target_triple);
-  }
-}
-
 bool z_toolchain_compile_c_object(const ZToolchainPlan *plan, const char *profile, const ZTargetInfo *target, const char *c_file, const char *object_file, const char *include_dir, const char *extra_c_flags) {
   if (!validate_toolchain_plan(plan, target)) return false;
   if (!c_file || !object_file || strcmp(c_file, object_file) == 0) return false;
-  if (!remove_existing_tool_output(object_file)) return false;
+  if (!z_process_prepare_output_file(object_file)) return false;
 
-  ZBuf cmd;
-  zbuf_init(&cmd);
-  append_toolchain_driver_command(&cmd, plan);
-  zbuf_appendf(&cmd, " %s", profile_c_flags(profile));
-  if (extra_c_flags && extra_c_flags[0]) zbuf_appendf(&cmd, " %s", extra_c_flags);
-  if (include_dir && include_dir[0]) {
-    zbuf_append(&cmd, " -I ");
-    append_shell_quoted_arg(&cmd, include_dir);
-  }
-  zbuf_append(&cmd, " -c ");
-  append_shell_quoted_arg(&cmd, c_file);
-  zbuf_append(&cmd, " -o ");
-  append_shell_quoted_arg(&cmd, object_file);
-  bool ok = system(cmd.data) == 0 && path_exists_for_cc(object_file, false);
-  zbuf_free(&cmd);
+  ZProcessArgv argv;
+  z_process_argv_init(&argv);
+  bool suppress_stderr = false;
+  bool uses_zig_env = false;
+  bool ok = zargv_append_toolchain_driver(&argv, plan, &uses_zig_env) &&
+            z_process_argv_append_flag_text(&argv, profile_c_flags(profile), &suppress_stderr) &&
+            z_process_argv_append_flag_text(&argv, extra_c_flags, &suppress_stderr);
+  if (ok && include_dir && include_dir[0]) ok = z_process_argv_push(&argv, "-I") && z_process_argv_push(&argv, include_dir);
+  if (ok) ok = z_process_argv_push(&argv, "-c") && z_process_argv_push(&argv, c_file) && z_process_argv_push(&argv, "-o") && z_process_argv_push(&argv, object_file);
+  if (ok) ok = z_process_run_argv(&argv, false, suppress_stderr, uses_zig_env) && z_process_output_file_ready(object_file);
+  z_process_argv_free(&argv);
   return ok;
 }
 
@@ -1242,23 +1492,20 @@ bool z_toolchain_link_objects(const ZToolchainPlan *plan, const ZTargetInfo *tar
   for (size_t i = 0; i < object_count; i++) {
     if (object_files[i] && strcmp(object_files[i], exe_file) == 0) return false;
   }
-  if (!remove_existing_tool_output(exe_file)) return false;
+  if (!z_process_prepare_output_file(exe_file)) return false;
 
-  ZBuf cmd;
-  zbuf_init(&cmd);
-  append_toolchain_driver_command(&cmd, plan);
-  if (pre_link_flags && pre_link_flags[0]) zbuf_appendf(&cmd, " %s", pre_link_flags);
+  ZProcessArgv argv;
+  z_process_argv_init(&argv);
+  bool suppress_stderr = false;
+  bool uses_zig_env = false;
+  bool ok = zargv_append_toolchain_driver(&argv, plan, &uses_zig_env) &&
+            z_process_argv_append_flag_text(&argv, pre_link_flags, &suppress_stderr);
   for (size_t i = 0; i < object_count; i++) {
-    if (object_files[i] && object_files[i][0]) {
-      zbuf_append_char(&cmd, ' ');
-      append_shell_quoted_arg(&cmd, object_files[i]);
-    }
+    if (ok && object_files[i] && object_files[i][0]) ok = z_process_argv_push(&argv, object_files[i]);
   }
-  zbuf_append(&cmd, " -o ");
-  append_shell_quoted_arg(&cmd, exe_file);
-  if (post_object_flags && post_object_flags[0]) zbuf_appendf(&cmd, " %s", post_object_flags);
-  bool ok = system(cmd.data) == 0 && path_exists_for_cc(exe_file, false);
-  zbuf_free(&cmd);
+  if (ok) ok = z_process_argv_push(&argv, "-o") && z_process_argv_push(&argv, exe_file) && z_process_argv_append_flag_text(&argv, post_object_flags, &suppress_stderr);
+  if (ok) ok = z_process_run_argv(&argv, false, suppress_stderr, uses_zig_env) && z_process_output_file_ready(exe_file);
+  z_process_argv_free(&argv);
   return ok;
 }
 
@@ -1266,17 +1513,19 @@ bool z_run_cc(const char *c_file, const char *exe_file, const char *cc, const ch
   ZToolchainPlan plan = z_plan_toolchain(cc, profile, target);
   if (!validate_toolchain_plan(&plan, target)) return false;
   if (!c_file || !exe_file || strcmp(c_file, exe_file) == 0) return false;
-  if (!remove_existing_tool_output(exe_file)) return false;
+  if (!z_process_prepare_output_file(exe_file)) return false;
 
-  ZBuf cmd;
-  zbuf_init(&cmd);
-  append_toolchain_driver_command(&cmd, &plan);
-  zbuf_appendf(&cmd, " %s ", profile_c_flags(profile));
-  append_shell_quoted_arg(&cmd, c_file);
-  zbuf_append(&cmd, " -o ");
-  append_shell_quoted_arg(&cmd, exe_file);
-  bool ok = system(cmd.data) == 0 && path_exists_for_cc(exe_file, false);
-  zbuf_free(&cmd);
+  ZProcessArgv argv;
+  z_process_argv_init(&argv);
+  bool suppress_stderr = false;
+  bool uses_zig_env = false;
+  bool ok = zargv_append_toolchain_driver(&argv, &plan, &uses_zig_env) &&
+            z_process_argv_append_flag_text(&argv, profile_c_flags(profile), &suppress_stderr) &&
+            z_process_argv_push(&argv, c_file) &&
+            z_process_argv_push(&argv, "-o") &&
+            z_process_argv_push(&argv, exe_file);
+  if (ok) ok = z_process_run_argv(&argv, false, suppress_stderr, uses_zig_env) && z_process_output_file_ready(exe_file);
+  z_process_argv_free(&argv);
   if (!ok) {
     fprintf(
       stderr,
@@ -1287,14 +1536,6 @@ bool z_run_cc(const char *c_file, const char *exe_file, const char *cc, const ch
       plan.selection_source
     );
   }
-  if (ok && plan.strip_artifact && command_exists("strip")) {
-    ZBuf strip_cmd;
-    zbuf_init(&strip_cmd);
-    zbuf_append(&strip_cmd, "strip ");
-    append_shell_quoted_arg(&strip_cmd, exe_file);
-    zbuf_append(&strip_cmd, " >/dev/null 2>&1 || true");
-    system(strip_cmd.data);
-    zbuf_free(&strip_cmd);
-  }
+  if (ok && plan.strip_artifact && command_exists("strip")) (void)run_tool_silent("strip", exe_file);
   return ok;
 }

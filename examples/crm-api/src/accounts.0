@@ -1,0 +1,30 @@
+use http_util
+
+pub fn listAccounts(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if tenantOk(request) {
+        return jsonResponse(response, 200_u16, "{\"accounts\":[{\"id\":1,\"name\":\"Acme\",\"owner\":\"Ada\"},{\"id\":2,\"name\":\"Globex\",\"owner\":\"Lin\"}],\"next\":null}")
+    }
+    return badRequest(response, "tenant")
+}
+
+pub fn createAccount(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if bodyIsJson(request, 256) && bodyHasU32(request, "owner_id", 256) {
+        return jsonResponse(response, 201_u16, "{\"account\":{\"id\":3,\"name\":\"New account\",\"owner_id\":9},\"created\":true}")
+    }
+    return badRequest(response, "json")
+}
+
+pub fn readAccount(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"account\":{\"id\":1,\"name\":\"Acme\",\"stage\":\"customer\",\"owner\":\"Ada\"}}")
+}
+
+pub fn updateAccount(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if bodyIsJson(request, 256) {
+        return jsonResponse(response, 200_u16, "{\"account\":{\"id\":1,\"name\":\"Acme Updated\",\"stage\":\"customer\"},\"updated\":true}")
+    }
+    return badRequest(response, "json")
+}
+
+pub fn deleteAccount(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"account\":{\"id\":1},\"deleted\":true}")
+}

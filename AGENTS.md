@@ -39,27 +39,57 @@ where they will run.
 - Keep examples runnable and docs copyable.
 - Prefer small, direct changes over broad refactors.
 - Use direct emitters for compiler output.
+- For broad local validation, run `pnpm run agent:checks`. It mirrors the CI
+  buckets in parallel, including conformance, command contracts, native test
+  shards, sanitizer smoke, and workspace checks. It uses isolated `/tmp`
+  workspaces so agents can validate uncommitted changes without local artifact
+  races.
 - Before ending any agent turn that changes the repository, run
-  `pnpm run conformance`; if it cannot complete, report the blocker and the
+  `pnpm run conformance` unless `pnpm run agent:checks` already passed for the
+  same changes. If validation cannot complete, report the blocker and the
   failing command.
 
 ## Useful Checks
 
 ```sh
-pnpm run docs:test
+pnpm run agent:checks
+pnpm run docs:build
 pnpm run conformance
 pnpm run native:test
 pnpm run command-contracts
 ```
 
+`pnpm run agent:checks` already includes conformance. Do not run conformance
+again after it passes unless you need to recheck later changes.
+
+Shard native tests locally with `ZERO_NATIVE_TEST_SHARD=1/4 pnpm run
+native:test:local`. PR CI runs representative native runtime cases in two
+fast shards. Scheduled and manual deep CI runs the full native runtime matrix
+in six shards, plus full conformance and full graph performance fixtures.
+
+`pnpm run conformance:local` and `pnpm run command-contracts:local` use the
+aggregate validation runner. Add `-- --shard 1/4` to run one conformance phase
+shard, `-- --phases name,name` to match a focused CI phase set, `-- --list` to
+see phases, and `-- --fail-fast` only when a narrow loop should stop at the
+first failing phase.
+Use `ZERO_NATIVE_TEST_SCOPE=fast` only when reproducing PR CI coverage. Leave it
+unset for the exhaustive native runtime matrix.
+`pnpm run conformance` runs the sandbox suite with four isolated conformance
+check workers. Local validation stays serial by default; set
+`ZERO_CONFORMANCE_CHECK_JOBS=<n>` only when measuring that path on the current
+machine.
+Validation scripts prefer the built native compiler at `.zero/bin/zero` after
+`native-build`; set `ZERO_BIN=<path>` only when comparing another compiler
+binary deliberately.
+
 For focused compiler work:
 
 ```sh
-bin/zero check --json <file-or-package>
-bin/zero graph --json <file-or-package>
-bin/zero size --json <file-or-package>
+bin/zero check --json <graph-input>
+bin/zero inspect --json <graph-input>
+bin/zero size --json <graph-input>
 bin/zero explain <diagnostic-code>
-bin/zero fix --plan --json <file-or-package>
+bin/zero fix --plan --json <graph-backed-file-or-package>
 ```
 
 ## Project Layout
@@ -101,7 +131,7 @@ make -C native/zero-c
 bin/zero --version --json
 pnpm run test:zero
 pnpm run command-contracts:local
-pnpm run docs:test
+pnpm run docs:build
 ```
 
 The release workflow reads the version from `package.json`, builds release

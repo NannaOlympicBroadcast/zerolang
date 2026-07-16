@@ -1,4 +1,5 @@
 pub fn main(world: World) -> Void raises {
+    // Rosetta comments task: this line is intentionally a comment.
     let value: i32 = 1 + 1
     if value == 2 {
         check world.out.write("comments ok\n")

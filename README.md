@@ -1,248 +1,164 @@
-# zerolang
+# Zerolang
 
-zerolang is an experimental graph-first programming language where agents work with semantic program structure instead of raw source text.
+**The programming language for agents.**
 
-Source code is still the source of truth. The graph is the compiler-derived interface agents use to inspect and change programs with less guessing.
+Zerolang is an experimental graph-native programming language where the semantic graph is the program database. Humans ask for outcomes. Agents query the graph, submit checked edits, and prove the result.
 
-The current model:
-
-- Human-readable `.0` source stays reviewable, auditable, and durable.
-- The compiler derives a checked ProgramGraph from source.
-- Agents inspect graph facts such as node IDs, graph hashes, types, effects, ownership facts, capabilities, helper use, and module edges.
-- Agents can submit checked graph edits instead of only patching text ranges.
-- Where source rewriting is supported, the compiler validates the edit before writing source.
-
-Design goals:
-
-- Token efficiency
-- Low memory usage
-- Fast startup
-- Fast builds
-- Low runtime latency
-- Zero dependencies
-
-> **Safety status**
+> **Safety warning**
 >
-> Security vulnerabilities should be expected. zerolang is not ready for production systems, sensitive data, or trusted infrastructure. Run and develop it in isolated, disposable environments.
+> Zerolang is experimental. Expect breaking changes, rough edges, and security issues. Run it in isolated workspaces, not against production systems or sensitive data.
 
-## Why Graph
+## Start With a Request
 
-Agents can edit source text, but source text is a lossy interface for program understanding. A text patch has to guess which references are related, whether a range is stale, whether a call resolves to the intended function, and whether an edit preserved ownership, fallibility, effects, imports, and target constraints.
-
-The ProgramGraph is zerolang's compiler-owned structure for that work. It is meant to give agents a map they can navigate in slices: start from a symbol, diagnostic, call, capability, module, or node ID, then ask for the surrounding semantic facts instead of loading unrelated source. That keeps context gathering focused while leaving source code as the durable artifact humans review.
-
-The edit loop is also different. A graph edit can target `node #expr_653eeb6e` instead of a line range, require the inspected `graphHash`, require an expected field value, and let the compiler validate, lower, write, format, reparse, and check the result as one path. Refactors can be expressed as semantic operations such as renaming a function node or replacing a resolved callee, rather than search-and-replace over text followed by separate cleanup commands.
-
-## Source Text
-
-`.0` source is intentionally regular. The goal is source that behaves like durable data: easy to index, compare, format, audit, and regenerate, while still reading like normal code.
-
-A small program shows typed signatures, infix expressions, fallibility, and explicit capability passing:
-
-```zero
-fn answer() -> i32 {
-    return 40 + 2
-}
-
-pub fn main(world: World) -> Void raises {
-    if answer() == 42 {
-        check world.out.write("math works\n")
-    }
-}
-```
-
-Source code remains the stored representation. ProgramGraph artifacts are derived inspection and interchange data, not the primary project files.
-
-## ProgramGraph
-
-Agents do not have to infer every fact from text. The compiler can expose the checked structure of a program directly:
-
-```bash
-zero graph dump examples/hello.0
-```
-
-Example output:
+The expected workflow is a normal conversation:
 
 ```text
-zero-graph v1
-origin source-text
-module "hello"
-hash "graph:a7f7e6899a73f3b4"
-
-node #decl_ad8d9028 Function name:"main" type:"Void" public:true fallible:true
-node #param_4610ae76 Param name:"world" type:"World"
-node #expr_c403020c MethodCall name:"write" type:"Void"
-node #expr_653eeb6e Literal type:"String" value:"hello from zero\n"
-edge #expr_c403020c arg #expr_653eeb6e order:0
-edge #decl_ad8d9028 body #block_29d1811d
+build hello world for zerolang
 ```
 
-The graph gives agents explicit handles such as node IDs, graph hashes, resolved types, effects, ownership facts, capability facts, helper use, and module edges. The hash is a stale-context check; node IDs are edit targets for the graph that was inspected.
+The agent should use the compiler, not guess from source text:
 
-## Checked Graph Edits
-
-For supported canonical `.0` source, `zero graph patch` applies checked edits to the graph and rewrites source only after validation. The command is intended to collapse the normal agent loop of edit, format, reparse, check, and fix into a compiler-mediated operation:
-
-```bash
-zero graph patch examples/hello.0 \
-  --expect-graph-hash graph:a7f7e6899a73f3b4 \
-  --op 'set node="#expr_653eeb6e" field="value" expect="hello from zero\n" value="hello graph\n"'
+```sh
+zero init
+zero patch --op 'addMain' --op 'addCheckWrite fn="main" text="hello from zero\n"'
+zero run
 ```
 
-This is different from a source-text patch. The operation targets a checked semantic node and field. The graph hash rejects stale context, and `expect` rejects the edit if the current field value is different from what the agent inspected.
+The result is still reviewable as a text projection:
 
-## Agent Workflow Interfaces
-
-The compiler exposes the workflow through CLI commands with stable structured output.
-
-### Load Version-Matched Rules
-
-The compiler ships skill text that matches the binary being used:
-
-```bash
-zero skills list
-zero skills get language
-zero skills get diagnostics
-zero skills get stdlib
-```
-
-Print the language guide bundled with the compiler:
-
-```bash
-zero skills get language
-```
-
-### Inspect Compiler Facts
-
-Compiler state is exposed through structured command output instead of prose-only output. The important contract is the stable fields and repair identifiers; today the CLI exposes those fields with `--json`:
-
-```bash
-zero tokens --json examples/hello.0
-zero parse --json examples/hello.0
-zero check --json examples/hello.0
-zero graph dump examples/hello.0
-zero graph --json examples/systems-package
-zero size --json examples/point.0
-```
-
-The structured contracts include diagnostic codes and spans, public symbols, import edges, target readiness, compile-time sandbox facts, retained helpers, graph hashes, node IDs, and size retention reasons.
-
-### Compiler-Native Contracts
-
-Most language ecosystems expose some of these facts through separate tools, editor protocols, or library APIs. zerolang keeps the agent-facing inspection and repair path in the compiler CLI.
-
-The inspection and repair surfaces are compiler commands, not editor-only features or a separate analysis service:
-
-| Command | Contract |
-| --- | --- |
-| `zero skills get language` | Version-matched language rules bundled with the compiler binary. |
-| `zero check --json` | Diagnostics with code, span, expected/actual fields, fix safety, repair metadata, compile-time sandbox facts, target readiness, and safety facts. |
-| `zero parse --json` | A stable parse summary with declarations, function signatures, and body node kinds. |
-| `zero graph --json` | Modules, imports, public symbols, capabilities, effects, ownership facts, safety facts, helper use, and interface fingerprints. |
-| `zero graph dump` | Deterministic ProgramGraph text with graph hashes, node IDs, nodes, and edges. |
-| `zero graph patch` | Checked graph edits with graph-hash and field-value preconditions. |
-| `zero fix --plan --json` | Typed repair plans that describe proposed fixes without editing files. |
-| `zero size --json` | Retained helpers, size reasons, profile policy, safety facts, backend facts, and artifact budget data. |
-
-### Repair With Diagnostics
-
-A failing fixture reports a diagnostic with stable fields:
-
-```bash
-zero check --json conformance/check/fail/unknown-name.0
-```
-
-Today that output includes fields like:
-
-```json
-{
-  "code": "NAM003",
-  "message": "unknown identifier 'message'",
-  "expected": "visible local, parameter, function, or builtin",
-  "actual": "no matching visible symbol",
-  "repair": {
-    "id": "declare-missing-symbol"
-  }
+```zero
+pub fn main(world: World) -> Void raises {
+    check world.out.write("hello from zero\n")
 }
 ```
 
-Diagnostics can be explained and turned into typed fix plans:
+That `.0` file is a projection of `zero.graph`. Humans can read it, review it, and occasionally edit it. Agents should normally keep using `zero query` and `zero patch`.
 
-```bash
-zero explain --json TYP009
-zero fix --plan --json examples/agent-repair-demo/broken.0
+## The Program Database
+
+Traditional agent coding loops treat text as the source of truth:
+
+```mermaid
+flowchart LR
+    A[agent writes text] --> B[check]
+    B --> C[format]
+    C --> D[build]
+    D --> E[inspect failures]
+    E --> A
 ```
 
-Run the repair demo:
+Zerolang moves the agent closer to the compiler:
 
-```bash
-pnpm run agent:demo
+```mermaid
+flowchart LR
+    A[agent queries graph] --> B[agent submits checked patch]
+    B --> C{compiler accepts?}
+    C -- invalid or stale --> A
+    C -- valid --> D[agent runs task validation]
+    D --> E[human reviews projection when useful]
 ```
 
-See `examples/agent-repair-demo/` for the broken fixture, suggested edit, fixed fixture, and scripted check-explain-plan-rerun flow.
+The graph gives agents explicit handles: symbols, node IDs, graph hashes, types, effects, ownership facts, capabilities, imports, call edges, and target facts. Edits can target semantic structure instead of line ranges. Stale graph hashes, unexpected field values, invalid shapes, and type errors fail before the store is written.
 
-### Compatibility Policy
+## What Exists Today
 
-zerolang is experimental and intentionally unstable. The repo prefers one current syntax and one formatted style over compatibility layers:
+- `zero.graph` is the checked compiler input for graph-first packages.
+- `.0` files are human-readable projections, not the normal agent authoring surface.
+- `zero patch` applies checked graph edits and rejects stale or invalid changes.
+- `zero query`, `zero inspect`, `zero check`, `zero test`, and `zero run` expose compiler facts through agent-friendly commands.
+- `zero import` and `zero export` make the projection boundary explicit, so human text edits do not silently diverge from the graph.
 
-```bash
-zero fmt --check examples/hello.0
-zero check --json examples/hello.0
-```
+## Install
 
-The project may make breaking changes to simplify the language, standard library, diagnostics, graph APIs, or inspection surfaces for agent use.
+Install the compiler:
 
-## Quick Start
-
-Install the latest release:
-
-```bash
+```sh
 curl -fsSL https://zerolang.ai/install.sh | bash
 export PATH="$HOME/.zero/bin:$PATH"
 zero --version
 ```
 
-Check a program:
+Install the agent bootstrap skill:
 
-```bash
-zero check examples/hello.0
+```sh
+npx skills add vercel-labs/zerolang
 ```
 
-Run a small executable:
+The compiler bundles version-matched skills for agents:
 
-```bash
-zero run examples/add.0
+```sh
+zero skills
+zero skills get agent
+zero skills get graph
+zero skills get language
+zero skills get stdlib
 ```
 
-Expected output:
+## Daily Loop
 
-```text
-math works
+For most package work:
+
+```sh
+zero query
+zero patch --op help
+zero patch --op 'addMain'
+zero check
+zero test
+zero run -- <args>
 ```
 
-## Common Commands
+The default input is the current directory. Use `.` only when you want to be explicit.
 
-```bash
-zero check examples/hello.0
-zero run examples/add.0
-zero build --emit exe --target linux-musl-x64 examples/add.0 --out .zero/out/add
-zero graph --json examples/systems-package
-zero size --json examples/point.0
-zero skills get zero --full
-zero doctor --json
+When a human wants to review projection text:
+
+```sh
+zero export
+zero verify-projection
 ```
 
-## Validation
+When a human intentionally edits a projection:
 
-```bash
-pnpm run docs:test
+```sh
+zero import
+zero check
+```
+
+## Runtime Goals
+
+The graph-first model should reduce agent guessing without relaxing the runtime goals:
+
+- Token-efficient inspection
+- Low memory usage
+- Fast startup and builds
+- Low runtime latency
+- Explicit capabilities
+- Small, dependency-free artifacts
+
+## Developing Zerolang
+
+Build the local compiler:
+
+```sh
+pnpm install
+make -C native/zero-c
+bin/zero --version
+```
+
+Useful checks:
+
+```sh
+pnpm run docs:build
 pnpm run conformance
 pnpm run native:test
 pnpm run command-contracts
 ```
 
-Benchmarks run locally by default:
+For local iteration:
 
-```bash
-pnpm run bench
+```sh
+pnpm run conformance:local -- --list
+pnpm run conformance:local -- --shard 1/4
+pnpm run command-contracts:local
 ```
+
+Read the docs at [zerolang.ai](https://zerolang.ai).

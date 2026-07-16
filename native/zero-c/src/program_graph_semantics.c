@@ -1,5 +1,6 @@
 #include "program_graph_semantics.h"
 
+#include "c_import.h"
 #include "program_graph_resolve.h"
 #include "program_graph_source_map.h"
 #include "std_sig.h"
@@ -7,6 +8,7 @@
 
 #include <ctype.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -18,6 +20,9 @@ typedef struct {
   const ZProgramGraphNode *target_node;
   const ZProgramGraphNode *target_function;
   const ZProgramGraphNode *world_binding;
+  char c_return_type[128];
+  char c_arg_types[Z_STD_HELPER_MAX_ARGS][128];
+  int c_arg_count;
   bool world_write;
   bool fallible;
   bool present;
@@ -39,6 +44,45 @@ static bool graph_semantics_text_starts_with(const char *text, const char *prefi
 static bool graph_semantics_text_contains(const char *text, const char *needle) {
   return text && needle && strstr(text, needle) != NULL;
 }
+
+static void graph_semantics_capability_set(ZProgramGraphCapabilitySummary *caps, const char *capability, const ZProgramGraphNode *node) {
+  if (!caps || !capability) return;
+#define SET_GRAPH_CAP(field) do { caps->field = true; if (!caps->field##_node) caps->field##_node = node; } while (0)
+  if (graph_semantics_text_eq(capability, "args")) SET_GRAPH_CAP(args);
+  else if (graph_semantics_text_eq(capability, "env")) SET_GRAPH_CAP(env);
+  else if (graph_semantics_text_eq(capability, "fs")) SET_GRAPH_CAP(fs);
+  else if (graph_semantics_text_eq(capability, "memory")) SET_GRAPH_CAP(memory);
+  else if (graph_semantics_text_eq(capability, "alloc")) {
+    SET_GRAPH_CAP(alloc);
+    SET_GRAPH_CAP(memory);
+  } else if (graph_semantics_text_eq(capability, "path")) SET_GRAPH_CAP(path);
+  else if (graph_semantics_text_eq(capability, "codec")) SET_GRAPH_CAP(codec);
+  else if (graph_semantics_text_eq(capability, "parse")) SET_GRAPH_CAP(parse);
+  else if (graph_semantics_text_eq(capability, "time")) SET_GRAPH_CAP(time);
+  else if (graph_semantics_text_eq(capability, "rand")) SET_GRAPH_CAP(rand);
+  else if (graph_semantics_text_eq(capability, "net")) SET_GRAPH_CAP(net);
+  else if (graph_semantics_text_eq(capability, "proc")) SET_GRAPH_CAP(proc);
+  else if (graph_semantics_text_eq(capability, "web")) SET_GRAPH_CAP(web);
+  else if (graph_semantics_text_eq(capability, "world") || graph_semantics_text_eq(capability, "io")) SET_GRAPH_CAP(world);
+#undef SET_GRAPH_CAP
+}
+
+static void graph_semantics_capability_set_for_type(ZProgramGraphCapabilitySummary *caps, const char *type, const ZProgramGraphNode *node) {
+  if (!caps || !type) return;
+  if (graph_semantics_text_eq(type, "World")) graph_semantics_capability_set(caps, "world", node);
+  else if (graph_semantics_text_eq(type, "Fs")) graph_semantics_capability_set(caps, "fs", node);
+  else if (graph_semantics_text_eq(type, "Net")) graph_semantics_capability_set(caps, "net", node);
+  else if (graph_semantics_text_eq(type, "Proc")) graph_semantics_capability_set(caps, "proc", node);
+  else if (graph_semantics_text_eq(type, "Clock")) graph_semantics_capability_set(caps, "time", node);
+  else if (graph_semantics_text_eq(type, "Rand")) graph_semantics_capability_set(caps, "rand", node);
+  else if (graph_semantics_text_eq(type, "Alloc") || graph_semantics_text_eq(type, "FixedBufAlloc") || graph_semantics_text_eq(type, "NullAlloc")) {
+    graph_semantics_capability_set(caps, "alloc", node);
+  }
+  if (graph_semantics_text_contains(type, "Span<") || graph_semantics_text_contains(type, "MutSpan<") || graph_semantics_text_contains(type, "ByteBuf")) {
+    graph_semantics_capability_set(caps, "memory", node);
+  }
+}
+
 
 static void graph_semantics_append_quoted(ZBuf *buf, const char *text) {
   zbuf_append_char(buf, '"');
@@ -97,6 +141,68 @@ static const ZProgramGraphResolutionReference *graph_semantics_reference_for_nod
 
 static const ZProgramGraphResolutionReference *graph_semantics_call_reference(const ZProgramGraphResolutionFacts *resolution, const ZProgramGraphNode *call) {
   return graph_semantics_reference_for_node(resolution, call ? call->id : NULL, "call");
+}
+
+static const ZProgramGraphNode *graph_semantics_resolution_target_node(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const ZProgramGraphNode *node) {
+  const ZProgramGraphResolutionReference *ref = graph_semantics_reference_for_node(resolution, node ? node->id : NULL, NULL);
+  return ref && ref->target_node && ref->target_node[0] ? graph_semantics_node_by_id(graph, ref->target_node) : NULL;
+}
+
+static const char *graph_semantics_node_semantic_type(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const ZProgramGraphNode *node) {
+  if (node && graph_semantics_text_present(node->type)) return node->type;
+  const ZProgramGraphNode *target = graph_semantics_resolution_target_node(graph, resolution, node);
+  return target && target->type ? target->type : "";
+}
+
+static const char *graph_semantics_node_semantic_type_id(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const ZProgramGraphNode *node) {
+  if (node && graph_semantics_text_present(node->type_id)) return node->type_id;
+  const ZProgramGraphNode *target = graph_semantics_resolution_target_node(graph, resolution, node);
+  return target && target->type_id ? target->type_id : "";
+}
+
+static bool graph_semantics_span_type_element(const char *type, const char *name, char *out, size_t out_len) {
+  if (!type || !name || !out || out_len == 0) return false;
+  size_t name_len = strlen(name);
+  if (strncmp(type, name, name_len) != 0 || type[name_len] != '<') return false;
+  const char *start = type + name_len + 1;
+  const char *end = strrchr(start, '>');
+  if (!end || end[1] != 0 || end <= start) return false;
+  size_t len = (size_t)(end - start);
+  if (len >= out_len) return false;
+  memcpy(out, start, len);
+  out[len] = 0;
+  return true;
+}
+
+static bool graph_semantics_fixed_array_element(const char *type, char *out, size_t out_len) {
+  if (!type || type[0] != '[' || !out || out_len == 0) return false;
+  const char *close = strchr(type, ']');
+  if (!close || close[1] == 0) return false;
+  const char *element = close + 1;
+  size_t len = strlen(element);
+  if (len >= out_len) return false;
+  memcpy(out, element, len);
+  out[len] = 0;
+  return true;
+}
+
+static bool graph_semantics_fixed_array_matches_span(const char *actual, const char *expected) {
+  char expected_element[128];
+  char actual_element[128];
+  bool expected_span = graph_semantics_span_type_element(expected, "Span", expected_element, sizeof(expected_element)) ||
+                       graph_semantics_span_type_element(expected, "MutSpan", expected_element, sizeof(expected_element));
+  return expected_span &&
+         graph_semantics_fixed_array_element(actual, actual_element, sizeof(actual_element)) &&
+         graph_semantics_text_eq(actual_element, expected_element);
+}
+
+static bool graph_semantics_copy_text(char *out, size_t out_len, const char *text) {
+  if (!out || out_len == 0 || !text) return false;
+  size_t len = strlen(text);
+  if (len >= out_len) return false;
+  memcpy(out, text, len);
+  out[len] = 0;
+  return true;
 }
 
 static const ZProgramGraphEdge *graph_semantics_owner_edge(const ZProgramGraph *graph, const char *node_id) {
@@ -210,6 +316,17 @@ static void graph_semantics_append_std_arg_types_json(ZBuf *buf, const ZStdHelpe
   zbuf_append(buf, "]");
 }
 
+static void graph_semantics_append_c_arg_types_json(ZBuf *buf, const ZGraphSemanticContract *contract) {
+  zbuf_append(buf, "[");
+  bool first = true;
+  for (int i = 0; contract && i < contract->c_arg_count && i < (int)Z_STD_HELPER_MAX_ARGS; i++) {
+    if (!first) zbuf_append(buf, ",");
+    graph_semantics_append_quoted(buf, contract->c_arg_types[i]);
+    first = false;
+  }
+  zbuf_append(buf, "]");
+}
+
 static void graph_semantics_append_function_arg_types_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphNode *function, bool skip_first) {
   zbuf_append(buf, "[");
   bool first = true;
@@ -224,7 +341,39 @@ static void graph_semantics_append_function_arg_types_json(ZBuf *buf, const ZPro
   zbuf_append(buf, "]");
 }
 
-static void graph_semantics_append_args_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphSourceRangeContext *sources, const ZProgramGraphNode *call) {
+static const ZProgramGraphNode *graph_semantics_contract_param_node(const ZProgramGraph *graph, const ZGraphSemanticContract *contract, size_t order, bool implicit_receiver) {
+  if (!contract || !contract->target_function) return NULL;
+  size_t param_order = order + (implicit_receiver ? 1 : 0);
+  return graph_semantics_child(graph, contract->target_function, "param", param_order);
+}
+
+static const char *graph_semantics_contract_expected_arg_type(const ZProgramGraph *graph, const ZGraphSemanticContract *contract, size_t order, bool implicit_receiver) {
+  const ZProgramGraphNode *param = graph_semantics_contract_param_node(graph, contract, order, implicit_receiver);
+  if (param && graph_semantics_text_present(param->type)) return param->type;
+  if (contract && contract->helper && order < Z_STD_HELPER_MAX_ARGS && order < (size_t)contract->helper->arg_count) return contract->helper->arg_types[order];
+  if (contract && order < Z_STD_HELPER_MAX_ARGS && contract->c_arg_count >= 0 && order < (size_t)contract->c_arg_count) return contract->c_arg_types[order];
+  return "";
+}
+
+static const char *graph_semantics_effective_arg_type(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const ZGraphSemanticContract *contract, const ZProgramGraphNode *arg, size_t order, bool implicit_receiver) {
+  const char *actual = graph_semantics_node_semantic_type(graph, resolution, arg);
+  const char *expected = graph_semantics_contract_expected_arg_type(graph, contract, order, implicit_receiver);
+  if (!graph_semantics_text_present(actual) && graph_semantics_text_present(expected)) return expected;
+  if (graph_semantics_fixed_array_matches_span(actual, expected)) return expected;
+  return actual;
+}
+
+static const char *graph_semantics_effective_arg_type_id(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const ZGraphSemanticContract *contract, const ZProgramGraphNode *arg, size_t order, bool implicit_receiver) {
+  const char *actual = graph_semantics_node_semantic_type(graph, resolution, arg);
+  const char *expected = graph_semantics_contract_expected_arg_type(graph, contract, order, implicit_receiver);
+  if (graph_semantics_fixed_array_matches_span(actual, expected)) {
+    const ZProgramGraphNode *param = graph_semantics_contract_param_node(graph, contract, order, implicit_receiver);
+    return param && param->type_id ? param->type_id : "";
+  }
+  return graph_semantics_node_semantic_type_id(graph, resolution, arg);
+}
+
+static void graph_semantics_append_args_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphSourceRangeContext *sources, const ZProgramGraphResolutionFacts *resolution, const ZGraphSemanticContract *contract, bool implicit_receiver, const ZProgramGraphNode *call) {
   zbuf_append(buf, "[");
   bool first = true;
   size_t count = graph_semantics_child_count(graph, call, "arg");
@@ -237,9 +386,9 @@ static void graph_semantics_append_args_json(ZBuf *buf, const ZProgramGraph *gra
     zbuf_append(buf, ",\"kind\":");
     graph_semantics_append_quoted(buf, z_program_graph_node_kind_name(arg->kind));
     zbuf_append(buf, ",\"type\":");
-    graph_semantics_append_quoted(buf, arg->type);
+    graph_semantics_append_quoted(buf, graph_semantics_effective_arg_type(graph, resolution, contract, arg, order, implicit_receiver));
     zbuf_append(buf, ",\"typeId\":");
-    graph_semantics_append_quoted(buf, arg->type_id);
+    graph_semantics_append_quoted(buf, graph_semantics_effective_arg_type_id(graph, resolution, contract, arg, order, implicit_receiver));
     zbuf_appendf(buf, ",\"order\":%zu,\"sourceRange\":", order);
     graph_semantics_append_source_range_json(buf, graph, sources, arg);
     zbuf_append(buf, "}");
@@ -287,7 +436,7 @@ static bool graph_semantics_call_has_implicit_receiver(const ZProgramGraph *grap
   return !graph_semantics_reference_is_type_like(base_ref);
 }
 
-static void graph_semantics_append_receiver_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphSourceRangeContext *sources, const ZProgramGraphNode *call, bool implicit_receiver) {
+static void graph_semantics_append_receiver_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphSourceRangeContext *sources, const ZProgramGraphResolutionFacts *resolution, const ZProgramGraphNode *call, bool implicit_receiver) {
   if (!implicit_receiver) {
     zbuf_append(buf, "null");
     return;
@@ -298,9 +447,9 @@ static void graph_semantics_append_receiver_json(ZBuf *buf, const ZProgramGraph 
   zbuf_append(buf, ",\"kind\":");
   graph_semantics_append_quoted(buf, receiver ? z_program_graph_node_kind_name(receiver->kind) : "");
   zbuf_append(buf, ",\"type\":");
-  graph_semantics_append_quoted(buf, receiver ? receiver->type : "");
+  graph_semantics_append_quoted(buf, graph_semantics_node_semantic_type(graph, resolution, receiver));
   zbuf_append(buf, ",\"typeId\":");
-  graph_semantics_append_quoted(buf, receiver ? receiver->type_id : "");
+  graph_semantics_append_quoted(buf, graph_semantics_node_semantic_type_id(graph, resolution, receiver));
   zbuf_append(buf, ",\"implicit\":true,\"sourceRange\":");
   graph_semantics_append_source_range_json(buf, graph, sources, receiver);
   zbuf_append(buf, "}");
@@ -320,18 +469,56 @@ static bool graph_semantics_contract_world_write(const ZProgramGraphNode *call, 
          graph_semantics_text_eq(target->type, "World");
 }
 
+static const char *graph_semantics_c_import_symbol(const ZProgramGraphNode *c_import, const ZProgramGraphResolutionReference *ref) {
+  const char *qualified = ref ? ref->qualified_name : NULL;
+  const char *alias = c_import ? c_import->name : NULL;
+  if (!graph_semantics_text_present(qualified)) return "";
+  if (graph_semantics_text_present(alias)) {
+    size_t alias_len = strlen(alias);
+    if (strncmp(qualified, alias, alias_len) == 0 && qualified[alias_len] == '.') return qualified + alias_len + 1;
+  }
+  const char *dot = strrchr(qualified, '.');
+  return dot && dot[1] ? dot + 1 : qualified;
+}
+
+static void graph_semantics_load_c_import_contract(ZGraphSemanticContract *contract) {
+  if (!contract || !contract->c_import || !contract->reference) return;
+  const char *header_path = contract->c_import->value;
+  const char *symbol = graph_semantics_c_import_symbol(contract->c_import, contract->reference);
+  if (!graph_semantics_text_present(header_path) || !graph_semantics_text_present(symbol)) return;
+  ZDiag diag = {0};
+  char *header = z_read_file(header_path, &diag);
+  if (!header) return;
+  ZCImportFunctionVec functions = {0};
+  z_c_header_parse_functions(header, &functions);
+  free(header);
+  for (size_t i = 0; i < functions.len; i++) {
+    ZCImportFunction *function = &functions.items[i];
+    if (!graph_semantics_text_eq(function->name, symbol)) continue;
+    graph_semantics_copy_text(contract->c_return_type, sizeof(contract->c_return_type), function->return_zero_type);
+    contract->c_arg_count = function->param_len > Z_STD_HELPER_MAX_ARGS ? Z_STD_HELPER_MAX_ARGS : (int)function->param_len;
+    for (int arg = 0; arg < contract->c_arg_count; arg++) {
+      graph_semantics_copy_text(contract->c_arg_types[arg], sizeof(contract->c_arg_types[arg]), function->params[arg].zero_type);
+    }
+    break;
+  }
+  z_c_import_function_vec_free(&functions);
+}
+
 static ZGraphSemanticContract graph_semantics_contract(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const ZProgramGraphNode *call) {
   ZGraphSemanticContract contract = {0};
+  contract.c_arg_count = -1;
   const ZProgramGraphResolutionReference *ref = graph_semantics_call_reference(resolution, call);
   contract.reference = ref;
   if (!ref) return contract;
   contract.target_node = graph_semantics_node_by_id(graph, ref->target_node);
-  if (graph_semantics_reference_target_kind(ref, "stdlib") || graph_semantics_reference_target_kind(ref, "sourceBackedStdlib")) {
+  if (graph_semantics_reference_target_kind(ref, "stdlib") || graph_semantics_reference_target_kind(ref, "graphBackedStdlib")) {
     contract.helper = z_std_helper_find(ref->qualified_name);
   }
-  if (graph_semantics_reference_target_kind(ref, "sourceBackedStdlib")) contract.source_module = z_std_source_module_for_public_call(ref->qualified_name);
+  if (graph_semantics_reference_target_kind(ref, "graphBackedStdlib")) contract.source_module = z_std_source_module_for_public_call(ref->qualified_name);
   if (graph_semantics_reference_target_kind(ref, "cFunction") || (contract.target_node && contract.target_node->kind == Z_PROGRAM_GRAPH_NODE_C_IMPORT)) {
     contract.c_import = contract.target_node;
+    graph_semantics_load_c_import_contract(&contract);
   }
   if (contract.target_node && contract.target_node->kind == Z_PROGRAM_GRAPH_NODE_FUNCTION) contract.target_function = contract.target_node;
   contract.world_binding = graph_semantics_contract_world_write(call, ref, contract.target_node) ? contract.target_node : NULL;
@@ -352,7 +539,7 @@ static const char *graph_semantics_contract_kind(const ZGraphSemanticContract *c
   if (!contract) return "language";
   if (contract->world_write) return "worldStreamWrite";
   if (contract->c_import) return "cAbi";
-  if (contract->source_module) return "sourceBackedStdlib";
+  if (contract->source_module) return "graphBackedStdlib";
   if (contract->helper) return "stdlib";
   if (contract->reference && graph_semantics_text_present(contract->reference->target_kind)) return contract->reference->target_kind;
   return "language";
@@ -375,6 +562,14 @@ static const char *graph_semantics_contract_target_support(const ZGraphSemanticC
 static const char *graph_semantics_contract_allocation(const ZGraphSemanticContract *contract) {
   if (!contract || !contract->helper) return "";
   return contract->helper->allocation_behavior;
+}
+
+static const char *graph_semantics_contract_return_type(const ZGraphSemanticContract *contract, const ZProgramGraphNode *call) {
+  if (contract && contract->world_write) return "Void";
+  if (contract && contract->helper && contract->helper->return_type) return contract->helper->return_type;
+  if (contract && graph_semantics_text_present(contract->c_return_type)) return contract->c_return_type;
+  if (contract && contract->target_function) return contract->target_function->type;
+  return call && call->type ? call->type : "";
 }
 
 static bool graph_semantics_contract_has_target_requirement(const ZGraphSemanticContract *contract) {
@@ -462,7 +657,7 @@ static void graph_semantics_append_contract_json(ZBuf *buf, const ZProgramGraph 
   zbuf_append(buf, ",\"symbolId\":");
   graph_semantics_append_contract_symbol_json(buf, &contract, contract.reference ? contract.reference->qualified_name : (call ? call->name : ""));
   zbuf_append(buf, ",\"returnType\":");
-  graph_semantics_append_quoted(buf, contract.helper && contract.helper->return_type ? contract.helper->return_type : (contract.target_function ? contract.target_function->type : call ? call->type : ""));
+  graph_semantics_append_quoted(buf, graph_semantics_contract_return_type(&contract, call));
   zbuf_append(buf, ",\"capability\":");
   graph_semantics_append_quoted(buf, graph_semantics_contract_capability(&contract));
   zbuf_append(buf, ",\"targetSupport\":");
@@ -473,6 +668,7 @@ static void graph_semantics_append_contract_json(ZBuf *buf, const ZProgramGraph 
   graph_semantics_append_quoted(buf, contract.source_module ? contract.source_module->module : "");
   zbuf_append(buf, ",\"expectedArgCount\":");
   if (contract.helper && contract.helper->arg_count >= 0) zbuf_appendf(buf, "%d", contract.helper->arg_count);
+  else if (contract.c_arg_count >= 0) zbuf_appendf(buf, "%d", contract.c_arg_count);
   else if (contract.target_function) {
     size_t count = graph_semantics_child_count(graph, contract.target_function, "param");
     zbuf_appendf(buf, "%zu", implicit_receiver && count > 0 ? count - 1 : count);
@@ -480,6 +676,7 @@ static void graph_semantics_append_contract_json(ZBuf *buf, const ZProgramGraph 
   else zbuf_append(buf, "null");
   zbuf_append(buf, ",\"expectedArgTypes\":");
   if (contract.helper) graph_semantics_append_std_arg_types_json(buf, contract.helper);
+  else if (contract.c_arg_count >= 0) graph_semantics_append_c_arg_types_json(buf, &contract);
   else if (contract.target_function) graph_semantics_append_function_arg_types_json(buf, graph, contract.target_function, implicit_receiver);
   else zbuf_append(buf, "[]");
   zbuf_append(buf, ",\"errors\":");
@@ -559,15 +756,25 @@ static bool graph_semantics_node_is_user_type_decl(const ZProgramGraphNode *node
           node->kind == Z_PROGRAM_GRAPH_NODE_CHOICE);
 }
 
-static bool graph_semantics_graph_declares_type_name(const ZProgramGraph *graph, const char *name) {
+static bool graph_semantics_node_is_stdlib_type_decl(const ZProgramGraphNode *node) {
+  return graph_semantics_node_is_user_type_decl(node) &&
+         (graph_semantics_text_starts_with(node->symbol_id, "symbol:std.") ||
+          graph_semantics_text_starts_with(node->path, "std/"));
+}
+
+static bool graph_semantics_graph_declares_non_std_type_name(const ZProgramGraph *graph, const char *name) {
   for (size_t i = 0; graph && name && i < graph->node_len; i++) {
     const ZProgramGraphNode *node = &graph->nodes[i];
-    if (graph_semantics_node_is_user_type_decl(node) && graph_semantics_text_eq(node->name, name)) return true;
+    if (graph_semantics_node_is_user_type_decl(node) &&
+        !graph_semantics_node_is_stdlib_type_decl(node) &&
+        graph_semantics_text_eq(node->name, name)) {
+      return true;
+    }
   }
   return false;
 }
 
-static bool graph_semantics_type_id_resolves_to_user_type_name(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const char *type_id, const char *name) {
+static bool graph_semantics_type_id_resolves_to_non_std_type_name(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const char *type_id, const char *name) {
   if (!graph_semantics_text_present(type_id) || !graph_semantics_text_present(name)) return false;
   for (size_t i = 0; resolution && i < resolution->reference_len; i++) {
     const ZProgramGraphResolutionReference *ref = &resolution->references[i];
@@ -575,7 +782,7 @@ static bool graph_semantics_type_id_resolves_to_user_type_name(const ZProgramGra
     const ZProgramGraphNode *type_ref = graph_semantics_node_by_id(graph, ref->node_id);
     if (!type_ref || !graph_semantics_text_eq(type_ref->type_id, type_id)) continue;
     const ZProgramGraphNode *target = graph_semantics_node_by_id(graph, ref->target_node);
-    if (graph_semantics_node_is_user_type_decl(target)) return true;
+    if (graph_semantics_node_is_user_type_decl(target) && !graph_semantics_node_is_stdlib_type_decl(target)) return true;
   }
   return false;
 }
@@ -604,8 +811,8 @@ static bool graph_semantics_type_token_is_owned_wrapped(const char *type, const 
 }
 
 static bool graph_semantics_resource_name_shadowed(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const char *type, const char *type_id, const char *name, const char *token_start) {
-  if (!graph_semantics_graph_declares_type_name(graph, name)) return false;
-  if (graph_semantics_type_id_resolves_to_user_type_name(graph, resolution, type_id, name)) return true;
+  if (!graph_semantics_graph_declares_non_std_type_name(graph, name)) return false;
+  if (graph_semantics_type_id_resolves_to_non_std_type_name(graph, resolution, type_id, name)) return true;
   if (graph_semantics_text_eq(type, name)) return true;
   return !graph_semantics_type_token_is_owned_wrapped(type, token_start);
 }
@@ -621,6 +828,8 @@ static bool graph_semantics_known_resource_type_name(const char *name) {
     "GeneralAlloc",
     "BufferedReader",
     "BufferedWriter",
+    "FixedReader",
+    "FixedWriter",
     "Fs",
     "World",
     "WorldStream",
@@ -762,6 +971,19 @@ static size_t graph_semantics_target_requirement_count(const ZProgramGraph *grap
   return count;
 }
 
+void z_program_graph_collect_capabilities(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, ZProgramGraphCapabilitySummary *out) {
+  if (!out) return;
+  *out = (ZProgramGraphCapabilitySummary){0};
+  for (size_t i = 0; graph && i < graph->node_len; i++) {
+    const ZProgramGraphNode *node = &graph->nodes[i];
+    if (node->kind == Z_PROGRAM_GRAPH_NODE_PARAM) graph_semantics_capability_set_for_type(out, node->type, node);
+    if (!graph_semantics_node_is_call(node) || !graph_semantics_call_reference(resolution, node)) continue;
+    ZGraphSemanticContract contract = graph_semantics_contract(graph, resolution, node);
+    if (!contract.present) continue;
+    graph_semantics_capability_set(out, graph_semantics_contract_capability(&contract), node);
+  }
+}
+
 static size_t graph_semantics_repair_fact_count(const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution) {
   size_t count = 0;
   for (size_t i = 0; graph && i < graph->node_len; i++) {
@@ -877,13 +1099,13 @@ static void graph_semantics_append_calls_json(ZBuf *buf, const ZProgramGraph *gr
     zbuf_append(buf, ",\"qualifiedName\":");
     graph_semantics_append_quoted(buf, ref->qualified_name);
     zbuf_append(buf, ",\"returnType\":");
-    graph_semantics_append_quoted(buf, node->type);
+    graph_semantics_append_quoted(buf, graph_semantics_contract_return_type(&contract, node));
     zbuf_append(buf, ",\"returnTypeId\":");
     graph_semantics_append_quoted(buf, node->type_id);
     zbuf_append(buf, ",\"receiver\":");
-    graph_semantics_append_receiver_json(buf, graph, sources, node, implicit_receiver);
+    graph_semantics_append_receiver_json(buf, graph, sources, resolution, node, implicit_receiver);
     zbuf_append(buf, ",\"args\":");
-    graph_semantics_append_args_json(buf, graph, sources, node);
+    graph_semantics_append_args_json(buf, graph, sources, resolution, &contract, implicit_receiver, node);
     zbuf_append(buf, ",\"contract\":");
     graph_semantics_append_contract_json(buf, graph, resolution, node, checked, implicit_receiver, &fallible, &contract);
     zbuf_append(buf, ",\"resolution\":");
@@ -948,7 +1170,21 @@ static void graph_semantics_append_ownership_json(ZBuf *buf, const ZProgramGraph
   zbuf_append(buf, "]");
 }
 
-static void graph_semantics_append_borrowing_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphSourceRangeContext *sources) {
+static bool graph_semantics_borrow_type(char *out, size_t out_len, const ZProgramGraph *graph, const ZProgramGraphResolutionFacts *resolution, const ZProgramGraphNode *borrow, const ZProgramGraphNode *target) {
+  if (!out || out_len == 0) return false;
+  out[0] = 0;
+  if (!borrow) return false;
+  if (graph_semantics_text_present(borrow->type)) return graph_semantics_copy_text(out, out_len, borrow->type);
+  if (borrow->kind != Z_PROGRAM_GRAPH_NODE_BORROW || !target) return false;
+  const char *target_type = graph_semantics_node_semantic_type(graph, resolution, target);
+  if (!graph_semantics_text_present(target_type)) return false;
+  char owned_inner[160];
+  if (graph_semantics_span_type_element(target_type, "owned", owned_inner, sizeof(owned_inner))) target_type = owned_inner;
+  int written = snprintf(out, out_len, "%s<%s>", borrow->is_mutable ? "mutref" : "ref", target_type);
+  return written > 0 && (size_t)written < out_len;
+}
+
+static void graph_semantics_append_borrowing_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphSourceRangeContext *sources, const ZProgramGraphResolutionFacts *resolution) {
   zbuf_append(buf, "[");
   bool first = true;
   for (size_t i = 0; graph && i < graph->node_len; i++) {
@@ -956,15 +1192,17 @@ static void graph_semantics_append_borrowing_json(ZBuf *buf, const ZProgramGraph
     if (node->kind != Z_PROGRAM_GRAPH_NODE_BORROW && !graph_semantics_type_is_borrow(node->type)) continue;
     if (!first) zbuf_append(buf, ",");
     const ZProgramGraphNode *target = node->kind == Z_PROGRAM_GRAPH_NODE_BORROW ? graph_semantics_child(graph, node, "left", 0) : NULL;
+    char borrow_type[192];
+    if (!graph_semantics_borrow_type(borrow_type, sizeof(borrow_type), graph, resolution, node, target)) borrow_type[0] = 0;
     zbuf_append(buf, "{\"node\":");
     graph_semantics_append_quoted(buf, node->id);
     zbuf_append(buf, ",\"kind\":");
     graph_semantics_append_quoted(buf, z_program_graph_node_kind_name(node->kind));
     zbuf_append(buf, ",\"type\":");
-    graph_semantics_append_quoted(buf, node->type);
+    graph_semantics_append_quoted(buf, borrow_type);
     zbuf_append(buf, ",\"borrowKind\":");
-    graph_semantics_append_quoted(buf, graph_semantics_ownership_kind(graph, NULL, node->type, node->type_id));
-    zbuf_appendf(buf, ",\"mutable\":%s,\"target\":", (node->is_mutable || graph_semantics_text_contains(node->type, "mut")) ? "true" : "false");
+    graph_semantics_append_quoted(buf, graph_semantics_ownership_kind(graph, resolution, borrow_type, node->type_id));
+    zbuf_appendf(buf, ",\"mutable\":%s,\"target\":", (node->is_mutable || graph_semantics_text_contains(borrow_type, "mut")) ? "true" : "false");
     graph_semantics_append_quoted(buf, target ? target->id : "");
     zbuf_append(buf, ",\"sourceRange\":");
     graph_semantics_append_source_range_json(buf, graph, sources, node);
@@ -1108,7 +1346,7 @@ void z_program_graph_append_semantics_json(ZBuf *buf, const ZProgramGraph *graph
   zbuf_append(buf, ",\"ownership\":");
   graph_semantics_append_ownership_json(buf, graph, &sources, &resolution);
   zbuf_append(buf, ",\"borrowing\":");
-  graph_semantics_append_borrowing_json(buf, graph, &sources);
+  graph_semantics_append_borrowing_json(buf, graph, &sources, &resolution);
   zbuf_append(buf, ",\"resources\":");
   graph_semantics_append_resources_json(buf, graph, &sources, &resolution);
   zbuf_append(buf, ",\"targetRequirements\":");

@@ -1,0 +1,79 @@
+fn time_date_checks() -> Bool {
+    return std.time.isRfc3339Date("2026-06-11") && std.time.isRfc3339Date("2000-02-29") && !std.time.isRfc3339Date("1900-02-29") && !std.time.isRfc3339Date("2023-02-29") && !std.time.isRfc3339Date("2024-04-31") && !std.time.isRfc3339Date("2024-13-01") && !std.time.isRfc3339Date("2024-1-01")
+}
+
+fn time_time_checks() -> Bool {
+    return std.time.isRfc3339Time("23:59:59Z") && std.time.isRfc3339Time("12:30:45.123+05:30") && std.time.isRfc3339Time("12:30:45z") && !std.time.isRfc3339Time("12:30:45") && !std.time.isRfc3339Time("24:00:00Z") && !std.time.isRfc3339Time("12:30:45.Z") && !std.time.isRfc3339Time("12:30:45+24:00")
+}
+
+fn time_leap_second_checks() -> Bool {
+    if !std.time.isRfc3339Time("23:59:60Z") || !std.time.isRfc3339Time("00:29:60+00:30") {
+        return false
+    }
+    if std.time.isRfc3339Time("23:59:60-01:00") || std.time.isRfc3339Time("12:00:60Z") {
+        return false
+    }
+    return std.time.isRfc3339Time("15:59:60-08:00") && std.time.isRfc3339Time("00:59:60+01:00") && !std.time.isRfc3339Time("23:59:60+00:01")
+}
+
+fn time_datetime_checks() -> Bool {
+    return std.time.isRfc3339DateTime("2026-06-11T12:30:45Z") && std.time.isRfc3339DateTime("2026-06-11t12:30:45z") && std.time.isRfc3339DateTime("1990-12-31T15:59:60-08:00") && !std.time.isRfc3339DateTime("1990-12-31T23:59:60-01:00") && !std.time.isRfc3339DateTime("2026-06-11 12:30:45Z") && !std.time.isRfc3339DateTime("2023-02-29T00:00:00Z")
+}
+
+fn time_epoch_checks() -> Bool {
+    if std.time.parseRfc3339DateTimeOr("1970-01-01T00:00:00Z", -1) != 0 {
+        return false
+    }
+    if std.time.parseRfc3339DateTimeOr("2000-01-01T00:00:00Z", -1) != 946684800 {
+        return false
+    }
+    if std.time.parseRfc3339DateTimeOr("2026-06-11T15:30:00-05:00", -1) != 1781209800 {
+        return false
+    }
+    if std.time.parseRfc3339DateTimeOr("1970-01-01T00:00:00+01:00", 0) != -3600 {
+        return false
+    }
+    return std.time.parseRfc3339DateTimeOr("not a datetime", 777) == 777
+}
+
+fn time_calendar_checks() -> Bool {
+    return std.time.isLeapYear(2000) && !std.time.isLeapYear(1900) && std.time.isLeapYear(2024) && std.time.daysInMonth(2024, 2) == 29 && std.time.daysInMonth(2023, 2) == 28 && std.time.daysInMonth(2024, 4) == 30 && std.time.daysInMonth(2024, 13) == 0
+}
+
+fn time_duration_format_checks() -> Bool {
+    var ns_storage: [32]u8 = [0_u8; 32]
+    var ms_storage: [32]u8 = [0_u8; 32]
+    var big_ms_storage: [32]u8 = [0_u8; 32]
+    var second_storage: [32]u8 = [0_u8; 32]
+    let ns_text: Maybe<Span<u8>> = std.time.writeDurationNs(ns_storage, std.time.ns(42_i64))
+    let ms_text: Maybe<Span<u8>> = std.time.writeDurationMs(ms_storage, std.time.add(std.time.seconds(1), std.time.ms(250)))
+    let big_ms_text: Maybe<Span<u8>> = std.time.writeDurationMs(big_ms_storage, std.time.ns(3000000000000000_i64))
+    let second_text: Maybe<Span<u8>> = std.time.writeDurationSeconds(second_storage, std.time.minutes(2))
+    if !ns_text.has || !std.mem.eql(ns_text.value, "42ns") {
+        return false
+    }
+    if !ms_text.has || !std.mem.eql(ms_text.value, "1250ms") {
+        return false
+    }
+    if !big_ms_text.has || !std.mem.eql(big_ms_text.value, "3000000000ms") {
+        return false
+    }
+    return second_text.has && std.mem.eql(second_text.value, "120s")
+}
+
+fn time_deadline_checks() -> Bool {
+    let start: Duration = std.time.seconds(10)
+    let timeout: Duration = std.time.ms(250)
+    let deadline: Duration = std.time.deadlineAfter(start, timeout)
+    let remaining: Duration = std.time.remainingUntil(deadline, std.time.seconds(10))
+    let past: Duration = std.time.remainingUntil(deadline, std.time.seconds(11))
+    return std.time.asMsFloor(deadline) == 10250 && (std.time.asMsFloor(remaining) == 250 && std.time.isZero(past)) && (!std.time.deadlineExpired(deadline, std.time.seconds(10)) && std.time.deadlineExpired(deadline, deadline))
+}
+
+pub fn main(world: World) -> Void raises {
+    if time_date_checks() && (time_time_checks() && time_leap_second_checks()) && (time_datetime_checks() && (time_epoch_checks() && (time_calendar_checks() && (time_duration_format_checks() && time_deadline_checks())))) {
+        check world.out.write("std time rfc3339 ok\n")
+    } else {
+        check world.out.write("std time rfc3339 failed\n")
+    }
+}

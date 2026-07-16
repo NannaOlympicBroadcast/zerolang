@@ -15,15 +15,15 @@ fn __zero_std_fs_read_file(fs: Fs, path: String, buffer: MutSpan<u8>) -> Maybe<u
                 total = total + count.value
             }
         }
-        if ok && !done {
-            var extra: [1]u8 = [0_u8]
+        var extra: [64]u8 = [0_u8; 64]
+        while ok && !done {
             let count: Maybe<usize> = std.fs.read(&mut file, extra)
             if !count.has {
                 ok = false
             } else if count.value == 0 {
                 done = true
             } else {
-                ok = false
+                total = total + count.value
             }
         }
         std.fs.close(&mut file)
@@ -36,14 +36,13 @@ fn __zero_std_fs_read_file(fs: Fs, path: String, buffer: MutSpan<u8>) -> Maybe<u
 }
 
 fn __zero_std_fs_write_file(fs: Fs, path: String, bytes: Span<u8>) -> Bool {
-    let created: Maybe<owned<File>> = std.fs.create(fs, path)
-    if created.has {
-        var file: owned<File> = created.value
-        let ok: Bool = std.fs.writeAll(&mut file, bytes)
-        std.fs.close(&mut file)
-        return ok
-    }
-    return false
+    let count: Maybe<usize> = std.fs.writeBytes(path, bytes)
+    return count.has && count.value == std.mem.len(bytes)
+}
+
+fn __zero_std_fs_append_file(fs: Fs, path: String, bytes: Span<u8>) -> Bool {
+    let count: Maybe<usize> = std.fs.appendBytes(path, bytes)
+    return count.has && count.value == std.mem.len(bytes)
 }
 
 fn __zero_std_fs_copy_file(from_path: String, to_path: String, buffer: MutSpan<u8>) -> Bool {
@@ -80,4 +79,47 @@ fn __zero_std_fs_copy_file(from_path: String, to_path: String, buffer: MutSpan<u
     std.fs.close(&mut src)
     std.fs.close(&mut dst)
     return ok
+}
+
+fn __zero_std_fs_file_size(fs: Fs, path: String) -> Maybe<usize> {
+    let opened: Maybe<owned<File>> = std.fs.open(fs, path)
+    if opened.has {
+        var file: owned<File> = opened.value
+        let len: Maybe<usize> = std.fs.fileLen(&mut file)
+        std.fs.close(&mut file)
+        return len
+    }
+    return null
+}
+
+fn __zero_std_fs_is_file(path: String) -> Bool {
+    if std.fs.isDir(path) {
+        return false
+    }
+    let fs: Fs = std.fs.host()
+    let size: Maybe<usize> = std.fs.fileSize(fs, path)
+    return size.has
+}
+
+fn __zero_std_fs_ensure_dir(path: String) -> Bool {
+    if std.fs.isDir(path) {
+        return true
+    }
+    return std.fs.makeDir(path)
+}
+
+fn __zero_std_fs_read_file_bytes(fs: Fs, path: String, buffer: MutSpan<u8>) -> Maybe<Span<u8>> {
+    let count: Maybe<usize> = std.fs.readBytes(path, buffer)
+    if count.has && count.value <= std.mem.len(buffer) {
+        return buffer[..count.value]
+    }
+    return null
+}
+
+fn __zero_std_fs_read_file_equals(fs: Fs, path: String, buffer: MutSpan<u8>, expected: Span<u8>) -> Bool {
+    let bytes: Maybe<Span<u8>> = std.fs.readFileBytes(fs, path, buffer)
+    if bytes.has {
+        return std.mem.eqlBytes(bytes.value, expected)
+    }
+    return false
 }

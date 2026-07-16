@@ -45,7 +45,7 @@ static const char *fallback_manifest =
 "libcMode = \"bundled-libc\"\n"
 "exeSuffix = \"\"\n"
 "zigTarget = \"x86_64-linux-musl\"\n"
-"capabilities = [\"memory\", \"stdio\", \"args\", \"env\", \"fs\", \"time\", \"rand\"]\n"
+"capabilities = [\"memory\", \"stdio\", \"args\", \"env\", \"fs\", \"time\", \"rand\", \"proc\"]\n"
 "[[target]]\n"
 "name = \"linux-musl-arm64\"\n"
 "aliases = [\"aarch64-linux-musl\"]\n"
@@ -124,6 +124,49 @@ static char *trim_copy(const char *start, size_t len) {
   return z_strndup(start, len);
 }
 
+static bool target_text_equals(const char *left, const char *right) {
+  return left && right && strcmp(left, right) == 0;
+}
+
+static bool manifest_key_equals(const char *line, const char *key) {
+  if (!line || !key) return false;
+  while (*key && *line == *key) {
+    line++;
+    key++;
+  }
+  if (*key) return false;
+  while (*line && isspace((unsigned char)*line)) line++;
+  return *line == '=';
+}
+
+static bool manifest_list_token_equals(const char *start, const char *end, const char *token) {
+  size_t token_len = token ? strlen(token) : 0;
+  return token_len > 0 && start && end && start <= end && (size_t)(end - start) == token_len && memcmp(start, token, token_len) == 0;
+}
+
+static bool manifest_list_contains_token(const char *list, const char *token) {
+  if (!list || !token || !token[0]) return false;
+  const char *cursor = list;
+  while (*cursor) {
+    while (*cursor && (isspace((unsigned char)*cursor) || *cursor == ',')) cursor++;
+    const char *start = cursor;
+    const char *end = cursor;
+    if (*cursor == '"') {
+      start = ++cursor;
+      while (*cursor && *cursor != '"') cursor++;
+      end = cursor;
+      if (*cursor == '"') cursor++;
+    } else {
+      while (*cursor && *cursor != ',') cursor++;
+      end = cursor;
+      while (end > start && isspace((unsigned char)end[-1])) end--;
+    }
+    if (manifest_list_token_equals(start, end, token)) return true;
+    while (*cursor && *cursor != ',') cursor++;
+  }
+  return false;
+}
+
 static char *manifest_value(const char *line) {
   const char *eq = strchr(line, '=');
   if (!eq) return z_strdup("");
@@ -138,19 +181,29 @@ static char *manifest_value(const char *line) {
 
 static void set_target_field(ZTargetInfo *target, const char *line) {
   char *value = manifest_value(line);
-  if (strncmp(line, "name", 4) == 0) target->name = value;
-  else if (strncmp(line, "aliases", 7) == 0) target->aliases = value;
-  else if (strncmp(line, "os", 2) == 0) target->os = value;
-  else if (strncmp(line, "arch", 4) == 0) target->arch = value;
-  else if (strncmp(line, "abi", 3) == 0) target->abi = value;
-  else if (strncmp(line, "libcMode", 8) == 0) target->libc_mode = value;
-  else if (strncmp(line, "libc", 4) == 0) target->libc = value;
-  else if (strncmp(line, "exeSuffix", 9) == 0) target->exe_suffix = value;
-  else if (strncmp(line, "zigTarget", 9) == 0) target->zig_target = value;
-  else if (strncmp(line, "objectFormat", 12) == 0) target->object_format = value;
-  else if (strncmp(line, "linker", 6) == 0) target->linker = value;
-  else if (strncmp(line, "capabilities", 12) == 0) target->capabilities = value;
-  else free(value);
+  struct {
+    const char *key;
+    const char **slot;
+  } fields[] = {
+    {"name", &target->name},
+    {"aliases", &target->aliases},
+    {"os", &target->os},
+    {"arch", &target->arch},
+    {"abi", &target->abi},
+    {"libc", &target->libc},
+    {"libcMode", &target->libc_mode},
+    {"exeSuffix", &target->exe_suffix},
+    {"zigTarget", &target->zig_target},
+    {"objectFormat", &target->object_format},
+    {"linker", &target->linker},
+    {"capabilities", &target->capabilities},
+  };
+  for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+    if (!manifest_key_equals(line, fields[i].key)) continue;
+    *fields[i].slot = value;
+    return;
+  }
+  free(value);
 }
 
 static void push_target(ZTargetInfo current) {
@@ -176,7 +229,7 @@ static void load_targets_from_text(const char *text) {
     const char *line_end = strchr(cursor, '\n');
     size_t len = line_end ? (size_t)(line_end - cursor) : strlen(cursor);
     char *line = trim_copy(cursor, len);
-    if (strcmp(line, "[[target]]") == 0) {
+    if (target_text_equals(line, "[[target]]")) {
       if (in_target) push_target(current);
       current = (ZTargetInfo){0};
       in_target = true;
@@ -227,37 +280,36 @@ const ZTargetInfo *z_target_at(size_t index) {
 
 const ZTargetInfo *z_find_target(const char *target) {
   ensure_targets_loaded();
-  const char *name = target && strcmp(target, "host") != 0 ? target : z_host_target();
+  const char *name = target && !target_text_equals(target, "host") ? target : z_host_target();
   for (size_t i = 0; i < target_count; i++) {
-    if (strcmp(targets[i].name, name) == 0) return &targets[i];
-    if (targets[i].aliases && strstr(targets[i].aliases, name)) return &targets[i];
+    if (target_text_equals(targets[i].name, name)) return &targets[i];
+    if (manifest_list_contains_token(targets[i].aliases, name)) return &targets[i];
   }
   return NULL;
 }
 
 bool z_is_known_target(const char *target) {
-  if (!target || strcmp(target, "host") == 0) return true;
+  if (!target || target_text_equals(target, "host")) return true;
   return z_find_target(target) != NULL;
 }
 
 bool z_target_is_host(const ZTargetInfo *target) {
-  return target && strcmp(target->name, z_host_target()) == 0;
+  return target_text_equals(target ? target->name : NULL, z_host_target());
 }
 
 static bool host_capability_available(const char *capability) {
-  return capability &&
-         (strcmp(capability, "args") == 0 ||
-          strcmp(capability, "env") == 0 ||
-          strcmp(capability, "fs") == 0 ||
-          strcmp(capability, "net") == 0 ||
-          strcmp(capability, "proc") == 0);
+  const char *host_capabilities[] = {"args", "env", "fs", "net", "proc", NULL};
+  for (int i = 0; host_capabilities[i]; i++) {
+    if (target_text_equals(capability, host_capabilities[i])) return !target_text_equals(capability, "proc") || (!target_text_equals(z_host_target(), "win32-x64.exe") && !target_text_equals(z_host_target(), "win32-arm64.exe"));
+  }
+  return false;
 }
 
 bool z_target_has_capability(const ZTargetInfo *target, const char *capability) {
   ensure_targets_loaded();
   if (!target || !capability) return false;
   if (z_target_is_host(target) && host_capability_available(capability)) return true;
-  return target->capabilities && strstr(target->capabilities, capability) != NULL;
+  return manifest_list_contains_token(target->capabilities, capability);
 }
 
 const char *z_target_libc_mode(const ZTargetInfo *target) {
@@ -265,7 +317,7 @@ const char *z_target_libc_mode(const ZTargetInfo *target) {
 }
 
 bool z_target_requires_sysroot(const ZTargetInfo *target) {
-  return target && !z_target_is_host(target) && strcmp(z_target_libc_mode(target), "sysroot") == 0;
+  return target && !z_target_is_host(target) && target_text_equals(z_target_libc_mode(target), "sysroot");
 }
 
 static bool target_path_is_dir(const char *path) {
@@ -326,13 +378,17 @@ static void append_target_capability_facts_json(ZBuf *buf, const ZTargetInfo *ta
   zbuf_append(buf, "]");
 }
 
+static const char *target_linker_label(const ZTargetInfo *target) {
+  const char *linker = target && target->linker ? target->linker : "cc";
+  return target_text_equals(linker, "zig cc") ? "target-cc" : linker;
+}
+
 static const char *target_libc_mode(const ZTargetInfo *target) {
   return z_target_libc_mode(target);
 }
 
 static void append_target_toolchain_json(ZBuf *buf, const ZTargetInfo *target) {
   const char *driver = z_target_is_host(target) ? "cc" : "target-capable C compiler";
-  const char *linker = target->linker && strcmp(target->linker, "zig cc") == 0 ? "target-cc" : (target->linker ? target->linker : "cc");
   zbuf_appendf(
     buf,
     "{\"cCompiler\":\"%s\",\"crossCompiler\":\"%s\",\"compilerTarget\":\"%s\",\"objectFormat\":\"%s\",\"linker\":\"%s\",\"requiresSysroot\":%s}",
@@ -340,7 +396,7 @@ static void append_target_toolchain_json(ZBuf *buf, const ZTargetInfo *target) {
     driver,
     target->zig_target,
     target->object_format ? target->object_format : "unknown",
-    linker,
+    target_linker_label(target),
     z_target_requires_sysroot(target) ? "true" : "false"
   );
 }
@@ -372,8 +428,8 @@ static bool target_http_runtime_supported(const ZTargetInfo *target) {
          z_target_has_capability(target, "net") &&
          z_direct_backend_supports_runtime_object(object_backend) &&
          z_direct_exe_backend(target) != Z_DIRECT_BACKEND_NONE &&
-         ((target->os && strcmp(target->os, "macos") == 0) ||
-          (target->os && strcmp(target->os, "linux") == 0));
+         (target_text_equals(target->os, "macos") ||
+          target_text_equals(target->os, "linux"));
 }
 
 void z_append_http_runtime_json(ZBuf *buf, const ZTargetInfo *target) {
@@ -426,7 +482,7 @@ void z_append_targets_json(ZBuf *buf) {
       targets[i].arch,
       targets[i].abi,
       targets[i].object_format,
-      targets[i].linker && strcmp(targets[i].linker, "zig cc") == 0 ? "target-cc" : targets[i].linker,
+      target_linker_label(&targets[i]),
       targets[i].libc,
       targets[i].exe_suffix,
       targets[i].zig_target,

@@ -1,0 +1,92 @@
+use accounts
+
+use activities
+
+use contacts
+
+use deals
+
+use http_util
+
+use search
+
+pub fn handleCrm(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    let method: Maybe<Span<u8>> = std.http.requestMethodName(request)
+    let path: Maybe<Span<u8>> = std.http.requestPath(request)
+    if !method.has {
+        return badRequest(response, "json")
+    }
+    if !path.has {
+        return badRequest(response, "json")
+    }
+    if std.http.requestIsGet(request, "/health") {
+        return jsonResponse(response, 200_u16, "{\"ok\":true,\"service\":\"crm\"}")
+    }
+    if std.http.requestIsGet(request, "/crm/accounts") {
+        return listAccounts(request, response)
+    }
+    if std.http.requestIsPost(request, "/crm/accounts") {
+        return createAccount(request, response)
+    }
+    if std.http.requestIsGet(request, "/crm/accounts/1") {
+        return readAccount(response)
+    }
+    if std.http.requestIsPost(request, "/crm/accounts/1/update") {
+        return updateAccount(request, response)
+    }
+    if std.http.requestIsPost(request, "/crm/accounts/1/delete") {
+        return deleteAccount(response)
+    }
+    if std.http.requestIsGet(request, "/crm/contacts") {
+        return listContacts(request, response)
+    }
+    if std.http.requestIsPost(request, "/crm/contacts") {
+        return createContact(request, response)
+    }
+    if std.http.requestIsGet(request, "/crm/contacts/7") {
+        return readContact(response)
+    }
+    if std.http.requestIsPost(request, "/crm/contacts/7/update") {
+        return updateContact(request, response)
+    }
+    if std.http.requestIsPost(request, "/crm/contacts/7/delete") {
+        return deleteContact(response)
+    }
+    if std.http.requestIsGet(request, "/crm/deals") {
+        return listDeals(request, response)
+    }
+    if std.http.requestIsPost(request, "/crm/deals") {
+        return createDeal(request, response)
+    }
+    if std.http.requestIsGet(request, "/crm/deals/42") {
+        return readDeal(response)
+    }
+    if std.http.requestIsPost(request, "/crm/deals/42/update") {
+        return updateDeal(request, response)
+    }
+    if std.http.requestIsPost(request, "/crm/deals/42/delete") {
+        return deleteDeal(response)
+    }
+    if std.http.requestIsGet(request, "/crm/activities") {
+        return listActivities(request, response)
+    }
+    if std.http.requestIsPost(request, "/crm/activities") {
+        return createActivity(request, response)
+    }
+    if std.http.requestIsGet(request, "/crm/search") {
+        return searchCrm(request, response)
+    }
+    if std.http.requestMethodIs(request, "PUT") {
+        return methodNotAllowed(response)
+    }
+    if std.http.requestMethodIs(request, "PATCH") {
+        return methodNotAllowed(response)
+    }
+    if std.http.requestMethodIs(request, "DELETE") {
+        return methodNotAllowed(response)
+    }
+    if std.http.requestMethodIs(request, "POST") {
+        return methodNotAllowed(response)
+    }
+    return notFound(response)
+}

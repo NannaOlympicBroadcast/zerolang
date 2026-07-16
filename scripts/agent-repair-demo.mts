@@ -7,8 +7,17 @@ import { join } from "node:path";
 const outDir = ".zero/agent-repair-demo";
 mkdirSync(outDir, { recursive: true });
 
-const brokenSource = readFileSync("examples/agent-repair-demo/broken.0", "utf8");
+const brokenSource = `pub fn main(world: World) -> Void raises {
+    let src: [4]u8 = [1, 2, 3, 4]
+    let dst: [4]u8 = [0, 0, 0, 0]
+    let copied: usize = std.mem.copy(dst, src)
+    if copied == 4 {
+        check world.out.write("copied\\n")
+    }
+}
+`;
 const workFile = join(outDir, "main.0");
+const workGraph = join(outDir, "main.graph");
 writeFileSync(workFile, brokenSource);
 
 function zeroJson(args, allowFailure = false) {
@@ -20,26 +29,26 @@ function zeroJson(args, allowFailure = false) {
   }
 }
 
-const check = zeroJson(["check", "--json", workFile], true);
-assert.equal(check.ok, false);
-assert.equal(check.diagnostics[0].code, "TYP009");
-assert.equal(check.diagnostics[0].repair.id, "make-binding-mutable");
+const importPlan = zeroJson(["import", "--json", "--format", "binary", "--out", workGraph, workFile], true);
+assert.equal(importPlan.ok, false);
+assert.equal(importPlan.diagnostics[0].code, "TYP009");
+assert.equal(importPlan.diagnostics[0].repair.id, "make-binding-mutable");
 
 const explain = zeroJson(["explain", "--json", "TYP009"]);
 assert.equal(explain.code, "TYP009");
 assert.equal(explain.repair.id, "make-binding-mutable");
 
-const plan = zeroJson(["fix", "--plan", "--json", workFile]);
-assert.equal(plan.mode, "plan");
-assert.equal(plan.appliesEdits, false);
-assert.equal(plan.fixes[0].id, "make-binding-mutable");
+const repair = importPlan.diagnostics[0].repair;
+assert.equal(repair.id, "make-binding-mutable");
 
 const fixedSource = brokenSource
   .replace("    let dst: [4]u8", "    var dst: [4]u8")
   .replace("    let _copied: i32", "    let _copied: usize");
 writeFileSync(workFile, fixedSource);
+const fixedImport = zeroJson(["import", "--json", "--format", "binary", "--out", workGraph, workFile]);
+assert.equal(fixedImport.ok, true);
 
-const fixed = zeroJson(["check", "--json", workFile]);
+const fixed = zeroJson(["check", "--json", workGraph]);
 assert.equal(fixed.ok, true);
 assert.equal(fixed.diagnostics.length, 0);
 
@@ -59,14 +68,14 @@ assertNoC(projectCheck);
 
 const projectTest = zeroJson(["test", "--json", projectDir]);
 assert.equal(projectTest.ok, true);
-assert.equal(projectTest.testBackend, "direct-frontend");
+assert.equal(projectTest.testBackend, "direct-program-graph");
 assertNoC(projectTest);
 
 const projectMain = join(projectDir, "src", "main.0");
 const projectMainSource = readFileSync(projectMain, "utf8");
 writeFileSync(projectMain, projectMainSource.split('\n\ntest "package import works"')[0] + "\n");
 
-const projectGraph = zeroJson(["graph", "--json", projectDir]);
+const projectGraph = zeroJson(["inspect", "--json", projectDir]);
 assert.equal(projectGraph.selfHostRouting.cBridge.required, false);
 
 const projectDoc = zeroJson(["doc", "--json", projectDir]);

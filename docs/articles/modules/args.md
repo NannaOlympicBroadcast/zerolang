@@ -1,4 +1,7 @@
-## Status
+## When To Use std.args
+
+In Zerolang, use `std.args` for hosted command-line programs that need positional
+arguments, option lookup, or simple numeric argument parsing.
 
 Runnable today:
 

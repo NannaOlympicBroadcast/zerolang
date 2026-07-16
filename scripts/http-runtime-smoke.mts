@@ -1,19 +1,26 @@
 #!/usr/bin/env -S node --experimental-strip-types --disable-warning=ExperimentalWarning
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { createServer as createHttpServer } from "node:http";
+import { execFile, spawn } from "node:child_process";
+import { createServer as createHttpServer, request as createHttpRequest } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { createServer as createTcpServer } from "node:net";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { connect as connectTcp, createServer as createTcpServer } from "node:net";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { basename } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const zero = "bin/zero";
 const outDir = ".zero/native-test";
+const zeroRunTimeoutMs = 20000;
 const target =
   process.platform === "darwin" && process.arch === "arm64" ? "darwin-arm64" :
   process.platform === "linux" && process.arch === "x64" ? "linux-x64" :
   null;
+
+type RawZeroListenerRequestOptions = {
+  end?: boolean;
+  timeoutMs?: number;
+};
 
 function zeroArray(count) {
   return `0_u8; ${count}`;
@@ -122,10 +129,230 @@ function listen(server) {
   });
 }
 
+function listenOn(server, port) {
+  return new Promise<void>((resolve, reject) => {
+    const onError = (error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    server.listen(port, "127.0.0.1");
+  });
+}
+
 function close(server) {
   return new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   });
+}
+
+function waitForZeroListener(child, timeoutMs = 30000) {
+  return new Promise<{ port: number; stdout: string; stderr: string }>((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const maybeReady = () => {
+      const match = `${stdout}\n${stderr}`.match(/listening on http:\/\/127\.0\.0\.1:(\d+)/);
+      if (match) {
+        clearTimeout(timer);
+        resolve({ port: Number(match[1]), stdout, stderr });
+      }
+    };
+    const timer = setTimeout(() => {
+      reject(new Error(`timed out waiting for zero listener\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    }, timeoutMs);
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+      maybeReady();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+      maybeReady();
+    });
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      reject(new Error(`zero listener exited before ready: code=${code} signal=${signal}\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    });
+  });
+}
+
+function stopZeroListener(child) {
+  return new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    const killTimer = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, 1000);
+    child.once("exit", () => {
+      clearTimeout(killTimer);
+      resolve();
+    });
+    child.kill("SIGTERM");
+  });
+}
+
+function requestZeroListener(port, method, path, body = "", headers = {}) {
+  const bodyBuffer = Buffer.from(body);
+  return new Promise<{ status: number; body: string }>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      request.destroy(new Error(`${method} ${path} timed out`));
+    }, 5000);
+    const request = createHttpRequest({
+      host: "127.0.0.1",
+      port,
+      path,
+      method,
+      headers: {
+        ...headers,
+        ...(bodyBuffer.length > 0 ? { "content-length": String(bodyBuffer.length) } : {}),
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        clearTimeout(timeout);
+        resolve({
+          status: response.statusCode ?? 0,
+          body: Buffer.concat(chunks).toString("utf8"),
+        });
+      });
+    });
+    request.on("error", (error) => {
+      clearTimeout(timeout);
+      reject(new Error(`${method} ${path} failed: ${error.message}`));
+    });
+    if (bodyBuffer.length > 0) request.write(bodyBuffer);
+    request.end();
+  });
+}
+
+function rawZeroListenerRequest(port, payload, options: RawZeroListenerRequestOptions = {}) {
+  return new Promise<string>((resolve, reject) => {
+    const chunks = [];
+    let settled = false;
+    const socket = connectTcp({ host: "127.0.0.1", port }, () => {
+      if (options.end === false) socket.write(payload);
+      else socket.end(payload);
+    });
+    const timeout = setTimeout(() => {
+      finish(new Error("raw HTTP request timed out"));
+    }, options.timeoutMs ?? 5000);
+    function finish(error = null) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      socket.destroy();
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    }
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.on("end", () => finish());
+    socket.on("close", () => {
+      if (!settled && chunks.length > 0) finish();
+    });
+    socket.on("error", finish);
+  });
+}
+
+async function assertExplicitPortConflict() {
+  const dir = await mkdtemp("/tmp/zero-http-listen-explicit-");
+  const packageDir = `${dir}/ping-pong-api`;
+  const patchPath = `${dir}/explicit-port.patch`;
+  try {
+    await cp("examples/ping-pong-api", packageDir, { recursive: true });
+    await writeFile(patchPath, `zero-program-graph-patch v1
+replaceFunctionBody main
+  check std.http.listen(world, 3000_u16)
+end
+`);
+    await execFileAsync(zero, ["patch", packageDir, patchPath], { timeout: zeroRunTimeoutMs });
+    const result = await execFileAsync(zero, ["run", packageDir], { timeout: zeroRunTimeoutMs }).catch((error) => error);
+    assert.notEqual(result.code, 0);
+    assert.match(`${result.stdout ?? ""}\n${result.stderr ?? ""}`, /std\.http\.listen could not bind the requested port|Address already in use/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function runHttpListenExample() {
+  const tempDirsBefore = new Set((await readdir("/tmp")).filter((entry) => entry.startsWith("zero-listen-")));
+  let reserved3000 = null;
+  let port3000Occupied = false;
+  const devPortGuard = createTcpServer();
+  try {
+    await listenOn(devPortGuard, 3000);
+    reserved3000 = devPortGuard;
+    port3000Occupied = true;
+  } catch (error) {
+    try {
+      devPortGuard.close();
+    } catch {
+      // The guard may never have started if another local service owns 3000.
+    }
+    if (error && error.code === "EADDRINUSE") {
+      port3000Occupied = true;
+    } else {
+      throw error;
+    }
+  }
+
+  const child = spawn(zero, ["run", "examples/ping-pong-api"], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  try {
+    const { port } = await waitForZeroListener(child);
+    if (port3000Occupied) {
+      assert.notEqual(port, 3000);
+    }
+    assert.deepEqual(await requestZeroListener(port, "GET", "/ping"), {
+      status: 200,
+      body: "{\"message\":\"pong\"}",
+    });
+    assert.deepEqual(await requestZeroListener(port, "GET", "/health"), {
+      status: 200,
+      body: "{\"ok\":true}",
+    });
+    assert.deepEqual(await requestZeroListener(port, "GET", "/missing"), {
+      status: 404,
+      body: "{\"error\":\"not_found\"}",
+    });
+    assert.deepEqual(await requestZeroListener(port, "POST", "/echo", "{\"ping\":1}", { "content-type": "application/json" }), {
+      status: 201,
+      body: "{\"ping\":1}",
+    });
+    assert.deepEqual(await requestZeroListener(port, "POST", "/echo", "not-json"), {
+      status: 400,
+      body: "{\"error\":\"bad_request\"}",
+    });
+    const badRequest = await rawZeroListenerRequest(port, "POST /echo\r\ncontent-length: nope\r\n\r\nx");
+    assert.match(badRequest, /^HTTP\/1\.1 400 Bad Request/);
+    assert.match(badRequest, /\r\nconnection: close\r\n/i);
+    assert.match(badRequest, /\{"error":"bad_request"\}/);
+    const tooLarge = await rawZeroListenerRequest(port, "POST /echo\r\ncontent-length: 999999\r\n\r\n");
+    assert.match(tooLarge, /^HTTP\/1\.1 413 Payload Too Large/);
+    assert.match(tooLarge, /\{"error":"payload_too_large"\}/);
+    const incomplete = await rawZeroListenerRequest(port, "POST /echo\r\ncontent-length: 4\r\n\r\nx", { end: false, timeoutMs: 8000 });
+    assert.match(incomplete, /^HTTP\/1\.1 408 Request Timeout/);
+    assert.match(incomplete, /\{"error":"request_timeout"\}/);
+    if (port3000Occupied) await assertExplicitPortConflict();
+  } finally {
+    await stopZeroListener(child);
+    if (reserved3000) await close(reserved3000);
+    const tempDirsAfter = (await readdir("/tmp")).filter((entry) => entry.startsWith("zero-listen-"));
+    for (const entry of tempDirsAfter) {
+      assert(tempDirsBefore.has(entry), `std.http.listen leaked temporary directory /tmp/${entry}`);
+    }
+  }
 }
 
 async function runExitCode(path, env = {}) {
@@ -136,6 +363,15 @@ async function runExitCode(path, env = {}) {
     if (typeof error.code === "number") return error.code;
     throw error;
   }
+}
+
+async function importGraphInput(sourcePath) {
+  const graphPath = `/tmp/zero-http-runtime-${process.pid}-${basename(sourcePath, ".0")}.graph`;
+  const projectionSidecar = `${sourcePath.slice(0, -2)}.graph`;
+  await rm(projectionSidecar, { force: true });
+  await rm(graphPath, { force: true });
+  await execFileAsync(zero, ["import", "--format", "text", "--out", graphPath, sourcePath]);
+  return graphPath;
 }
 
 function assertRuntimeReport(report, targetName) {
@@ -158,11 +394,12 @@ function assertRuntimeReport(report, targetName) {
 }
 
 async function buildAndRun(name, source, expectedCode, env = {}) {
-  const src = `${outDir}/${name}.0`;
+  const src = `/tmp/zero-http-runtime-${process.pid}-${name}.0`;
   const exe = `${outDir}/${name}`;
   const jsonPath = `${exe}.json`;
   await writeFile(src, source);
-  const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", target, src, "--out", exe], { maxBuffer: 1024 * 1024 });
+  const input = await importGraphInput(src);
+  const build = await execFileAsync(zero, ["build", "--json", "--emit", "exe", "--target", target, input, "--out", exe], { maxBuffer: 1024 * 1024 });
   await writeFile(jsonPath, build.stdout);
   assertRuntimeReport(JSON.parse(build.stdout), target);
   const code = await runExitCode(exe, env);
@@ -171,34 +408,38 @@ async function buildAndRun(name, source, expectedCode, env = {}) {
 
 async function runHttpJsonExample(baseUrl) {
   const exe = `${outDir}/std-http-json-example`;
-  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/std-http-json.0", "--", `GET ${baseUrl}/ok\n\n`], { timeout: 5000 });
+  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/std-http-json.graph", "--", `GET ${baseUrl}/ok\n\n`], { timeout: zeroRunTimeoutMs });
   assert.equal(run.stdout, "http json ok\n");
 }
 
 async function runHttpRequestExample(baseUrl) {
   const exe = `${outDir}/std-http-request-example`;
   const request = `POST ${baseUrl}/echo\ncontent-type: application/json\nx-zero-test: yes\n\n{"ping":1}`;
-  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/std-http-request.0", "--", request], { timeout: 5000 });
+  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/std-http-request.graph", "--", request], { timeout: zeroRunTimeoutMs });
   assert.equal(run.stdout, "http request ok\n");
 }
 
 async function runHttpHeadersExample(baseUrl) {
   const exe = `${outDir}/std-http-headers-example`;
-  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/std-http-headers.0", "--", `GET ${baseUrl}/headers\n\n`, "connection"], { timeout: 5000 });
+  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/std-http-headers.graph", "--", `GET ${baseUrl}/headers\n\n`, "connection"], { timeout: zeroRunTimeoutMs });
   assert.equal(run.stdout, "http header found\n");
 }
 
 async function runJsonApiClientExample(baseUrl) {
   const exe = `${outDir}/json-api-client-example`;
-  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/json-api-client.0", "--", `${baseUrl}/client`], { timeout: 5000 });
+  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/json-api-client.graph", "--", `${baseUrl}/client`], { timeout: zeroRunTimeoutMs });
   assert.equal(run.stdout, "json api client ok\n");
 }
 
 async function runJsonApiRouterExample() {
   const exe = `${outDir}/json-api-router-example`;
   const request = "POST /users?tenant=demo\ncontent-type: application/json\n\n{\"id\":7}";
-  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/json-api-router.0", "--", request], { timeout: 5000 });
+  const run = await execFileAsync(zero, ["run", "--out", exe, "examples/json-api-router.graph", "--", request], { timeout: zeroRunTimeoutMs });
   assert.equal(run.stdout, "json api router ok\n");
+  const corsExe = `${outDir}/json-api-router-cors-example`;
+  const preflight = "OPTIONS /users\naccess-control-request-method: POST\n\n";
+  const cors = await execFileAsync(zero, ["run", "--out", corsExe, "examples/json-api-router.graph", "--", preflight], { timeout: zeroRunTimeoutMs });
+  assert.equal(cors.stdout, "json api router ok\n");
 }
 
 function okSource(baseUrl) {
@@ -581,6 +822,7 @@ if (!(await canLinkCurl())) {
 
 await mkdir(outDir, { recursive: true });
 await assertProviderUnavailableRuntime();
+await runHttpListenExample();
 
 function handleRequest(request, response) {
   if (request.url === "/headers") {

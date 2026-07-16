@@ -1,0 +1,59 @@
+export c fn main() -> i32 {
+    var found_buf: [192]u8 = [0_u8; 192]
+    let found: Maybe<Span<u8>> = std.http.writeFound(found_buf, "/next")
+    if !found.has {
+        return 1
+    }
+    let found_status: Bool = std.str.contains(found.value, "302 Found")
+    let found_location: Bool = std.str.contains(found.value, "location: /next")
+    let found_length: Bool = std.str.contains(found.value, "content-length: 0")
+    if !found_status || !found_location || !found_length {
+        return 2
+    }
+    let found_body: Maybe<Span<u8>> = std.http.responseBodyBytes(found.value)
+    if !found_body.has {
+        return 3
+    }
+    if std.mem.len(found_body.value) != 0 {
+        return 4
+    }
+    var see_other_buf: [192]u8 = [0_u8; 192]
+    let see_other: Maybe<Span<u8>> = std.http.writeSeeOther(see_other_buf, "/created")
+    if !see_other.has {
+        return 5
+    }
+    let see_other_status: Bool = std.str.contains(see_other.value, "303 See Other")
+    if !see_other_status {
+        return 6
+    }
+    var moved_buf: [192]u8 = [0_u8; 192]
+    let moved: Maybe<Span<u8>> = std.http.writeMovedPermanently(moved_buf, "/new-home")
+    if !moved.has {
+        return 7
+    }
+    let moved_status: Bool = std.str.contains(moved.value, "301 Moved Permanently")
+    if !moved_status {
+        return 8
+    }
+    var permanent_buf: [192]u8 = [0_u8; 192]
+    let permanent: Maybe<Span<u8>> = std.http.writePermanentRedirect(permanent_buf, "/stable")
+    if !permanent.has {
+        return 9
+    }
+    let permanent_status: Bool = std.str.contains(permanent.value, "308 Permanent Redirect")
+    let permanent_location: Bool = std.str.contains(permanent.value, "location: /stable")
+    if !permanent_status || !permanent_location {
+        return 10
+    }
+    var non_redirect_buf: [192]u8 = [0_u8; 192]
+    let non_redirect: Maybe<Span<u8>> = std.http.writeRedirect(non_redirect_buf, 200_u16, "/bad")
+    if non_redirect.has {
+        return 11
+    }
+    var unsafe_buf: [192]u8 = [0_u8; 192]
+    let unsafe: Maybe<Span<u8>> = std.http.writeFound(unsafe_buf, "https://example.com\nset-cookie: bad=1")
+    if unsafe.has {
+        return 12
+    }
+    return 0
+}

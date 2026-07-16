@@ -3,11 +3,9 @@ pub fn defaultName() -> String {
 }
 
 pub fn outputDir() -> String {
-    let dir: String = rescue std.env.get("ZERO_RESOURCE_DIR") err ".zero"
-    return dir
+    return std.env.getOr("ZERO_RESOURCE_DIR", ".zero")
 }
 
 pub fn outputName() -> String {
-    let name: String = rescue std.args.get(1) err defaultName()
-    return name
+    return std.args.getOr(1, defaultName())
 }

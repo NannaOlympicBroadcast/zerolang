@@ -1,0 +1,9 @@
+pub fn main() -> Void {
+    var random_buf: [8]u8 = [0_u8; 8]
+    var entropy_buf: [8]u8 = [0_u8; 8]
+    let random_id: Maybe<Span<u8>> = std.crypto.randomId32(random_buf)
+    let entropy_hex: Maybe<Span<u8>> = std.rand.entropyHex32(entropy_buf)
+    if random_id.has && entropy_hex.has {
+        let _lengths: usize = std.mem.len(random_id.value) + std.mem.len(entropy_hex.value)
+    }
+}

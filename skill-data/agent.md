@@ -5,85 +5,94 @@ description: Graph-first agent workflow for making focused Zero changes with CLI
 
 # Zero Agent Workflow
 
-Use this when editing Zero code, examples, tests, docs, or a package. The graph interface is the primary authoring surface for agents: inspect and patch source through ProgramGraph commands, and use ProgramGraph artifacts only when you need an interchange/debug file. `.0` files are the canonical source text that gets committed. Zero command text is designed to be readable by agents; use JSON when another tool must parse stable fields or when deeper diagnostics are needed.
+Use this when editing Zero code. `zero.graph` is compiler input; `.0` is the human projection. Use JSON only when another tool must parse stable fields.
 
-## Start
+## Edit Through Patch
 
-Use the same compiler binary that will run the project:
+Anchored edits win. Do not retype a function for one line or rewrite `.0` for one declaration.
 
-```sh
-zero --version
-zero skills list
-zero skills get language
-zero skills get graph
-zero skills get diagnostics
-```
-
-Inside the Zero repository checkout, prefer `bin/zero` over a global `zero`. For installed user projects, use the `zero` on `PATH` unless the user points at another binary.
-
-## Graph-First Edit Loop
-
-1. Read the nearest `zero.json`, source files, tests, and examples enough to understand the package boundary.
-2. Inspect the current source through the graph:
+1. `--replace-in-fn`: edit one function's canonical body text.
 
 ```sh
-zero graph view <file-or-package>
-zero graph check <file-or-package>
+zero patch . --replace-in-fn handleLine --old 'limit + 1' --new 'limit + 2'
 ```
 
-3. Use JSON when you need exact node IDs or graph hashes:
+`--old` must match `zero view --fn <name>` output exactly once.
+
+2. `--replace-fn` for one whole body:
 
 ```sh
-zero graph dump --json <file-or-package>
+zero patch . --replace-fn greet --body-file - <<'EOF'
+check world.out.write("hello agent\n")
+EOF
 ```
 
-4. For precise mechanical edits on canonical `.0`, prefer a checked graph patch that rewrites the source after validation:
+3. Declaration work stays in ops; call sites update:
 
 ```sh
-zero graph patch <file.0> --expect-graph-hash graph:a7f7e6899a73f3b4 --op 'rename node="#decl_ad8d9028" expect="main" value="start"'
-zero graph check <file.0>
-zero check <file.0>
+zero patch . --op 'setConst name="limit" value="64"'
+zero patch . --op 'addParamTo fn="scan" name="bias" type="i32" default="0"'  # updates every call site
+zero patch . --op 'setReturnType fn="scan" type="i64"'
 ```
 
-5. When a graph artifact is necessary, write it under `.zero/`, patch the artifact, validate it, and then make the accepted source change. Do not commit derived `.program-graph` files unless the user explicitly asks.
-6. Run a focused source check:
+4. New helpers stay graph-native:
+
+```text
+zero-program-graph-patch v1
+upsertFunction handle
+fn handle(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return null
+}
+end
+```
+
+Pass a patch file, or stream full `zero-program-graph-patch v1` text with `zero patch . --patch-text -`.
+
+Use `addReturnExpr fn="maybe" expr="null"` for non-id returns and `appendStmt fn="main" stmt="check std.http.listen(world, 3000_u16)"` for one stmt. For pure helper tests, use `addTest name="addition works" call="add" arg0="2" arg1="3" expect="5" type="i32"`; reserve `addTestBody name="api add" ... end` for custom bodies and remove bad ones with `deleteTest name="api add"`. Labels are display names, not `__zero_test_*`.
+
+Runnable CLIs keep `World` on `pub fn main`; helpers are value-based. HTTP uses `handle(request, response)`.
+
+After `validated: check-equivalent`, the graph is saved and checked. Do not run `zero check`, `zero view`, or `zero export` just to confirm. `zero run . -- <args>` / `zero test` prove behavior or debug. Export only for requested `.0` review. Repeat `--op` to batch edits. For rewrites/handles: `zero skills get graph`.
+
+Read only for current code or handles:
+
+- `zero view --fn <name>`: one function source.
+- `zero view --fn <name> --around <text>`: enclosing block only.
+- `zero view --outline <module-or-file>`: signatures plus one-line docs.
+
+For a new package: `zero init`, then `zero patch --op 'addMain'`.
+
+## zero query
+
+```text
+zero query [--json] [--fn <name>] [--find <text>] [--refs <name>] [--calls <name>]
+           [--node <id>] [--depth <n>] [--full] [--handles] [--no-help] [graph-input|name]
+```
+
+- bare name that is not an existing path: runs `--find` against the current package
+- `zero query --fn <name> --handles`: patch handles for one function
+- add `--no-help` when you need handles without the patch-operation footer
+- `--find <text>`: search names, ids, types, values, and node kinds; prints matches with spans
+- `--calls <name>` / `--refs <name>`: resolved calls and semantic references
+- `--node <id>`: one node's span, parents, and children; short handles resolve here too
+
+Import/export, identity recovery, structural edits, and merge live in `graph`. Direct `.0` edits are a last resort; never delete `zero.graph`.
+
+## Verify Before Done
+
+After a fix works, exercise typical and boundary inputs.
 
 ```sh
-zero check <file-or-package>
+zero run . -- <typical input>
+zero run . -- <empty or boundary input>
+zero test
 ```
 
-7. When the compiler reports a diagnostic, explain the code first. If you need stable fields or a repair plan, rerun with JSON:
+If behavior changed, add or update a `test` block. On a diagnostic, run `zero explain <code>`.
 
-```sh
-zero explain <diagnostic-code>
-zero check --json <file-or-package>
-zero fix --plan --json <file-or-package>
-```
+## Rules
 
-8. If behavior changes, add or update a `test` block or conformance fixture.
-9. Validate with the narrowest command that covers the changed surface.
-
-## Agent Rules
-
-- Treat effects as capabilities, not ambient globals. Use `World`, `std.fs`, `std.args`, `std.env`, and similar APIs only where the target supports them.
-- Keep examples copyable and runnable from the repository or package root.
-- Prefer explicit types at public boundaries and when inference is unclear.
-- Use `Maybe<T>`, explicit `raises` / `raises [...]`, and `check` instead of hidden failure.
-- Prefer graph inspection and source-backed graph patches for agent planning and mechanical edits.
-- Do not invent syntax. Load `language` when unsure.
-- Do not invent CLI fields. If you need fields, run the command with `--json` and read the data.
-
-## Useful Focused Commands
-
-```sh
-zero check <input>
-zero graph <input>
-zero graph view <input>
-zero graph check <input>
-zero graph dump --json <input>
-zero test <input>
-zero size <input>
-zero doctor
-```
-
-For CLI behavior, JSON contracts, or editor/tool integrations in the Zero repo, use `--json` and the repository scripts listed by `AGENTS.md` or the project documentation.
+- Treat effects as capabilities, not ambient globals: `World`, `std.fs`, `std.args`, `std.env`.
+- Use `Maybe<T>`, explicit `raises` / `raises [...]`, and `check` / `rescue` instead of hidden failure.
+- Do not invent syntax or CLI fields; load `language` when unsure.
+- Check `stdlib` before hand-writing parsing or validation; it ships validators such as `std.time`, `std.inet`, `std.regex`, and `std.unicode`. Fetch one module with `zero skills get stdlib --topic std.time`.

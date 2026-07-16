@@ -1,7 +1,9 @@
 #include "program_graph_format.h"
+#include "program_graph_build.h"
 #include "program_graph_import.h"
 #include "program_graph_resolve.h"
 #include "program_graph_semantics.h"
+#include "program_graph_store.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -16,6 +18,28 @@ static bool graph_format_text_eq(const char *left, const char *right) {
 
 static bool graph_format_text_present(const char *text) {
   return text && text[0];
+}
+
+static void graph_format_free_node_fields(ZProgramGraphNode *node) {
+  if (!node) return;
+  free(node->id);
+  free(node->name);
+  free(node->type);
+  free(node->value);
+  free(node->path);
+  free(node->symbol_id);
+  free(node->type_id);
+  free(node->effect_id);
+  free(node->node_hash);
+  *node = (ZProgramGraphNode){0};
+}
+
+static void graph_format_free_edge_fields(ZProgramGraphEdge *edge) {
+  if (!edge) return;
+  free(edge->from);
+  free(edge->to);
+  free(edge->kind);
+  *edge = (ZProgramGraphEdge){0};
 }
 
 static void graph_format_append_quoted(ZBuf *buf, const char *text) {
@@ -301,26 +325,6 @@ static bool graph_format_validation_state_from_name(const char *name, ZProgramGr
     }
   }
   return false;
-}
-
-static void graph_format_free_node_fields(ZProgramGraphNode *node) {
-  free(node->id);
-  free(node->name);
-  free(node->type);
-  free(node->value);
-  free(node->path);
-  free(node->symbol_id);
-  free(node->type_id);
-  free(node->effect_id);
-  free(node->node_hash);
-  *node = (ZProgramGraphNode){0};
-}
-
-static void graph_format_free_edge_fields(ZProgramGraphEdge *edge) {
-  free(edge->from);
-  free(edge->to);
-  free(edge->kind);
-  *edge = (ZProgramGraphEdge){0};
 }
 
 static bool graph_format_parse_node_line(const char *line, ZProgramGraphNode *out) {
@@ -627,19 +631,39 @@ fail:
 static bool graph_format_storage_validation_fail(const char *path, const ZProgramGraphValidation *validation, ZDiag *diag) {
   if (diag) {
     *diag = (ZDiag){0};
-    diag->code = 1001;
+    diag->code = 1005;
     diag->path = path;
     diag->line = 1;
     diag->column = 1;
     snprintf(diag->message, sizeof(diag->message), "stored program graph failed validation: %s",
              validation && validation->message[0] ? validation->message : "invalid graph shape");
     snprintf(diag->expected, sizeof(diag->expected), "shape-valid program graph");
-    snprintf(diag->actual, sizeof(diag->actual), "%s", validation && validation->code[0] ? validation->code : "invalid graph");
+    if (validation && validation->edge_from[0]) {
+      snprintf(diag->actual, sizeof(diag->actual), "%.16s from:%.32s to:%.32s target:%.16s",
+               validation->code[0] ? validation->code : "invalid graph",
+               validation->edge_from,
+               validation->edge_to,
+               validation->edge_target);
+    } else {
+      snprintf(diag->actual, sizeof(diag->actual), "%s", validation && validation->code[0] ? validation->code : "invalid graph");
+    }
   }
   return false;
 }
 
 bool z_program_graph_load(const char *path, ZProgramGraph *out, ZDiag *diag) {
+  if (z_program_graph_store_path_is_binary(path)) {
+    ZProgramGraphStore store;
+    z_program_graph_store_init(&store);
+    bool ok = z_program_graph_store_load_path(path, &store, diag);
+    if (ok) {
+      *out = store.graph;
+      store.graph = (ZProgramGraph){0};
+    }
+    z_program_graph_store_free(&store);
+    if (!ok && diag && !diag->path) diag->path = path;
+    return ok;
+  }
   char *text = z_read_file(path, diag);
   if (!text) return false;
   bool parsed = z_program_graph_parse_dump(text, out, diag);
@@ -656,11 +680,14 @@ bool z_program_graph_load(const char *path, ZProgramGraph *out, ZDiag *diag) {
   return true;
 }
 
-bool z_program_graph_save(const char *path, const ZProgramGraph *graph, ZDiag *diag) {
+bool z_program_graph_save_format(const char *path, const ZProgramGraph *graph, ZProgramGraphStoreFormat format, ZDiag *diag) {
   ZProgramGraphValidation validation = {0};
   if (!z_program_graph_validate(graph, &validation)) return graph_format_storage_validation_fail(path, &validation, diag);
   ZProgramGraph storage = graph ? *graph : (ZProgramGraph){0};
   storage.canonical_source = false;
+  if (format == Z_PROGRAM_GRAPH_STORE_FORMAT_BINARY) {
+    return z_program_graph_store_write_generated_path_format(path, &storage, Z_PROGRAM_GRAPH_STORE_FORMAT_BINARY, NULL, diag);
+  }
   ZBuf dump; zbuf_init(&dump);
   z_program_graph_append_dump(&dump, &storage, &validation);
   ZProgramGraph parsed;
@@ -673,6 +700,10 @@ bool z_program_graph_save(const char *path, const ZProgramGraph *graph, ZDiag *d
   bool ok = z_write_file(path, dump.data ? dump.data : "", diag);
   zbuf_free(&dump);
   return ok;
+}
+
+bool z_program_graph_save(const char *path, const ZProgramGraph *graph, ZDiag *diag) {
+  return z_program_graph_save_format(path, graph, Z_PROGRAM_GRAPH_STORE_FORMAT_TEXT, diag);
 }
 
 void z_program_graph_append_json(ZBuf *buf, const ZProgramGraph *graph, const ZProgramGraphValidation *validation) {
@@ -828,6 +859,11 @@ void z_append_program_graph_json(ZBuf *buf, const SourceInput *input, const Prog
     return;
   }
   graph.canonical_source = input && input->canonical_text_source;
+  if (!z_program_graph_merge_embedded_std_graph_modules(&graph, input, NULL)) {
+    z_program_graph_free(&graph);
+    graph_format_append_failed_json(buf);
+    return;
+  }
   ZProgramGraphValidation validation = {0};
   z_program_graph_validate(&graph, &validation);
   z_program_graph_append_json(buf, &graph, &validation);
@@ -842,6 +878,12 @@ void z_append_program_graph_dump(ZBuf *buf, const SourceInput *input, const Prog
     return;
   }
   graph.canonical_source = input && input->canonical_text_source;
+  if (!z_program_graph_merge_embedded_std_graph_modules(&graph, input, NULL)) {
+    z_program_graph_free(&graph);
+    if (json) graph_format_append_failed_json(buf);
+    else graph_format_append_failed_dump(buf);
+    return;
+  }
   ZProgramGraphValidation validation = {0};
   z_program_graph_validate(&graph, &validation);
   if (json) z_program_graph_append_json(buf, &graph, &validation);

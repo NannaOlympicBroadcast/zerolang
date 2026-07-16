@@ -1,6 +1,12 @@
 #include "x64_emit.h"
 
+#include <stdio.h>
 #include <stdlib.h>
+
+static void z_x64_invariant_fatal(const char *what) {
+  fprintf(stderr, "zero: fatal: internal x86-64 encoder invariant violated: %s\n", what);
+  abort();
+}
 
 void z_x64_append_u8(ZBuf *buf, unsigned value) {
   zbuf_append_char(buf, (char)(value & 0xffu));
@@ -23,13 +29,13 @@ static void z_x64_emit_wide_prefix(ZBuf *buf, bool wide) {
 }
 
 static void z_x64_require_reg(unsigned reg) {
-  if (reg >= 16) abort();
+  if (reg >= 16) z_x64_invariant_fatal("register index out of range");
 }
 
 static void z_x64_require_sib_index(unsigned reg) {
   z_x64_require_reg(reg);
   // SIB index field 4 without REX.X encodes no index, so rsp cannot be used here.
-  if (reg == 4) abort();
+  if (reg == 4) z_x64_invariant_fatal("rsp cannot be a SIB index");
 }
 
 void z_x64_patch_u32(ZBuf *buf, size_t offset, uint32_t value) {
@@ -264,7 +270,7 @@ void z_x64_emit_xor_reg_from_reg(ZBuf *buf, unsigned dst_reg, unsigned src_reg, 
 }
 
 static void z_x64_emit_reg_i8_op(ZBuf *buf, unsigned modrm_op, unsigned reg, int8_t value, bool wide) {
-  if (modrm_op > 7) abort();
+  if (modrm_op > 7) z_x64_invariant_fatal("modrm operation field out of range");
   z_x64_require_reg(reg);
   unsigned rex = wide ? 0x48 : 0x40;
   if (reg >= 8) rex |= 0x01;
@@ -315,7 +321,7 @@ void z_x64_emit_shr_reg_one(ZBuf *buf, unsigned reg, bool wide) {
 }
 
 static void z_x64_emit_shift_reg_imm8(ZBuf *buf, unsigned modrm_op, unsigned reg, unsigned amount, bool wide) {
-  if (modrm_op > 7 || amount > 0xff) abort();
+  if (modrm_op > 7 || amount > 0xff) z_x64_invariant_fatal("shift encoding out of range");
   z_x64_require_reg(reg);
   unsigned rex = wide ? 0x48 : 0x40;
   if (reg >= 8) rex |= 0x01;
@@ -362,7 +368,8 @@ static unsigned z_x64_scale_bits(unsigned scale) {
     case 4: return 2;
     case 8: return 3;
   }
-  abort();
+  z_x64_invariant_fatal("unsupported SIB scale");
+  return 0;
 }
 
 static void z_x64_emit_base_index_scale_disp_op(ZBuf *buf, unsigned opcode, unsigned reg, unsigned base_reg, unsigned index_reg, unsigned scale, unsigned disp, bool wide, bool reg_is_byte) {
@@ -420,7 +427,7 @@ void z_x64_emit_cmp_base_index_reg8(ZBuf *buf, unsigned base_reg, unsigned index
 }
 
 void z_x64_emit_cmp_base_index_u8(ZBuf *buf, unsigned base_reg, unsigned index_reg, unsigned value) {
-  if (value > 0xff) abort();
+  if (value > 0xff) z_x64_invariant_fatal("immediate byte out of range");
   z_x64_emit_base_index_reg(buf, 0x80, 7, base_reg, index_reg, false, false);
   z_x64_append_u8(buf, value);
 }
@@ -477,6 +484,72 @@ void z_x64_emit_byte_eq_loop(ZBuf *buf) {
   z_x64_patch_rel32(buf, equal, buf->len);
   z_x64_emit_mov_eax_u32(buf, 1);
   z_x64_patch_rel32(buf, after_false, buf->len);
+}
+
+void z_x64_emit_vec_lookup_loop(ZBuf *buf, bool contains) {
+  // Inputs: r8b=value, rdx=base, ecx=len. Output: eax=index/len or Bool.
+  z_x64_emit_xor_eax_eax(buf);
+  size_t loop = buf->len;
+  z_x64_emit_cmp_rax_rcx(buf, false);
+  size_t absent = z_x64_emit_jcc32_placeholder(buf, 0x83);
+  z_x64_emit_cmp_base_index_reg8(buf, 2, 0, 8);
+  size_t found = z_x64_emit_jcc32_placeholder(buf, 0x84);
+  z_x64_emit_add_reg_i8(buf, 0, 1, false);
+  size_t back = z_x64_emit_jmp32_placeholder(buf, 0xe9);
+  z_x64_patch_rel32(buf, back, loop);
+  z_x64_patch_rel32(buf, absent, buf->len);
+  if (contains) z_x64_emit_mov_eax_u32(buf, 0);
+  else z_x64_emit_mov_eax_from_ecx(buf);
+  size_t end = z_x64_emit_jmp32_placeholder(buf, 0xe9);
+  z_x64_patch_rel32(buf, found, buf->len);
+  if (contains) z_x64_emit_mov_eax_u32(buf, 1);
+  z_x64_patch_rel32(buf, end, buf->len);
+}
+
+void z_x64_emit_vec_insert_unique_loop(ZBuf *buf) {
+  // Inputs: r8b=value, rdx=base, ecx=len, r9d=capacity. Output: eax=Bool, ecx=final len.
+  z_x64_emit_xor_eax_eax(buf);
+  size_t loop = buf->len;
+  z_x64_emit_cmp_rax_rcx(buf, false);
+  size_t absent = z_x64_emit_jcc32_placeholder(buf, 0x83);
+  z_x64_emit_cmp_base_index_reg8(buf, 2, 0, 8);
+  size_t duplicate = z_x64_emit_jcc32_placeholder(buf, 0x84);
+  z_x64_emit_add_reg_i8(buf, 0, 1, false);
+  size_t back = z_x64_emit_jmp32_placeholder(buf, 0xe9);
+  z_x64_patch_rel32(buf, back, loop);
+  z_x64_patch_rel32(buf, absent, buf->len);
+  z_x64_emit_cmp_reg_reg(buf, 1, 9, false);
+  size_t has_capacity = z_x64_emit_jcc32_placeholder(buf, 0x82);
+  z_x64_patch_rel32(buf, duplicate, buf->len);
+  z_x64_emit_mov_eax_u32(buf, 0);
+  size_t end = z_x64_emit_jmp32_placeholder(buf, 0xe9);
+  z_x64_patch_rel32(buf, has_capacity, buf->len);
+  z_x64_emit_store_base_index_reg8(buf, 2, 1, 8);
+  z_x64_emit_add_reg_i8(buf, 1, 1, false);
+  z_x64_emit_mov_eax_u32(buf, 1);
+  z_x64_patch_rel32(buf, end, buf->len);
+}
+
+void z_x64_emit_vec_remove_value_loop(ZBuf *buf) {
+  // Inputs: r8b=value, rdx=base, ecx=len. Output: eax=Bool, ecx=final len.
+  z_x64_emit_xor_eax_eax(buf);
+  size_t loop = buf->len;
+  z_x64_emit_cmp_rax_rcx(buf, false);
+  size_t absent = z_x64_emit_jcc32_placeholder(buf, 0x83);
+  z_x64_emit_cmp_base_index_reg8(buf, 2, 0, 8);
+  size_t found = z_x64_emit_jcc32_placeholder(buf, 0x84);
+  z_x64_emit_add_reg_i8(buf, 0, 1, false);
+  size_t back = z_x64_emit_jmp32_placeholder(buf, 0xe9);
+  z_x64_patch_rel32(buf, back, loop);
+  z_x64_patch_rel32(buf, absent, buf->len);
+  z_x64_emit_mov_eax_u32(buf, 0);
+  size_t end = z_x64_emit_jmp32_placeholder(buf, 0xe9);
+  z_x64_patch_rel32(buf, found, buf->len);
+  z_x64_emit_add_reg_i8(buf, 1, -1, false);
+  z_x64_emit_movzx_reg32_base_index_u8(buf, 9, 2, 1);
+  z_x64_emit_store_base_index_reg8(buf, 2, 0, 9);
+  z_x64_emit_mov_eax_u32(buf, 1);
+  z_x64_patch_rel32(buf, end, buf->len);
 }
 
 void z_x64_emit_crc32_bytes_loop(ZBuf *buf, unsigned ptr_reg, unsigned len_reg) {
@@ -719,7 +792,7 @@ void z_x64_emit_movzx_reg32_ptr_reg_disp_u16(ZBuf *buf, unsigned dst_reg, unsign
 void z_x64_emit_load_reg_ptr_reg(ZBuf *buf, unsigned dst_reg, unsigned base_reg, bool wide) { z_x64_emit_ptr_reg_disp_op(buf, 0, 0x8b, dst_reg, base_reg, 0, wide, false); }
 
 void z_x64_emit_mov_ptr_reg_disp_u8(ZBuf *buf, unsigned base_reg, unsigned disp, unsigned value) {
-  if (value > 0xff) abort();
+  if (value > 0xff) z_x64_invariant_fatal("immediate byte out of range");
   z_x64_emit_ptr_reg_disp_op(buf, 0, 0xc6, 0, base_reg, disp, false, false);
   z_x64_append_u8(buf, value);
 }
@@ -774,7 +847,7 @@ void z_x64_emit_cmp_rax_rcx(ZBuf *buf, bool wide) {
 }
 
 void z_x64_emit_setcc_al_to_bool(ZBuf *buf, unsigned setcc_opcode) {
-  if (setcc_opcode < 0x90 || setcc_opcode > 0x9f) abort();
+  if (setcc_opcode < 0x90 || setcc_opcode > 0x9f) z_x64_invariant_fatal("setcc opcode out of range");
   z_x64_append_u8(buf, 0x0f);
   z_x64_append_u8(buf, setcc_opcode);
   z_x64_append_u8(buf, 0xc0);
@@ -809,6 +882,13 @@ void z_x64_emit_epilogue(ZBuf *buf) {
 void z_x64_emit_mov_eax_u32(ZBuf *buf, uint32_t value) {
   z_x64_append_u8(buf, 0xb8);
   z_x64_append_u32(buf, value);
+}
+
+void z_x64_emit_align_rsp_16(ZBuf *buf) {
+  z_x64_append_u8(buf, 0x48); // and rsp, -16
+  z_x64_append_u8(buf, 0x83);
+  z_x64_append_u8(buf, 0xe4);
+  z_x64_append_u8(buf, 0xf0);
 }
 
 void z_x64_emit_ud2(ZBuf *buf) {

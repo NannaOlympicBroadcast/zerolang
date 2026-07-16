@@ -1,0 +1,30 @@
+use http_util
+
+pub fn listContacts(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if tenantOk(request) {
+        return jsonResponse(response, 200_u16, "{\"contacts\":[{\"id\":7,\"name\":\"Grace Hopper\",\"account_id\":1},{\"id\":8,\"name\":\"Katherine Johnson\",\"account_id\":2}]}")
+    }
+    return badRequest(response, "tenant")
+}
+
+pub fn createContact(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if bodyIsJson(request, 256) && bodyHasU32(request, "account_id", 256) {
+        return jsonResponse(response, 201_u16, "{\"contact\":{\"id\":9,\"name\":\"New contact\",\"account_id\":1},\"created\":true}")
+    }
+    return badRequest(response, "json")
+}
+
+pub fn readContact(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"contact\":{\"id\":7,\"name\":\"Grace Hopper\",\"email\":\"grace@example.com\",\"account_id\":1}}")
+}
+
+pub fn updateContact(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if bodyIsJson(request, 256) {
+        return jsonResponse(response, 200_u16, "{\"contact\":{\"id\":7,\"name\":\"Grace Hopper\",\"email\":\"updated@example.com\"},\"updated\":true}")
+    }
+    return badRequest(response, "json")
+}
+
+pub fn deleteContact(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"contact\":{\"id\":7},\"deleted\":true}")
+}

@@ -1,84 +1,77 @@
-## Optimization And Size Profiles
+## Make Retention Visible
 
-Zero profiles are product contracts, not hidden compiler moods. Build and size
-JSON expose the selected profile so CI and agents can explain why bytes were
-retained.
+Zerolang optimization docs should answer a concrete question: why did this graph
+input retain these bytes, helpers, allocations, or runtime shims?
 
-Common profile choices:
+```json-render
+{
+  "messages": [
+    {
+      "role": "user",
+      "text": "why is this binary bigger now?"
+    },
+    {
+      "role": "assistant",
+      "text": "I’ll inspect the size report and trace what is being retained."
+    },
+    {
+      "role": "tools",
+      "calls": [
+        {
+          "command": "zero size --json",
+          "output": "{\"sizeBreakdown\":{},\"retentionReasons\":[\"std.http.fetch retained by handle\"]}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## What This Means
+
+Use graph inputs or graph-first packages:
+
+```sh
+zero size --json examples/fixed-vec.graph
+zero mem --json examples/allocator-collections.graph
+zero build --json --profile tiny --target linux-musl-x64 examples/hello.graph --out .zero/out/hello
+```
+
+## Profiles
 
 | Profile | Use when | Contract |
 | --- | --- | --- |
-| `debug` | You need diagnostics and local symbols. | Diagnostic panic path and debug metadata retained. |
-| `fast` | Throughput matters more than minimum size. | Direct codegen optimizes for speed while keeping today's checked bounds behavior. |
-| `small` | This is the default release profile. | Pay-as-used helpers, stripped unrequested metadata, deterministic artifacts. |
+| `debug` | You need diagnostics and local symbols. | Keeps diagnostic/debug metadata. |
+| `fast` | Throughput matters more than minimum size. | Optimizes for speed within current direct codegen limits. |
+| `small` | You want the normal release shape. | Pay-as-used helpers and deterministic artifacts. |
 | `tiny` | Artifact size is the main constraint. | Minimum runtime metadata and strict helper budget. |
 
-Copyable commands:
+Build JSON includes `profileSemantics`, `profileCatalog`, `profileBudget`, and
+`safetyFacts`.
 
-```sh
-bin/zero build --json --profile small --target linux-musl-x64 examples/hello.0 --out .zero/out/hello-small
-bin/zero build --json --profile tiny --target linux-musl-x64 examples/hello.0 --out .zero/out/hello-tiny
-bin/zero size --json --profile debug --target linux-musl-x64 examples/memory-primitives.0
-bin/zero size --json --profile tiny --target linux-musl-x64 examples/fixed-vec.0
-bin/zero mem --json examples/allocator-collections.0
-```
+## Size Reports
 
-`zero build --json` includes:
+`zero size --json` adds:
 
-- `profileSemantics`: canonical profile, `profileKey`, aliases, and optimization goal.
-- `profileCatalog`: the available profiles and aliases.
-- `profileBudget`: size limits and helper-budget policy for the selected profile.
-- `safetyFacts`: current compiler safety facts for bounds, literal integer range checks, runtime arithmetic, initialization, aliasing, lifetime, ownership, span, MIR, and unchecked surfaces.
+- `sizeBreakdown`
+- `retentionReasons`
+- `optimizationHints`
+- retained function and helper facts
+- literal and section cost
+- target and profile facts
 
-`zero size --json` adds `sizeBreakdown`, `retentionReasons`, and
-`optimizationHints`, plus the same `safetyFacts`. Start there when an artifact
-is larger than expected.
+Use `retentionReasons` when an agent needs to explain why a helper, literal, or
+debug metadata block stayed in the artifact.
 
-`zero mem --json` is the memory-budget companion. It includes:
+## Memory Reports
 
-- `memoryBudgets`: stack, static, heap, arena, and fixed-buffer totals.
-- `allocatorFacts`: which allocator APIs were used.
-- `safetyFacts`: the current memory-safety contract for the selected profile, including any unchecked runtime surfaces.
-- `allocationInstrumentation`: allocation failure and cleanup facts.
-- `collectionFacts`: fixed-capacity collection usage and no-global-allocator checks.
+`zero mem --json` includes:
 
-## Size Breakdown
+- `memoryBudgets`
+- `allocatorFacts`
+- `allocationInstrumentation`
+- `collectionFacts`
+- `safetyFacts`
 
-`sizeBreakdown` is shaped for optimization agents:
-
-- `functions`: retained functions, tests, exports, estimated bytes, and retention reasons.
-- `sections`: code, readonly literals, stack, debug metadata, and optional output artifact sections.
-- `literals`: readonly string and byte literal cost.
-- `stdlibHelpers`: pay-as-used helper cost and capability attribution.
-- `imports`: capability imports retained by the selected program.
-- `runtimeShims`: target/runtime shims retained by capabilities or bounds checks.
-- `debugMetadata`: bytes and policy for profile-retained metadata.
-
-Use `retentionReasons` to answer why a function, helper, literal, or debug
-metadata block stayed in the artifact. Use `optimizationHints` for the next
-action, such as switching away from `debug`, removing hosted filesystem helpers
-from target-neutral code, or inspecting `topLargestEmittedHelpers`.
-
-## Benchmark Trends
-
-The benchmark gate writes both a full one-run report and a compact trend
-artifact:
-
-```sh
-ZERO_BENCH_RUNS=1 pnpm run bench
-```
-
-The benchmark outputs are:
-
-| File | Purpose |
-| --- | --- |
-| `.zero/bench/latest.json` | Full one-run smoke report. |
-| `.zero/bench/trends/latest.json` | Compact trend summary. |
-| `.zero/bench/trends/summary.md` | Human-readable companion report. |
-
-The trend summary tracks artifact size, compressed size, build time, startup
-time, operation timings, and peak RSS when available.
-
-Use benchmark trends before trusting profile regressions. Profile builds and
-size reports for `debug`, `fast`, `small`, and `tiny` should stay deterministic
-across repeated runs.
+These fields are the public way to check whether an example remains
+fixed-capacity, caller-buffered, or heap-free.

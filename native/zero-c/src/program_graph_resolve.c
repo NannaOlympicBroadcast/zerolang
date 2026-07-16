@@ -1,5 +1,7 @@
 #include "program_graph_resolve.h"
 
+#include "program_graph_adjacency.h"
+
 #include "std_sig.h"
 #include "std_source.h"
 
@@ -55,6 +57,8 @@ typedef struct {
 
 typedef struct {
   const ZProgramGraph *graph;
+  ZProgramGraphAdjacency adjacency;
+  size_t *scope_by_node;
   ZGraphScopeFact *scopes;
   size_t scope_len, scope_cap;
   ZGraphBindingFact *bindings;
@@ -110,46 +114,39 @@ static void graph_resolve_append_quoted(ZBuf *buf, const char *text) {
   zbuf_append_char(buf, '"');
 }
 
-static size_t graph_resolve_node_index(const ZProgramGraph *graph, const char *id) {
-  for (size_t i = 0; graph && id && i < graph->node_len; i++) {
-    if (graph_resolve_text_eq(graph->nodes[i].id, id)) return i;
-  }
-  return SIZE_MAX;
+static size_t graph_resolve_node_index(const ZGraphResolver *resolver, const char *id) {
+  return resolver ? z_program_graph_adjacency_node_index(&resolver->adjacency, id) : SIZE_MAX;
 }
 
 static const ZProgramGraphNode *graph_resolve_node(const ZProgramGraph *graph, size_t index) {
   return graph && index < graph->node_len ? &graph->nodes[index] : NULL;
 }
 
-static const ZProgramGraphEdge *graph_resolve_owner_edge(const ZProgramGraph *graph, const char *node_id) {
-  for (size_t i = 0; graph && node_id && i < graph->edge_len; i++) {
-    const ZProgramGraphEdge *edge = &graph->edges[i];
-    if (edge->target == Z_PROGRAM_GRAPH_EDGE_TARGET_NODE && graph_resolve_text_eq(edge->to, node_id)) return edge;
+static const ZProgramGraphEdge *graph_resolve_owner_edge(const ZGraphResolver *resolver, const char *node_id) {
+  if (!resolver || !node_id) return NULL;
+  return z_program_graph_adjacency_first_child_edge(&resolver->adjacency, node_id);
+}
+
+static const ZProgramGraphNode *graph_resolve_child(const ZGraphResolver *resolver, const ZProgramGraphNode *node, const char *kind, size_t order) {
+  if (!resolver || !node || !kind) return NULL;
+  size_t start = 0;
+  size_t len = 0;
+  z_program_graph_adjacency_owner_run(&resolver->adjacency, node->id, kind, &start, &len);
+  for (size_t i = start; i < start + len; i++) {
+    const ZProgramGraphEdge *edge = z_program_graph_adjacency_owner_edge_at(&resolver->adjacency, i);
+    if (edge->order == order) return z_program_graph_adjacency_node(&resolver->adjacency, edge->to);
   }
   return NULL;
 }
 
-static const ZProgramGraphNode *graph_resolve_child(const ZProgramGraph *graph, const ZProgramGraphNode *node, const char *kind, size_t order) {
-  for (size_t i = 0; graph && node && kind && i < graph->edge_len; i++) {
-    const ZProgramGraphEdge *edge = &graph->edges[i];
-    if (edge->target == Z_PROGRAM_GRAPH_EDGE_TARGET_NODE &&
-        edge->order == order &&
-        graph_resolve_text_eq(edge->from, node->id) &&
-        graph_resolve_text_eq(edge->kind, kind)) {
-      size_t index = graph_resolve_node_index(graph, edge->to);
-      return graph_resolve_node(graph, index);
-    }
-  }
-  return NULL;
-}
-
-static bool graph_resolve_node_is_ancestor(const ZProgramGraph *graph, size_t ancestor_index, size_t node_index) {
+static bool graph_resolve_node_is_ancestor(const ZGraphResolver *resolver, size_t ancestor_index, size_t node_index) {
+  const ZProgramGraph *graph = resolver ? resolver->graph : NULL;
   const ZProgramGraphNode *ancestor = graph_resolve_node(graph, ancestor_index);
   const ZProgramGraphNode *node = graph_resolve_node(graph, node_index);
   const char *current = node ? node->id : NULL;
   for (size_t depth = 0; graph && ancestor && current && depth < graph->node_len; depth++) {
     if (graph_resolve_text_eq(current, ancestor->id)) return true;
-    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, current);
+    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, current);
     current = owner ? owner->from : NULL;
   }
   return false;
@@ -182,10 +179,9 @@ static char *graph_resolve_scope_id(const ZProgramGraphNode *node) {
 }
 
 static size_t graph_resolve_scope_for_node(const ZGraphResolver *resolver, size_t node_index) {
-  for (size_t i = 0; resolver && i < resolver->scope_len; i++) {
-    if (resolver->scopes[i].node_index == node_index) return i;
-  }
-  return Z_GRAPH_SCOPE_NONE;
+  const ZProgramGraph *graph = resolver ? resolver->graph : NULL;
+  if (!graph || node_index >= graph->node_len) return Z_GRAPH_SCOPE_NONE;
+  return resolver->scope_by_node[node_index];
 }
 
 static size_t graph_resolve_nearest_scope(const ZGraphResolver *resolver, size_t node_index) {
@@ -193,10 +189,10 @@ static size_t graph_resolve_nearest_scope(const ZGraphResolver *resolver, size_t
   const ZProgramGraphNode *node = graph_resolve_node(graph, node_index);
   const char *current = node ? node->id : NULL;
   for (size_t depth = 0; graph && current && depth < graph->node_len; depth++) {
-    size_t index = graph_resolve_node_index(graph, current);
+    size_t index = graph_resolve_node_index(resolver, current);
     size_t scope_index = graph_resolve_scope_for_node(resolver, index);
     if (scope_index != Z_GRAPH_SCOPE_NONE) return scope_index;
-    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, current);
+    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, current);
     current = owner ? owner->from : NULL;
   }
   return Z_GRAPH_SCOPE_NONE;
@@ -205,9 +201,9 @@ static size_t graph_resolve_nearest_scope(const ZGraphResolver *resolver, size_t
 static size_t graph_resolve_owner_scope(const ZGraphResolver *resolver, size_t node_index) {
   const ZProgramGraph *graph = resolver ? resolver->graph : NULL;
   const ZProgramGraphNode *node = graph_resolve_node(graph, node_index);
-  const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, node ? node->id : NULL);
+  const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, node ? node->id : NULL);
   if (!owner) return Z_GRAPH_SCOPE_NONE;
-  size_t owner_index = graph_resolve_node_index(graph, owner->from);
+  size_t owner_index = graph_resolve_node_index(resolver, owner->from);
   return graph_resolve_nearest_scope(resolver, owner_index);
 }
 
@@ -225,6 +221,9 @@ static void graph_resolve_add_scope(ZGraphResolver *resolver, size_t node_index,
   scope->kind = kind;
   scope->node_index = node_index;
   scope->parent = Z_GRAPH_SCOPE_NONE;
+  if (resolver->graph && node_index < resolver->graph->node_len && resolver->scope_by_node[node_index] == Z_GRAPH_SCOPE_NONE) {
+    resolver->scope_by_node[node_index] = resolver->scope_len - 1;
+  }
 }
 
 static const char *graph_resolve_import_binding_name(const ZProgramGraphNode *node) {
@@ -235,12 +234,13 @@ static const char *graph_resolve_import_binding_name(const ZProgramGraphNode *no
   return last_dot && last_dot[1] ? last_dot + 1 : module;
 }
 
-static char *graph_resolve_derived_symbol_id(const ZProgramGraph *graph, const ZProgramGraphNode *node, const char *name, const char *kind) {
+static char *graph_resolve_derived_symbol_id(const ZGraphResolver *resolver, const ZProgramGraphNode *node, const char *name, const char *kind) {
+  const ZProgramGraph *graph = resolver ? resolver->graph : NULL;
   if (node && graph_resolve_text_present(node->symbol_id)) return z_strdup(node->symbol_id);
   const ZProgramGraphNode *module = node;
   for (size_t depth = 0; graph && module && module->kind != Z_PROGRAM_GRAPH_NODE_MODULE && depth < graph->node_len; depth++) {
-    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, module->id);
-    module = owner ? graph_resolve_node(graph, graph_resolve_node_index(graph, owner->from)) : NULL;
+    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, module->id);
+    module = owner ? graph_resolve_node(graph, graph_resolve_node_index(resolver, owner->from)) : NULL;
   }
   ZBuf out;
   zbuf_init(&out);
@@ -267,7 +267,7 @@ static char *graph_resolve_derived_symbol_id(const ZProgramGraph *graph, const Z
   return out.data ? out.data : z_strdup("symbol:module:main::binding.anonymous");
 }
 
-static const char *graph_resolve_binding_kind(const ZProgramGraph *graph, const ZProgramGraphNode *node) {
+static const char *graph_resolve_binding_kind(const ZGraphResolver *resolver, const ZProgramGraphNode *node) {
   if (!node) return NULL;
   switch (node->kind) {
     case Z_PROGRAM_GRAPH_NODE_IMPORT: return "import";
@@ -279,11 +279,11 @@ static const char *graph_resolve_binding_kind(const ZProgramGraph *graph, const 
     case Z_PROGRAM_GRAPH_NODE_ENUM: return "enum";
     case Z_PROGRAM_GRAPH_NODE_CHOICE: return "choice";
     case Z_PROGRAM_GRAPH_NODE_FUNCTION: {
-      const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, node->id);
+      const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, node->id);
       return owner && graph_resolve_text_eq(owner->kind, "method") ? "method" : "function";
     }
     case Z_PROGRAM_GRAPH_NODE_PARAM: {
-      const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, node->id);
+      const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, node->id);
       if (owner && graph_resolve_text_eq(owner->kind, "typeParam")) return node->is_static ? "staticParam" : "typeParam";
       return "param";
     }
@@ -303,11 +303,10 @@ static char *graph_resolve_binding_name(const ZProgramGraphNode *node) {
 }
 
 static bool graph_resolve_binding_is_ordered(const ZProgramGraph *graph, const ZProgramGraphNode *node) {
+  (void)graph;
   if (!node) return false;
   if (node->kind == Z_PROGRAM_GRAPH_NODE_LET) return true;
-  if (node->kind != Z_PROGRAM_GRAPH_NODE_PARAM) return false;
-  const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, node->id);
-  return !owner || !graph_resolve_text_eq(owner->kind, "typeParam");
+  return false;
 }
 
 static void graph_resolve_add_binding(ZGraphResolver *resolver, size_t scope_index, size_t node_index, const char *name, const char *kind, const char *target_module, const char *target_name, bool ordered) {
@@ -322,7 +321,7 @@ static void graph_resolve_add_binding(ZGraphResolver *resolver, size_t scope_ind
   ZGraphBindingFact *binding = &resolver->bindings[resolver->binding_len++];
   binding->name = z_strdup(name);
   binding->kind = z_strdup(kind);
-  binding->symbol_id = graph_resolve_derived_symbol_id(resolver->graph, node, name, kind);
+  binding->symbol_id = graph_resolve_derived_symbol_id(resolver, node, name, kind);
   binding->target_module = graph_resolve_text_present(target_module) ? z_strdup(target_module) : NULL;
   binding->target_name = graph_resolve_text_present(target_name) ? z_strdup(target_name) : NULL;
   binding->node_index = node_index;
@@ -369,7 +368,7 @@ static bool graph_resolve_binding_visible(const ZGraphResolver *resolver, const 
   const ZProgramGraphNode *binding_node = graph_resolve_node(resolver->graph, binding->node_index);
   const ZProgramGraphNode *ref_node = graph_resolve_node(resolver->graph, ref_node_index);
   if (!binding_node || !ref_node) return true;
-  if (graph_resolve_node_is_ancestor(resolver->graph, binding->node_index, ref_node_index)) return false;
+  if (graph_resolve_node_is_ancestor(resolver, binding->node_index, ref_node_index)) return false;
   if (binding_node->line < ref_node->line) return true;
   if (binding_node->line == ref_node->line && binding_node->column < ref_node->column) return true;
   return false;
@@ -528,7 +527,7 @@ static char *graph_resolve_expr_chain(const ZGraphResolver *resolver, const ZPro
   if (!resolver || !node) return NULL;
   if (node->kind == Z_PROGRAM_GRAPH_NODE_IDENTIFIER) return graph_resolve_text_present(node->name) ? z_strdup(node->name) : NULL;
   if (node->kind == Z_PROGRAM_GRAPH_NODE_FIELD_ACCESS) {
-    const ZProgramGraphNode *left = graph_resolve_child(resolver->graph, node, "left", 0);
+    const ZProgramGraphNode *left = graph_resolve_child(resolver, node, "left", 0);
     char *left_name = graph_resolve_expr_chain(resolver, left);
     if (!left_name || !left_name[0] || !graph_resolve_text_present(node->name)) {
       free(left_name);
@@ -543,7 +542,7 @@ static char *graph_resolve_expr_chain(const ZGraphResolver *resolver, const ZPro
     return out.data ? out.data : NULL;
   }
   if (node->kind == Z_PROGRAM_GRAPH_NODE_METHOD_CALL || node->kind == Z_PROGRAM_GRAPH_NODE_CALL) {
-    const ZProgramGraphNode *left = graph_resolve_child(resolver->graph, node, "left", 0);
+    const ZProgramGraphNode *left = graph_resolve_child(resolver, node, "left", 0);
     char *left_name = graph_resolve_expr_chain(resolver, left);
     if (left_name) return left_name;
     return graph_resolve_text_present(node->name) ? z_strdup(node->name) : NULL;
@@ -573,8 +572,8 @@ static bool graph_resolve_builtin_type(const char *name) {
   static const char *const builtins[] = {
     "Void", "Bool", "bool", "String", "char", "Type",
     "World", "WorldStream", "Fs", "File", "ByteBuf", "NullAlloc", "FixedBufAlloc", "PageAlloc", "GeneralAlloc",
-    "Vec", "Duration", "RandSource", "ProcStatus", "Address", "Net", "Conn", "Listener",
-    "HttpMethod", "HttpClient", "HttpServer", "HttpResult", "HttpError", "HttpHeaderValue", "JsonDoc", "BufferedReader", "BufferedWriter",
+    "Vec", "FixedSet", "FixedDeque", "FixedRingBuffer", "FixedMap", "Duration", "RandSource", "ProcStatus", "ProcChild", "Address", "Net", "Conn", "Listener",
+    "HttpMethod", "HttpClient", "HttpServer", "HttpResult", "HttpError", "HttpHeaderValue", "JsonDoc", "BufferedReader", "BufferedWriter", "FixedReader", "FixedWriter",
     "Env", "Args", "Clock", "Rand", "Proc", "Alloc",
     "Maybe", "Span", "MutSpan",
     "ref", "mutref", "owned", "usize", "isize", "u8", "u16", "u32", "u64",
@@ -699,7 +698,7 @@ static void graph_resolve_reference_diag(ZGraphResolver *resolver, ZGraphReferen
 static void graph_resolve_apply_lookup(ZGraphResolver *resolver, ZGraphReferenceFact *ref, const ZGraphLookup *lookup, const char *target_kind) {
   if (!resolver || !ref || !lookup) return;
   if (lookup->len == 1 && !lookup->overflow) {
-    const ZGraphBindingFact *via = graph_resolve_import_for_binding(resolver, graph_resolve_nearest_scope(resolver, graph_resolve_node_index(resolver->graph, ref->node_id)), lookup->items[0]);
+    const ZGraphBindingFact *via = graph_resolve_import_for_binding(resolver, graph_resolve_nearest_scope(resolver, graph_resolve_node_index(resolver, ref->node_id)), lookup->items[0]);
     graph_resolve_reference_to_binding(ref, resolver, lookup->items[0], target_kind, via ? via->symbol_id : NULL);
     return;
   }
@@ -775,9 +774,9 @@ static bool graph_resolve_static_arg_literal(const char *name) {
 static const ZGraphBindingFact *graph_resolve_callee_binding_from_node(const ZGraphResolver *resolver, const ZProgramGraphNode *node) {
   if (!resolver || !node) return NULL;
   if (node->kind == Z_PROGRAM_GRAPH_NODE_CALL || node->kind == Z_PROGRAM_GRAPH_NODE_METHOD_CALL) {
-    return graph_resolve_callee_binding_from_node(resolver, graph_resolve_child(resolver->graph, node, "left", 0));
+    return graph_resolve_callee_binding_from_node(resolver, graph_resolve_child(resolver, node, "left", 0));
   }
-  size_t node_index = graph_resolve_node_index(resolver->graph, node->id);
+  size_t node_index = graph_resolve_node_index(resolver, node->id);
   size_t scope = graph_resolve_nearest_scope(resolver, node_index);
   if (node->kind == Z_PROGRAM_GRAPH_NODE_IDENTIFIER) {
     ZGraphLookup lookup = graph_resolve_lookup_name(resolver, scope, node->name, node_index, Z_GRAPH_LOOKUP_ANY);
@@ -812,12 +811,12 @@ static const ZGraphBindingFact *graph_resolve_callee_binding_from_node(const ZGr
 
 static bool graph_resolve_type_arg_expects_static(const ZGraphResolver *resolver, size_t node_index) {
   const ZProgramGraphNode *node = graph_resolve_node(resolver ? resolver->graph : NULL, node_index);
-  const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver ? resolver->graph : NULL, node ? node->id : NULL);
+  const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, node ? node->id : NULL);
   if (!owner || !graph_resolve_text_eq(owner->kind, "typeArg")) return false;
-  const ZProgramGraphNode *callee = graph_resolve_node(resolver->graph, graph_resolve_node_index(resolver->graph, owner->from));
+  const ZProgramGraphNode *callee = graph_resolve_node(resolver->graph, graph_resolve_node_index(resolver, owner->from));
   const ZGraphBindingFact *binding = graph_resolve_callee_binding_from_node(resolver, callee);
   const ZProgramGraphNode *decl = binding ? graph_resolve_node(resolver->graph, binding->node_index) : NULL;
-  const ZProgramGraphNode *param = graph_resolve_child(resolver->graph, decl, "typeParam", owner->order);
+  const ZProgramGraphNode *param = graph_resolve_child(resolver, decl, "typeParam", owner->order);
   return param && param->kind == Z_PROGRAM_GRAPH_NODE_PARAM && param->is_static;
 }
 
@@ -885,7 +884,7 @@ static bool graph_resolve_language_builtin_call(ZGraphReferenceFact *ref, const 
 
 static bool graph_resolve_call_reference_to_owner(ZGraphResolver *resolver, ZGraphReferenceFact *ref, const ZGraphBindingFact *owner, const char *member_name, bool allow_value_owner) {
   if (!resolver || !ref || !owner || !member_name) return false;
-  size_t ref_scope = graph_resolve_nearest_scope(resolver, graph_resolve_node_index(resolver->graph, ref->node_id));
+  size_t ref_scope = graph_resolve_nearest_scope(resolver, graph_resolve_node_index(resolver, ref->node_id));
   if (allow_value_owner && graph_resolve_text_eq(owner->kind, "cImport")) {
     const ZProgramGraphNode *target = graph_resolve_node(resolver->graph, owner->node_index);
     ref->resolved = true;
@@ -962,10 +961,21 @@ static void graph_resolve_call_reference(ZGraphResolver *resolver, size_t node_i
   }
 
   if (strncmp(qualified, "std.", 4) == 0 && !first_is_shadowed) {
+    const char *std_source_target_name = z_std_source_target_for_public_call(qualified);
+    const ZStdSourceModule *std_source_module = z_std_source_module_for_public_call(qualified);
     const ZGraphBindingFact *source_binding = graph_resolve_std_source_binding(resolver, qualified);
     if (source_binding) {
-      const ZGraphBindingFact *via = graph_resolve_import_binding_for_module(resolver, scope, z_std_source_module_for_public_call(qualified)->module);
-      graph_resolve_reference_to_binding(ref, resolver, source_binding, "sourceBackedStdlib", via ? via->symbol_id : NULL);
+      const ZGraphBindingFact *via = graph_resolve_import_binding_for_module(resolver, scope, std_source_module->module);
+      graph_resolve_reference_to_binding(ref, resolver, source_binding, "graphBackedStdlib", via ? via->symbol_id : NULL);
+    } else if (std_source_target_name && std_source_module) {
+      ZBuf symbol;
+      zbuf_init(&symbol);
+      zbuf_append(&symbol, "symbol:");
+      zbuf_append(&symbol, std_source_module->module);
+      zbuf_append(&symbol, "::value.");
+      zbuf_append(&symbol, std_source_target_name);
+      graph_resolve_reference_builtin(ref, "graphBackedStdlib", symbol.data ? symbol.data : "");
+      zbuf_free(&symbol);
     } else if (z_std_helper_find(qualified)) {
       ZBuf symbol;
       zbuf_init(&symbol);
@@ -1007,9 +1017,9 @@ static void graph_resolve_call_reference(ZGraphResolver *resolver, size_t node_i
 }
 
 static bool graph_resolve_identifier_is_call_callee(const ZGraphResolver *resolver, const ZProgramGraphNode *node) {
-  const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver ? resolver->graph : NULL, node ? node->id : NULL);
+  const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, node ? node->id : NULL);
   if (!owner || !graph_resolve_text_eq(owner->kind, "left")) return false;
-  size_t owner_index = graph_resolve_node_index(resolver->graph, owner->from);
+  size_t owner_index = graph_resolve_node_index(resolver, owner->from);
   const ZProgramGraphNode *owner_node = graph_resolve_node(resolver->graph, owner_index);
   return owner_node && owner_node->kind == Z_PROGRAM_GRAPH_NODE_CALL && graph_resolve_text_eq(owner_node->name, node->name);
 }
@@ -1018,9 +1028,9 @@ static bool graph_resolve_identifier_is_call_chain_base(const ZGraphResolver *re
   const ZProgramGraph *graph = resolver ? resolver->graph : NULL;
   const char *current = node ? node->id : NULL;
   for (size_t depth = 0; graph && current && depth < graph->node_len; depth++) {
-    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(graph, current);
+    const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, current);
     if (!owner || !graph_resolve_text_eq(owner->kind, "left")) return false;
-    size_t owner_index = graph_resolve_node_index(graph, owner->from);
+    size_t owner_index = graph_resolve_node_index(resolver, owner->from);
     const ZProgramGraphNode *owner_node = graph_resolve_node(graph, owner_index);
     if (!owner_node) return false;
     if (owner_node->kind == Z_PROGRAM_GRAPH_NODE_FIELD_ACCESS) {
@@ -1138,13 +1148,13 @@ static void graph_resolve_build_scopes(ZGraphResolver *resolver) {
 static void graph_resolve_build_bindings(ZGraphResolver *resolver) {
   for (size_t i = 0; resolver && i < resolver->graph->node_len; i++) {
     const ZProgramGraphNode *node = &resolver->graph->nodes[i];
-    const char *kind = graph_resolve_binding_kind(resolver->graph, node);
+    const char *kind = graph_resolve_binding_kind(resolver, node);
     if (!kind) continue;
     char *name = graph_resolve_binding_name(node);
     size_t owner_scope = graph_resolve_owner_scope(resolver, i);
     if (node->kind == Z_PROGRAM_GRAPH_NODE_PARAM) {
-      const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver->graph, node->id);
-      if (owner) owner_scope = graph_resolve_scope_for_node(resolver, graph_resolve_node_index(resolver->graph, owner->from));
+      const ZProgramGraphEdge *owner = graph_resolve_owner_edge(resolver, node->id);
+      if (owner) owner_scope = graph_resolve_scope_for_node(resolver, graph_resolve_node_index(resolver, owner->from));
     } else if (node->kind == Z_PROGRAM_GRAPH_NODE_LET) {
       owner_scope = graph_resolve_owner_scope(resolver, i);
     }
@@ -1167,8 +1177,8 @@ static void graph_resolve_build_bindings(ZGraphResolver *resolver) {
   for (size_t i = 0; resolver && i < resolver->graph->node_len; i++) {
     const ZProgramGraphNode *node = &resolver->graph->nodes[i];
     if (node->kind != Z_PROGRAM_GRAPH_NODE_FOR || !graph_resolve_text_present(node->name)) continue;
-    const ZProgramGraphNode *body = graph_resolve_child(resolver->graph, node, "then", 0);
-    size_t scope = graph_resolve_scope_for_node(resolver, graph_resolve_node_index(resolver->graph, body ? body->id : NULL));
+    const ZProgramGraphNode *body = graph_resolve_child(resolver, node, "then", 0);
+    size_t scope = graph_resolve_scope_for_node(resolver, graph_resolve_node_index(resolver, body ? body->id : NULL));
     graph_resolve_add_binding(resolver, scope, i, node->name, "local", NULL, NULL, false);
   }
 }
@@ -1182,8 +1192,19 @@ static void graph_resolve_build_references(ZGraphResolver *resolver) {
   }
 }
 
+static void graph_resolve_init(ZGraphResolver *resolver, const ZProgramGraph *graph) {
+  *resolver = (ZGraphResolver){.graph = graph};
+  z_program_graph_adjacency_init(&resolver->adjacency, graph);
+  size_t node_len = graph ? graph->node_len : 0;
+  resolver->scope_by_node = z_checked_reallocarray(NULL, node_len ? node_len : 1, sizeof(size_t));
+  for (size_t i = 0; i < node_len; i++) resolver->scope_by_node[i] = Z_GRAPH_SCOPE_NONE;
+}
+
 static void graph_resolve_free(ZGraphResolver *resolver) {
   if (!resolver) return;
+  z_program_graph_adjacency_free(&resolver->adjacency);
+  free(resolver->scope_by_node);
+  resolver->scope_by_node = NULL;
   for (size_t i = 0; i < resolver->scope_len; i++) free(resolver->scopes[i].id);
   for (size_t i = 0; i < resolver->binding_len; i++) {
     free(resolver->bindings[i].name);
@@ -1347,7 +1368,8 @@ void z_program_graph_resolution_facts_free(ZProgramGraphResolutionFacts *facts) 
 bool z_program_graph_collect_resolution_facts(const ZProgramGraph *graph, ZProgramGraphResolutionFacts *facts) {
   if (!facts) return false;
   *facts = (ZProgramGraphResolutionFacts){0};
-  ZGraphResolver resolver = {.graph = graph};
+  ZGraphResolver resolver;
+  graph_resolve_init(&resolver, graph);
   graph_resolve_build_scopes(&resolver);
   graph_resolve_build_bindings(&resolver);
   graph_resolve_build_references(&resolver);
@@ -1376,7 +1398,8 @@ bool z_program_graph_collect_resolution_facts(const ZProgramGraph *graph, ZProgr
 }
 
 void z_program_graph_append_resolution_json(ZBuf *buf, const ZProgramGraph *graph) {
-  ZGraphResolver resolver = {.graph = graph};
+  ZGraphResolver resolver;
+  graph_resolve_init(&resolver, graph);
   graph_resolve_build_scopes(&resolver);
   graph_resolve_build_bindings(&resolver);
   graph_resolve_build_references(&resolver);

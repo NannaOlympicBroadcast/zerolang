@@ -1,9 +1,13 @@
-## Getting Started
+## Start With An Agent
 
-Zero is the programming language for agents. The fastest way to try it today is
-to install the latest compiler release and run a small program.
+Zerolang is designed for a human working with an agent.
 
-## Install The Compiler
+The agent should author the program through the graph. The human should review
+the graph summary, command output, and the `.0` projection when useful. A
+projection is readable and bidirectional, but it is not the normal place for an
+agent to write code.
+
+## Install
 
 ```sh
 curl -fsSL https://zerolang.ai/install.sh | bash
@@ -11,12 +15,53 @@ export PATH="$HOME/.zero/bin:$PATH"
 zero --version
 ```
 
-The installer downloads the latest matching binary from the GitHub release and
-writes it to `$HOME/.zero/bin/zero`.
+Then install the agent bootstrap skill:
 
-## Check Your First File
+```sh
+npx skills add vercel-labs/zerolang
+```
 
-Create `hello.0`:
+Use the installed `zero` command in public examples. If you are developing Zero
+itself, follow the repository contributor notes for checkout-local compiler
+work.
+
+## Hello World
+
+Start by asking:
+
+```json-render
+{
+  "messages": [
+    {
+      "role": "user",
+      "text": "build hello world for zerolang"
+    },
+    {
+      "role": "assistant",
+      "text": "I’ll initialize this directory, add main, and run it."
+    },
+    {
+      "role": "tools",
+      "calls": [
+        {
+          "command": "zero init",
+          "output": "graph project init ok\nwrote: ./zero.toml\nwrote: ./zero.graph"
+        },
+        {
+          "command": "zero patch --op 'addMain' --op 'addCheckWrite fn=\"main\" text=\"hello from zero\\n\"'",
+          "output": "program graph patch ok"
+        },
+        {
+          "command": "zero run",
+          "output": "hello from zero"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The expected projection is:
 
 ```zero
 pub fn main(world: World) -> Void raises {
@@ -24,132 +69,52 @@ pub fn main(world: World) -> Void raises {
 }
 ```
 
-Run the checker:
+That file is a projection of `zero.graph`. Humans can read it, review it, and
+occasionally edit it. Agents should normally keep using `zero query` and
+`zero patch`.
+
+## The Daily Loop
+
+Use this loop for most tasks:
 
 ```sh
-zero check hello.0
+zero query
+zero patch --op help
+zero patch --op 'addMain'
+zero check
+zero test
+zero run -- <args>
 ```
 
-The important parts are:
+The default input is the current directory, so a package command does not need
+`.` unless you want to be explicit.
 
-- `pub fn main` declares the program entry point.
-- `world World` is the capability object passed to the program by the runtime.
-- `world.out.write ...` writes through that explicit capability.
-- `check` handles a fallible operation.
-- `raises` marks that `main` can return an error.
+## Reviewing A Projection
 
-Zero makes effects visible. A program that writes output asks for `World`
-instead of reading a hidden global process object.
-
-## Build And Run An Executable
-
-Create `add.0`:
-
-```zero
-fn answer() -> i32 {
-    return 40 + 2
-}
-
-pub fn main(world: World) -> Void raises {
-    let value: i32 = answer()
-    if value == 42 {
-        check world.out.write("math works\n")
-    } else {
-        check world.out.write("math broke\n")
-    }
-}
-```
-
-Run it:
+When a human wants to see readable text:
 
 ```sh
-zero run add.0
+zero export
+zero verify-projection
 ```
 
-Expected output:
-
-```text
-math works
-```
-
-This example introduces a helper function, a local binding, and `if` / `else`.
-
-## Create A Package
-
-The project workflow starts with `zero new`:
+When a human intentionally edits `src/main.0`, import the projection back into
+the graph before checking or running:
 
 ```sh
-zero new cli hello
-cd hello
-zero check .
-zero test .
-zero run .
-zero build --target linux-musl-x64 --out .zero/out/hello .
+zero import
+zero check
 ```
 
-Single files are useful for learning, but real Zero projects use a `zero.json`
-manifest and source files under `src/`.
+Do not use projection export as an automatic agent step. Export when a human
+asks to review source-like text or when CI wants a projection drift gate.
 
-## Learn The Core Syntax
+## Build An Artifact
 
-Work through these examples in order:
+Use `zero build` for executable, object, or LLVM IR artifacts:
 
 ```sh
-zero check examples/hello.0
-zero check examples/hello-let.0
-zero check examples/functions.0
-zero check examples/branch.0
-zero check examples/point.0
-zero check examples/result-choice.0
+zero build --emit exe --target linux-musl-x64 --out .zero/out/app
 ```
 
-They cover:
-
-- entry points and output
-- `let` bindings
-- functions and return values
-- conditionals
-- `type` data declarations
-- `enum`, `choice`, and `match`
-
-## Inspect A Package
-
-The CLI package example lives in `examples/systems-package`:
-
-```text
-examples/
-  systems-package/
-    src/
-      main.0
-      helpers.0
-      types.0
-    zero.json
-```
-
-Check it:
-
-```sh
-zero check examples/systems-package
-```
-
-Inspect its module graph:
-
-```sh
-zero graph --json examples/systems-package
-```
-
-The manifest tells Zero where the entry point lives:
-
-```json
-{
-  "package": { "name": "systems-package", "version": "0.1.0" },
-  "targets": { "cli": { "kind": "exe", "main": "src/main.0" } }
-}
-```
-
-## Next Steps
-
-- Read Learn Zero for a practical language tour.
-- Use the examples index to pick the next example by concept.
-- Use Building From Source when you want to validate a local checkout.
-- Use the language reference once you have written a few small programs.
+For early exploration, `zero run` is usually enough.

@@ -1,21 +1,32 @@
 fn handle(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
-    if std.http.requestMatches(request, "GET", "/health") {
-        return std.http.writeJsonResponse(response, 200_u16, "{\"ok\":true}")
+    if std.http.requestIsOptions(request, "/users") {
+        return std.http.writeCorsPreflight(response, "*", "GET, POST, OPTIONS", "content-type, authorization")
     }
-    if std.http.requestMatches(request, "POST", "/users") {
+    if std.http.requestIsGet(request, "/health") {
+        return std.http.writeJsonOk(response, "{\"ok\":true}")
+    }
+    let segment_count: usize = std.http.requestPathSegmentCount(request)
+    let first: Maybe<Span<u8>> = std.http.requestPathSegment(request, 0)
+    let second: Maybe<Span<u8>> = std.http.requestPathSegment(request, 1)
+    if std.http.requestMethodIs(request, "DELETE") && segment_count == 2 && first.has && second.has && std.mem.eql(first.value, "users") {
+        return std.http.writeResponse(response, 204_u16, "")
+    }
+    if std.http.requestIsPost(request, "/users") {
         let tenant: Maybe<Span<u8>> = std.http.requestQueryValue(request, "tenant")
-        let content_type: Maybe<Span<u8>> = std.http.requestHeader(request, "content-type")
-        let body: Maybe<Span<u8>> = std.http.requestBodyWithin(request, 64)
+        let body: Maybe<Span<u8>> = std.http.requestJsonBodyWithin(request, 64)
         var id: Maybe<u32> = null
         if body.has {
             id = std.json.u32(body.value, "id")
         }
-        if tenant.has && std.mem.eql(tenant.value, "demo") && content_type.has && std.mem.eql(content_type.value, "application/json") && body.has && std.json.validateBytes(body.value) && id.has {
-            return std.http.writeJsonResponse(response, 201_u16, "{\"created\":true}")
+        if tenant.has && std.mem.eql(tenant.value, "demo") && body.has && id.has {
+            return std.http.writeJsonCreated(response, "{\"created\":true}")
         }
-        return std.http.writeJsonResponse(response, 400_u16, "{\"error\":\"invalid\"}")
+        return std.http.writeJsonBadRequest(response, "{\"error\":\"invalid\"}")
     }
-    return std.http.writeJsonResponse(response, 404_u16, "{\"error\":\"not_found\"}")
+    if segment_count == 2 && first.has && second.has && std.mem.eql(first.value, "users") {
+        return std.http.writeJsonNotFound(response, "{\"error\":\"not_found\",\"resource\":\"user\"}")
+    }
+    return std.http.writeJsonNotFound(response, "{\"error\":\"not_found\"}")
 }
 
 pub fn main(world: World) -> Void raises {
@@ -32,9 +43,12 @@ pub fn main(world: World) -> Void raises {
     }
     let content_type: HttpHeaderValue = std.http.headerValue(output.value, "content-type")
     let header: Maybe<Span<u8>> = std.http.headerBytes(output.value, content_type)
-    let body_offset: usize = std.http.responseBodyOffset(output.value)
-    let body: Span<u8> = output.value[body_offset..]
-    if header.has && std.mem.eql(header.value, "application/json") && std.str.contains(output.value, "201 Created") && std.mem.eql(body, "{\"created\":true}") {
+    let body: Maybe<Span<u8>> = std.http.responseBodyBytes(output.value)
+    if header.has && std.mem.eql(header.value, "application/json") && std.str.contains(output.value, "201 Created") && body.has && std.mem.eql(body.value, "{\"created\":true}") {
+        check world.out.write("json api router ok\n")
+        return
+    }
+    if std.str.contains(output.value, "204 No Content") {
         check world.out.write("json api router ok\n")
         return
     }

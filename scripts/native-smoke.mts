@@ -26,6 +26,6 @@ const exe = target.startsWith("win32-") ? `${out}.exe` : out;
 
 mkdirSync(".zero/out", { recursive: true });
 run("make", ["-C", "native/zero-c"]);
-run("bin/zero", ["check", "examples/hello.0"]);
-run("bin/zero", ["build", "--emit", "exe", "--target", target, "examples/add.0", "--out", out]);
+run("bin/zero", ["check", "examples/hello.graph"]);
+run("bin/zero", ["build", "--emit", "exe", "--target", target, "examples/add.graph", "--out", out]);
 run(exe, []);

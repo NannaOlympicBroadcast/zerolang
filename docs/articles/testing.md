@@ -1,94 +1,80 @@
-## Testing And Reliability
+## Run Tests From The Graph
 
-`zero test` runs test blocks from a single `.0` file or every source file in a
-package. The test runner is part of the main CLI workflow and reports structured
-JSON for supported test workflows.
+In Zerolang, `zero test` runs test blocks from graph inputs and graph-first packages. When
+this page shows `test` projection syntax, read it as the human review view of a
+graph-backed test declaration.
 
-Common commands:
+```json-render
+{
+  "messages": [
+    {
+      "role": "user",
+      "text": "add subtract and prove it works"
+    },
+    {
+      "role": "assistant",
+      "text": "I’ll add the function and a focused test for it."
+    },
+    {
+      "role": "tools",
+      "calls": [
+        {
+          "command": "zero patch /tmp/subtract.patch",
+          "output": "program graph patch ok"
+        },
+        {
+          "command": "zero test --json --filter subtract",
+          "output": "{\"ok\":true,\"passedTests\":1,\"expectedFailures\":0}"
+        }
+      ]
+    }
+  ]
+}
+```
+
+## What This Means
+
+```zero
+test "add works" {
+    expect (add(40, 2) == 42)
+}
+```
+
+Agents should add or update tests through graph patches.
+
+## Daily Test Commands
 
 ```sh
-zero test conformance/native/pass/test-blocks.0
-zero test --json --filter addition conformance/native/pass/test-blocks.0
-zero test --json conformance/packages/test-app
-pnpm run reliability:smoke
-pnpm run native:sanitize
+zero test
+zero test --json
+zero test --json --filter add
 ```
 
 Package tests discover test blocks across the package entry file and local
-modules. Filtered tests use substring matching on the test name, which keeps CI
-shards simple and deterministic.
+modules. Filters use substring matching on the test name.
+
+## Expected Failures
 
 Expected-fail tests are named with `xfail:`, `expected fail:`, or `[xfail]`.
 
 | Result | JSON effect |
 | --- | --- |
-| The test fails as expected. | Status is `expected-fail`; `expectedFailures` increments. |
-| The test passes unexpectedly. | Status is `unexpected-pass`; `unexpectedPasses` increments and the command fails. |
+| The test fails as expected. | `expectedFailures` increments. |
+| The test passes unexpectedly. | `unexpectedPasses` increments and the command fails. |
 
-## JSON Contract
+`zero test --json` includes `fixtures`, `snapshotKey`, selected/discovered
+counts, stdout/stderr, and per-test results.
 
-`zero test --json` is intended for CI, editors, and repair agents. The stable fields include:
+## Repository Reliability
 
-```text
-ok
-sourceFile
-target
-testBackend
-selectedTests
-discoveredTests
-passedTests
-failedTests
-expectedFailures
-unexpectedPasses
-durationMs
-stdout
-stderr
-testDiscovery
-fixtures
-targetFacts
-results
+Repository-level reliability checks still live outside the docs site:
+
+```sh
+pnpm run reliability:smoke
+pnpm run native:sanitize
+pnpm run conformance
 ```
 
-`testDiscovery` records how the test set was found:
-
-- discovery mode and filter
-- package root and manifest path
-- source file count and module count
-- discovered and selected counts
-
-`fixtures.sourceFiles` lists the loaded source files. `fixtures.goldenOutput`
-records deterministic text output. `fixtures.snapshotKey` identifies the
-snapshot contract for review.
-
-Each result contains the test name, status, expected-fail flag, duration, source
-location, and failure span when a failure is available.
-
-## Golden And Snapshot Workflow
-
-Golden rows compare command output against exact expected output. Snapshot rows
-compare structured metadata or formatted source against the checked-in contract.
-
-Review snapshot changes like API changes: confirm the behavior change first,
-then update the fixture or expected JSON in the same change that implements it.
-
-The reliability smoke writes `.zero/reliability-smoke/report.json` with golden,
-snapshot, fuzz, and crasher rows. It covers package tests, filtered tests,
-expected-fail behavior, formatter snapshots, stdlib parser helpers, generated
-fuzz fixtures, and minimized crash repros.
-
-## Fuzz And Crasher Repros
-
-Fuzz harnesses should be small, deterministic, and source-backed:
-
-- Parser fuzzing should run `zero tokens --json` and `zero parse --json` on generated `.0` files.
-- Checker fuzzing should run `zero check --json` and assert diagnostics for invalid programs instead of accepting crashes.
-- Formatter fuzzing should compare `zero fmt` output against stable source snapshots.
-- Stdlib parser fuzzing should use module examples such as `examples/std-data-formats.0` and inspect `usedStdlibHelpers`.
-
-When a compiler crash is found, reduce it to a single fixture under conformance
-or a documented smoke repro. Keep the minimized input in the reliability report
-until a focused regression test owns it.
-
-`pnpm run native:sanitize` remains the native hardening gate. Keep sanitizer
-failures, fuzz failures, and crasher repros visible in CI rather than hiding
-them behind best-effort local scripts.
+The reliability smoke covers golden output rows, structured snapshot rows,
+fuzz cases, and crasher regressions. Use those suites for compiler reliability,
+not per-page documentation assertions.

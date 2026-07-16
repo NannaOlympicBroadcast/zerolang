@@ -1,0 +1,39 @@
+export c fn main() -> i32 {
+    let path: Span<u8> = "/crm/accounts/42/update"
+    if std.http.pathSegmentCount(path) != 4 {
+        return 11
+    }
+    let resource: Maybe<Span<u8>> = std.http.pathSegment(path, 1)
+    let id: Maybe<Span<u8>> = std.http.pathSegment(path, 2)
+    let action: Maybe<Span<u8>> = std.http.pathSegment(path, 3)
+    if !resource.has || !std.mem.eql(resource.value, "accounts") {
+        return 12
+    }
+    if !id.has || !std.mem.eql(id.value, "42") {
+        return 13
+    }
+    if !action.has || !std.mem.eql(action.value, "update") {
+        return 14
+    }
+    let missing: Maybe<Span<u8>> = std.http.pathSegment(path, 4)
+    if missing.has {
+        return 15
+    }
+    let request: Span<u8> = "PATCH /crm/accounts/42?tenant=demo\ncontent-type: application/json\n\n{\"stage\":\"customer\"}"
+    if std.http.requestPathSegmentCount(request) != 3 {
+        return 16
+    }
+    let first: Maybe<Span<u8>> = std.http.requestPathSegment(request, 0)
+    let second: Maybe<Span<u8>> = std.http.requestPathSegment(request, 1)
+    let request_id: Maybe<Span<u8>> = std.http.requestPathSegment(request, 2)
+    if !first.has || !std.mem.eql(first.value, "crm") {
+        return 17
+    }
+    if !second.has || !std.mem.eql(second.value, "accounts") {
+        return 18
+    }
+    if !request_id.has || !std.mem.eql(request_id.value, "42") {
+        return 19
+    }
+    return 32
+}

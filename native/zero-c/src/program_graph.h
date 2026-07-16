@@ -121,6 +121,18 @@ typedef struct {
   char edge_target[16];
 } ZProgramGraphValidation;
 
+typedef struct {
+  const char **slots;
+  size_t cap;
+  size_t len;
+} ZProgramGraphIdSet;
+
+void z_program_graph_id_set_init(ZProgramGraphIdSet *set, size_t expected);
+void z_program_graph_id_set_free(ZProgramGraphIdSet *set);
+bool z_program_graph_id_set_has(const ZProgramGraphIdSet *set, const char *id);
+void z_program_graph_id_set_add(ZProgramGraphIdSet *set, const char *id);
+char *z_program_graph_source_node_base_id(const ZProgramGraph *graph, const ZProgramGraphNode *node, const ZProgramGraphEdge *owner_edge, const char *owner_new_id);
+char *z_program_graph_source_node_collision_id(const ZProgramGraphNode *node, const char *base_id, const ZProgramGraphIdSet *used, bool force_suffix);
 const char *z_program_graph_node_kind_name(ZProgramGraphNodeKind kind);
 const char *z_program_graph_edge_target_name(ZProgramGraphEdgeTarget target);
 const char *z_program_graph_validation_state_name(ZProgramGraphValidationState state);
@@ -129,6 +141,7 @@ void z_program_graph_finalize_identities(ZProgramGraph *graph);
 bool z_program_graph_node_id_valid(const char *id);
 void z_program_graph_init(ZProgramGraph *graph);
 void z_program_graph_free(ZProgramGraph *graph);
+bool z_program_graph_clone(const ZProgramGraph *from, ZProgramGraph *out);
 bool z_program_graph_validate(const ZProgramGraph *graph, ZProgramGraphValidation *validation);
 
 #endif

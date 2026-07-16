@@ -1,4 +1,3 @@
 pub fn inputName() -> String {
-    let name: String = rescue std.args.get(1) err "batch3.txt"
-    return name
+    return std.args.getOr(1, "batch3.txt")
 }

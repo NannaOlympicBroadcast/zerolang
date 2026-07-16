@@ -29,6 +29,9 @@ static void free_stmt_vec(StmtVec *vec) {
     free(stmt->name);
     free(stmt->type);
     free(stmt->resolved_type);
+    free(stmt->graph_id);
+    free(stmt->then_graph_id);
+    free(stmt->else_graph_id);
     free_expr(stmt->target);
     free_expr(stmt->expr);
     free_expr(stmt->range_end);
@@ -38,6 +41,7 @@ static void free_stmt_vec(StmtVec *vec) {
       free(stmt->match_arms.items[arm_index].case_name);
       free(stmt->match_arms.items[arm_index].range_end);
       free(stmt->match_arms.items[arm_index].payload_name);
+      free(stmt->match_arms.items[arm_index].body_graph_id);
       free_expr(stmt->match_arms.items[arm_index].guard);
       free_stmt_vec(&stmt->match_arms.items[arm_index].body);
     }

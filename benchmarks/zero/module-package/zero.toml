@@ -1,0 +1,10 @@
+[package]
+name = "bench-module-package"
+version = "0.1.0"
+
+[targets.cli]
+kind = "exe"
+main = "src/main.0"
+
+[repositoryGraph]
+compilerInput = true

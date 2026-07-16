@@ -1,0 +1,56 @@
+export c fn main() -> i32 {
+    var text_buf: [160]u8 = [0_u8; 160]
+    let text_response: Maybe<Span<u8>> = std.http.writeTextOk(text_buf, "hello")
+    if !text_response.has {
+        return 1
+    }
+    let text_status: Bool = std.str.contains(text_response.value, "200 OK")
+    let text_content_type: Bool = std.str.contains(text_response.value, "content-type: text/plain; charset=utf-8")
+    if !text_status || !text_content_type {
+        return 2
+    }
+    let text_body: Maybe<Span<u8>> = std.http.responseBodyBytes(text_response.value)
+    if !text_body.has {
+        return 3
+    }
+    let text_body_ok: Bool = std.mem.eql(text_body.value, "hello")
+    if !text_body_ok {
+        return 4
+    }
+    var text_404_buf: [160]u8 = [0_u8; 160]
+    let text_404_response: Maybe<Span<u8>> = std.http.writeTextResponse(text_404_buf, 404_u16, "missing")
+    if !text_404_response.has {
+        return 5
+    }
+    let text_404_status: Bool = std.str.contains(text_404_response.value, "404 Not Found")
+    if !text_404_status {
+        return 6
+    }
+    var html_buf: [192]u8 = [0_u8; 192]
+    let html_response: Maybe<Span<u8>> = std.http.writeHtmlOk(html_buf, "<h1>ok</h1>")
+    if !html_response.has {
+        return 7
+    }
+    let html_content_type: Bool = std.str.contains(html_response.value, "content-type: text/html; charset=utf-8")
+    if !html_content_type {
+        return 8
+    }
+    let html_body: Maybe<Span<u8>> = std.http.responseBodyBytes(html_response.value)
+    if !html_body.has {
+        return 9
+    }
+    let html_body_ok: Bool = std.mem.eql(html_body.value, "<h1>ok</h1>")
+    if !html_body_ok {
+        return 10
+    }
+    var html_404_buf: [192]u8 = [0_u8; 192]
+    let html_404_response: Maybe<Span<u8>> = std.http.writeHtmlResponse(html_404_buf, 404_u16, "<h1>missing</h1>")
+    if !html_404_response.has {
+        return 11
+    }
+    let html_404_status: Bool = std.str.contains(html_404_response.value, "404 Not Found")
+    if !html_404_status {
+        return 12
+    }
+    return 0
+}

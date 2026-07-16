@@ -1,6 +1,9 @@
 #include "program_graph_format.h"
 #include "program_graph_lower.h"
+#include "program_graph_projection.h"
+#include "program_graph_store_binary.h"
 
+#include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,22 +48,6 @@ char *z_strndup(const char *text, size_t len) {
   memcpy(copy, text ? text : "", len + 1);
   copy[len] = 0;
   return copy;
-}
-
-char *z_read_file(const char *path, ZDiag *diag) {
-  FILE *file = fopen(path, "rb");
-  if (!file) {
-    if (diag) snprintf(diag->message, sizeof(diag->message), "failed to read test graph");
-    return NULL;
-  }
-  fseek(file, 0, SEEK_END);
-  long size = ftell(file);
-  rewind(file);
-  char *data = z_checked_malloc((size_t)size + 1);
-  size_t read = fread(data, 1, (size_t)size, file);
-  fclose(file);
-  data[read] = 0;
-  return data;
 }
 
 bool z_write_file(const char *path, const char *text, ZDiag *diag) {
@@ -109,6 +96,40 @@ static void expect(int ok, const char *message) {
   exit(1);
 }
 
+static uint64_t read_le_u64(const unsigned char *bytes, size_t offset, size_t len) {
+  expect(bytes != NULL && offset <= len && len - offset >= 8, "binary fixture read out of range");
+  uint64_t value = 0;
+  for (unsigned i = 0; i < 8; i++) value |= (uint64_t)bytes[offset + i] << (i * 8);
+  return value;
+}
+
+static void write_le_u64(unsigned char *bytes, size_t offset, size_t len, uint64_t value) {
+  expect(bytes != NULL && offset <= len && len - offset >= 8, "binary fixture write out of range");
+  for (unsigned i = 0; i < 8; i++) bytes[offset + i] = (unsigned char)((value >> (i * 8)) & 0xffu);
+}
+
+static unsigned char *copy_binary_fixture(const ZBuf *binary) {
+  unsigned char *copy = z_checked_malloc(binary->len);
+  memcpy(copy, binary->data, binary->len);
+  return copy;
+}
+
+static void expect_binary_store_rejected(const unsigned char *bytes, size_t len, const char *message) {
+  ZProgramGraphStore parsed;
+  ZDiag diag = {0};
+  expect(!z_program_graph_store_parse_binary("corrupt-zero.graph", bytes, len, &parsed, &diag), message);
+  expect(strstr(diag.message, "invalid") != NULL || strstr(diag.message, "failed") != NULL, "binary rejection reported wrong diagnostic");
+}
+
+enum {
+  BINARY_SOURCE_COUNT_OFFSET = 24,
+  BINARY_PROJECTION_COUNT_OFFSET = 32,
+  BINARY_NODE_COUNT_OFFSET = 40,
+  BINARY_EDGE_COUNT_OFFSET = 48,
+  BINARY_STRING_BYTES_OFFSET = 64,
+  BINARY_MODULE_IDENTITY_REF_OFFSET = 72,
+};
+
 static void set_node(ZProgramGraphNode *node, const char *id, ZProgramGraphNodeKind kind, const char *name, const char *type) {
   node->id = z_strdup(id);
   node->kind = kind;
@@ -125,6 +146,111 @@ static void set_edge(ZProgramGraphEdge *edge, const char *from, const char *to, 
   edge->kind = z_strdup(kind);
   edge->target = target;
   edge->order = order;
+}
+
+static void expect_binary_store_corruption_rejected(const ZProgramGraph *graph) {
+  ZProgramGraphStore projections;
+  z_program_graph_store_init(&projections);
+  projections.projection_paths = z_checked_calloc(1, sizeof(char *));
+  projections.projection_texts = z_checked_calloc(1, sizeof(char *));
+  projections.projection_cap = 1;
+  projections.projection_len = 1;
+  projections.projection_paths[0] = z_strdup("program-graph-smoke.0");
+  projections.projection_texts[0] = z_strdup("pub fn main(world: World) -> Void raises {\n}\n");
+
+  ZBuf binary;
+  zbuf_init(&binary);
+  z_program_graph_store_append_binary(&binary, graph, &projections);
+  expect(z_program_graph_store_bytes_are_binary((const unsigned char *)binary.data, binary.len), "binary store fixture did not use binary magic");
+
+  ZProgramGraphStore parsed;
+  ZDiag valid_diag = {0};
+  expect(z_program_graph_store_parse_binary("valid-zero.graph", (const unsigned char *)binary.data, binary.len, &parsed, &valid_diag), valid_diag.message);
+  z_program_graph_store_free(&parsed);
+
+  uint64_t string_bytes = read_le_u64((const unsigned char *)binary.data, BINARY_STRING_BYTES_OFFSET, binary.len);
+  uint64_t module_identity_offset = read_le_u64((const unsigned char *)binary.data, BINARY_MODULE_IDENTITY_REF_OFFSET, binary.len);
+  uint64_t module_identity_len = read_le_u64((const unsigned char *)binary.data, BINARY_MODULE_IDENTITY_REF_OFFSET + 8, binary.len);
+  expect(string_bytes <= (uint64_t)binary.len, "binary fixture has invalid string table size");
+  expect(module_identity_len > 2, "binary fixture module identity too small to corrupt");
+  size_t strings_offset = binary.len - (size_t)string_bytes;
+  expect(module_identity_offset + 1 < string_bytes, "binary fixture module identity offset out of range");
+
+  unsigned char *embedded_nul = copy_binary_fixture(&binary);
+  embedded_nul[strings_offset + (size_t)module_identity_offset + 1] = 0;
+  expect_binary_store_rejected(embedded_nul, binary.len, "binary store with embedded NUL parsed");
+  free(embedded_nul);
+
+  unsigned char *too_many_sources = copy_binary_fixture(&binary);
+  write_le_u64(too_many_sources, BINARY_SOURCE_COUNT_OFFSET, binary.len, 100001u);
+  expect_binary_store_rejected(too_many_sources, binary.len, "binary store with oversized source count parsed");
+  free(too_many_sources);
+
+  unsigned char *too_many_projections = copy_binary_fixture(&binary);
+  write_le_u64(too_many_projections, BINARY_PROJECTION_COUNT_OFFSET, binary.len, 100001u);
+  expect_binary_store_rejected(too_many_projections, binary.len, "binary store with oversized projection count parsed");
+  free(too_many_projections);
+
+  unsigned char *too_many_nodes = copy_binary_fixture(&binary);
+  write_le_u64(too_many_nodes, BINARY_NODE_COUNT_OFFSET, binary.len, 1000001u);
+  expect_binary_store_rejected(too_many_nodes, binary.len, "binary store with oversized node count parsed");
+  free(too_many_nodes);
+
+  unsigned char *too_many_edges = copy_binary_fixture(&binary);
+  write_le_u64(too_many_edges, BINARY_EDGE_COUNT_OFFSET, binary.len, 4000001u);
+  expect_binary_store_rejected(too_many_edges, binary.len, "binary store with oversized edge count parsed");
+  free(too_many_edges);
+
+  unsigned char *too_many_string_bytes = copy_binary_fixture(&binary);
+  write_le_u64(too_many_string_bytes, BINARY_STRING_BYTES_OFFSET, binary.len, 256u * 1024u * 1024u + 1u);
+  expect_binary_store_rejected(too_many_string_bytes, binary.len, "binary store with oversized string table parsed");
+  free(too_many_string_bytes);
+
+  zbuf_free(&binary);
+  z_program_graph_store_free(&projections);
+}
+
+static void expect_binary_store_rejects_user_std_basename_without_projection(void) {
+  ZProgramGraph graph;
+  z_program_graph_init(&graph);
+  graph.nodes = z_checked_calloc(1, sizeof(ZProgramGraphNode));
+  graph.node_len = 1;
+  graph.node_cap = 1;
+  set_node(&graph.nodes[0], "#000001", Z_PROGRAM_GRAPH_NODE_MODULE, "term", NULL);
+  free(graph.nodes[0].path);
+  graph.nodes[0].path = z_strdup("src/term.0");
+  z_program_graph_finalize_identities(&graph);
+
+  ZBuf binary;
+  zbuf_init(&binary);
+  z_program_graph_store_append_binary(&binary, &graph, NULL);
+  ZProgramGraphStore parsed;
+  ZDiag diag = {0};
+  expect(!z_program_graph_store_parse_binary("user-std-basename.graph", (const unsigned char *)binary.data, binary.len, &parsed, &diag),
+         "binary store accepted user source path matching std basename without projection");
+  expect(strstr(diag.message, "projection table") != NULL || strstr(diag.message, "source table") != NULL,
+         "binary store basename collision reported wrong diagnostic");
+
+  zbuf_free(&binary);
+  z_program_graph_free(&graph);
+}
+
+static void expect_binary_fast_sync_rejects_empty_projection_table(const ZProgramGraph *graph) {
+  ZBuf binary;
+  zbuf_init(&binary);
+  z_program_graph_store_append_binary(&binary, graph, NULL);
+
+  char storage_path[128];
+  snprintf(storage_path, sizeof(storage_path), "/tmp/zero-program-graph-empty-projection-%p.graph", (void *)graph);
+  ZDiag write_diag = {0};
+  expect(z_write_binary_file(storage_path, (const unsigned char *)binary.data, binary.len, &write_diag), write_diag.message);
+
+  ZProgramGraphProjectionSourceSync sync = Z_PROGRAM_GRAPH_PROJECTION_SYNC_DIVERGED;
+  expect(!z_program_graph_projection_source_sync_state_binary_fast(storage_path, ".", &sync),
+         "binary fast sync accepted store with empty projection table");
+
+  remove(storage_path);
+  zbuf_free(&binary);
 }
 
 static void expect_lowered_program(void) {
@@ -575,6 +701,9 @@ int main(void) {
   z_program_graph_finalize_identities(&graph);
   expect(z_program_graph_validate(&graph, &validation), "valid symbol target failed validation");
   expect(validation.state == Z_PROGRAM_GRAPH_VALIDATION_SHAPE_VALID, "valid graph reported wrong state");
+  expect_binary_store_corruption_rejected(&graph);
+  expect_binary_store_rejects_user_std_basename_without_projection();
+  expect_binary_fast_sync_rejects_empty_projection_table(&graph);
 
   ZBuf dump;
   zbuf_init(&dump);

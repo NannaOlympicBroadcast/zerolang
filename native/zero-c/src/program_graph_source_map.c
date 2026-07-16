@@ -303,6 +303,7 @@ static void source_map_load_file(GraphSourceMapFile *file) {
   if (!file || !file->path || !file->path[0]) return;
   ZDiag diag = {0};
   file->text = z_read_file(file->path, &diag);
+  free((char *)diag.path);
   file->readable = file->text != NULL;
   if (!file->text) return;
   ZDiag token_diag = {0};

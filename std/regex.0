@@ -1,0 +1,1724 @@
+fn __zero_std_regex_pow2_u8(exp: usize) -> u8 {
+    var value: u8 = 1
+    var index: usize = 0
+    while index < exp {
+        value = value * 2_u8
+        index = index + 1
+    }
+    return value
+}
+
+fn __zero_std_regex_bit_get(bits: Span<u8>, index: usize) -> Bool {
+    let slot: usize = index / 8
+    if slot >= std.mem.len(bits) {
+        return false
+    }
+    let unit: u8 = __zero_std_regex_pow2_u8(index % 8)
+    return (bits[slot] / unit) % 2_u8 == 1_u8
+}
+
+fn __zero_std_regex_bit_set(bits: MutSpan<u8>, index: usize) -> Bool {
+    let slot: usize = index / 8
+    if slot >= std.mem.len(bits) {
+        return false
+    }
+    let unit: u8 = __zero_std_regex_pow2_u8(index % 8)
+    if (bits[slot] / unit) % 2_u8 == 1_u8 {
+        return false
+    }
+    bits[slot] = bits[slot] + unit
+    return true
+}
+
+fn __zero_std_regex_bit_mark(bits: MutSpan<u8>, index: usize) -> Void {
+    let changed: Bool = __zero_std_regex_bit_set(bits, index)
+    if changed {
+        return
+    }
+}
+
+fn __zero_std_regex_decode(text: Span<u8>, index: usize) -> u64 {
+    let len: usize = std.mem.len(text)
+    if index >= len {
+        return 0
+    }
+    let first: u8 = text[index]
+    if first < 128_u8 {
+        return 4294967296_u64 + (first as u64)
+    }
+    if first >= 194_u8 && first <= 223_u8 {
+        if index + 2 > len {
+            return 0
+        }
+        let second: u8 = text[index + 1]
+        if second < 128_u8 || second > 191_u8 {
+            return 0
+        }
+        let cp: u64 = ((first as u64) - 192_u64) * 64_u64 + ((second as u64) - 128_u64)
+        return 2_u64 * 4294967296_u64 + cp
+    }
+    if first >= 224_u8 && first <= 239_u8 {
+        if index + 3 > len {
+            return 0
+        }
+        let second: u8 = text[index + 1]
+        let third: u8 = text[index + 2]
+        if second < 128_u8 || second > 191_u8 || (third < 128_u8 || third > 191_u8) {
+            return 0
+        }
+        if first == 224_u8 && second < 160_u8 {
+            return 0
+        }
+        if first == 237_u8 && second > 159_u8 {
+            return 0
+        }
+        let cp: u64 = ((first as u64) - 224_u64) * 4096_u64 + ((second as u64) - 128_u64) * 64_u64 + ((third as u64) - 128_u64)
+        return 3_u64 * 4294967296_u64 + cp
+    }
+    if first >= 240_u8 && first <= 244_u8 {
+        if index + 4 > len {
+            return 0
+        }
+        let second: u8 = text[index + 1]
+        let third: u8 = text[index + 2]
+        let fourth: u8 = text[index + 3]
+        if second < 128_u8 || second > 191_u8 {
+            return 0
+        }
+        if third < 128_u8 || third > 191_u8 || (fourth < 128_u8 || fourth > 191_u8) {
+            return 0
+        }
+        if first == 240_u8 && second < 144_u8 {
+            return 0
+        }
+        if first == 244_u8 && second > 143_u8 {
+            return 0
+        }
+        let cp: u64 = ((first as u64) - 240_u64) * 262144_u64 + ((second as u64) - 128_u64) * 4096_u64 + ((third as u64) - 128_u64) * 64_u64 + ((fourth as u64) - 128_u64)
+        return 4_u64 * 4294967296_u64 + cp
+    }
+    return 0
+}
+
+fn __zero_std_regex_decode_width(joined: u64) -> usize {
+    return (joined / 4294967296_u64) as usize
+}
+
+fn __zero_std_regex_decode_cp(joined: u64) -> u32 {
+    return (joined % 4294967296_u64) as u32
+}
+
+fn __zero_std_regex_emit_byte(buffer: MutSpan<u8>, bpos: usize, limit: usize, value: u8) -> usize {
+    if bpos == 16777215 || bpos >= limit {
+        return 16777215
+    }
+    buffer[bpos] = value
+    return bpos + 1
+}
+
+fn __zero_std_regex_emit_u16(buffer: MutSpan<u8>, bpos: usize, limit: usize, value: usize) -> usize {
+    if bpos == 16777215 || bpos + 2 > limit {
+        return 16777215
+    }
+    buffer[bpos] = (value % 256) as u8
+    buffer[bpos + 1] = ((value / 256) % 256) as u8
+    return bpos + 2
+}
+
+fn __zero_std_regex_emit_u32(buffer: MutSpan<u8>, bpos: usize, limit: usize, value: u32) -> usize {
+    if bpos == 16777215 || bpos + 4 > limit {
+        return 16777215
+    }
+    buffer[bpos] = (value % 256_u32) as u8
+    buffer[bpos + 1] = ((value / 256_u32) % 256_u32) as u8
+    buffer[bpos + 2] = ((value / 65536_u32) % 256_u32) as u8
+    buffer[bpos + 3] = ((value / 16777216_u32) % 256_u32) as u8
+    return bpos + 4
+}
+
+fn __zero_std_regex_write_u16_at(buffer: MutSpan<u8>, at: usize, value: usize) -> Void {
+    if at + 2 > std.mem.len(buffer) {
+        return
+    }
+    buffer[at] = (value % 256) as u8
+    buffer[at + 1] = ((value / 256) % 256) as u8
+}
+
+fn __zero_std_regex_read_u16(program: Span<u8>, at: usize) -> usize {
+    if at + 2 > std.mem.len(program) {
+        return 16777215
+    }
+    return (program[at] as usize) + (program[at + 1] as usize) * 256
+}
+
+fn __zero_std_regex_read_u32(program: Span<u8>, at: usize) -> u32 {
+    if at + 4 > std.mem.len(program) {
+        return 4294967295_u32
+    }
+    return (program[at] as u32) + (program[at + 1] as u32) * 256_u32 + (program[at + 2] as u32) * 65536_u32 + (program[at + 3] as u32) * 16777216_u32
+}
+
+fn __zero_std_regex_instr_len(program: Span<u8>, pc: usize) -> usize {
+    let len: usize = std.mem.len(program)
+    if pc >= len {
+        return 0
+    }
+    let op: u8 = program[pc]
+    if op == 1_u8 {
+        if pc + 5 > len {
+            return 0
+        }
+        return 5
+    }
+    if op == 2_u8 || op == 4_u8 || (op == 7_u8 || op == 8_u8) || (op == 9_u8 || op == 10_u8) {
+        return 1
+    }
+    if op == 3_u8 {
+        if pc + 4 > len {
+            return 0
+        }
+        let count: usize = program[pc + 3] as usize
+        if pc + 4 + count * 8 > len {
+            return 0
+        }
+        return 4 + count * 8
+    }
+    if op == 5_u8 {
+        if pc + 3 > len {
+            return 0
+        }
+        return 3
+    }
+    if op == 6_u8 {
+        if pc + 5 > len {
+            return 0
+        }
+        return 5
+    }
+    return 0
+}
+
+fn __zero_std_regex_shift_right(buffer: MutSpan<u8>, start: usize, end: usize, delta: usize, limit: usize) -> Bool {
+    if end + delta > limit {
+        return false
+    }
+    var index: usize = end
+    while index > start {
+        index = index - 1
+        buffer[index + delta] = buffer[index]
+    }
+    return true
+}
+
+fn __zero_std_regex_fix_targets(buffer: MutSpan<u8>, scan_start: usize, scan_end: usize, frag_start: usize, frag_end: usize, delta: usize) -> Bool {
+    var pc: usize = scan_start
+    while pc < scan_end {
+        let il: usize = __zero_std_regex_instr_len(buffer[..scan_end], pc)
+        if il == 0 {
+            return false
+        }
+        let op: u8 = buffer[pc]
+        if op == 5_u8 || op == 6_u8 {
+            let t1: usize = (buffer[pc + 1] as usize) + (buffer[pc + 2] as usize) * 256
+            if t1 != 65535 && (t1 >= frag_start && t1 <= frag_end) {
+                __zero_std_regex_write_u16_at(buffer, pc + 1, t1 + delta)
+            }
+        }
+        if op == 6_u8 {
+            let t2: usize = (buffer[pc + 3] as usize) + (buffer[pc + 4] as usize) * 256
+            if t2 != 65535 && (t2 >= frag_start && t2 <= frag_end) {
+                __zero_std_regex_write_u16_at(buffer, pc + 3, t2 + delta)
+            }
+        }
+        pc = pc + il
+    }
+    return true
+}
+
+fn __zero_std_regex_copy_fragment(buffer: MutSpan<u8>, src_start: usize, src_end: usize, dst: usize, limit: usize) -> usize {
+    let frag_len: usize = src_end - src_start
+    if dst + frag_len > limit {
+        return 16777215
+    }
+    var index: usize = 0
+    while index < frag_len {
+        buffer[dst + index] = buffer[src_start + index]
+        index = index + 1
+    }
+    if !__zero_std_regex_fix_targets(buffer, dst, dst + frag_len, src_start, src_end, dst - src_start) {
+        return 16777215
+    }
+    return dst + frag_len
+}
+
+fn __zero_std_regex_esc_pack(err: u32, kind: u32, ppos: usize, value: u32) -> u64 {
+    return (err as u64) * 281474976710656_u64 + (kind as u64) * 1099511627776_u64 + (ppos as u64) * 16777216_u64 + (value as u64)
+}
+
+fn __zero_std_regex_esc_err(joined: u64) -> u32 {
+    return (joined / 281474976710656_u64) as u32
+}
+
+fn __zero_std_regex_esc_kind(joined: u64) -> u32 {
+    return ((joined / 1099511627776_u64) % 256_u64) as u32
+}
+
+fn __zero_std_regex_esc_ppos(joined: u64) -> usize {
+    return ((joined / 16777216_u64) % 65536_u64) as usize
+}
+
+fn __zero_std_regex_esc_value(joined: u64) -> u32 {
+    return (joined % 16777216_u64) as u32
+}
+
+fn __zero_std_regex_hex_digit(byte: u8) -> u32 {
+    if byte >= 48_u8 && byte <= 57_u8 {
+        return (byte - 48_u8) as u32
+    }
+    if byte >= 97_u8 && byte <= 102_u8 {
+        return (byte - 87_u8) as u32
+    }
+    if byte >= 65_u8 && byte <= 70_u8 {
+        return (byte - 55_u8) as u32
+    }
+    return 4294967295_u32
+}
+
+fn __zero_std_regex_parse_escape(pattern: Span<u8>, ppos: usize, in_class: Bool) -> u64 {
+    let plen: usize = std.mem.len(pattern)
+    if ppos >= plen {
+        return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+    }
+    let byte: u8 = pattern[ppos]
+    if byte == 100_u8 {
+        return __zero_std_regex_esc_pack(0, 1, ppos + 1, 0)
+    }
+    if byte == 68_u8 {
+        return __zero_std_regex_esc_pack(0, 2, ppos + 1, 0)
+    }
+    if byte == 119_u8 {
+        return __zero_std_regex_esc_pack(0, 3, ppos + 1, 0)
+    }
+    if byte == 87_u8 {
+        return __zero_std_regex_esc_pack(0, 4, ppos + 1, 0)
+    }
+    if byte == 115_u8 {
+        return __zero_std_regex_esc_pack(0, 5, ppos + 1, 0)
+    }
+    if byte == 83_u8 {
+        return __zero_std_regex_esc_pack(0, 6, ppos + 1, 0)
+    }
+    if byte == 98_u8 {
+        if in_class {
+            return __zero_std_regex_esc_pack(0, 0, ppos + 1, 8)
+        }
+        return __zero_std_regex_esc_pack(0, 7, ppos + 1, 0)
+    }
+    if byte == 66_u8 {
+        if in_class {
+            return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+        }
+        return __zero_std_regex_esc_pack(0, 8, ppos + 1, 0)
+    }
+    if byte == 110_u8 {
+        return __zero_std_regex_esc_pack(0, 0, ppos + 1, 10)
+    }
+    if byte == 114_u8 {
+        return __zero_std_regex_esc_pack(0, 0, ppos + 1, 13)
+    }
+    if byte == 116_u8 {
+        return __zero_std_regex_esc_pack(0, 0, ppos + 1, 9)
+    }
+    if byte == 102_u8 {
+        return __zero_std_regex_esc_pack(0, 0, ppos + 1, 12)
+    }
+    if byte == 118_u8 {
+        return __zero_std_regex_esc_pack(0, 0, ppos + 1, 11)
+    }
+    if byte == 48_u8 {
+        if ppos + 1 < plen && (pattern[ppos + 1] >= 48_u8 && pattern[ppos + 1] <= 57_u8) {
+            return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+        }
+        return __zero_std_regex_esc_pack(0, 0, ppos + 1, 0)
+    }
+    if byte >= 49_u8 && byte <= 57_u8 {
+        if in_class {
+            return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+        }
+        return __zero_std_regex_esc_pack(1, 0, ppos, 0)
+    }
+    if byte == 107_u8 {
+        if in_class {
+            return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+        }
+        return __zero_std_regex_esc_pack(4, 0, ppos, 0)
+    }
+    if byte == 112_u8 || byte == 80_u8 {
+        return __zero_std_regex_esc_pack(7, 0, ppos, 0)
+    }
+    if byte == 120_u8 {
+        if ppos + 3 > plen {
+            return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+        }
+        let high: u32 = __zero_std_regex_hex_digit(pattern[ppos + 1])
+        let low: u32 = __zero_std_regex_hex_digit(pattern[ppos + 2])
+        if high == 4294967295_u32 || low == 4294967295_u32 {
+            return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+        }
+        return __zero_std_regex_esc_pack(0, 0, ppos + 3, high * 16_u32 + low)
+    }
+    if byte == 117_u8 {
+        if ppos + 5 > plen {
+            return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+        }
+        var value: u32 = 0
+        var index: usize = 1
+        while index <= 4 {
+            let digit: u32 = __zero_std_regex_hex_digit(pattern[ppos + index])
+            if digit == 4294967295_u32 {
+                return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+            }
+            value = value * 16_u32 + digit
+            index = index + 1
+        }
+        return __zero_std_regex_esc_pack(0, 0, ppos + 5, value)
+    }
+    if byte == 99_u8 {
+        if ppos + 1 < plen {
+            let control: u8 = pattern[ppos + 1]
+            if control >= 65_u8 && control <= 90_u8 {
+                return __zero_std_regex_esc_pack(0, 0, ppos + 2, ((control - 64_u8) as u32))
+            }
+            if control >= 97_u8 && control <= 122_u8 {
+                return __zero_std_regex_esc_pack(0, 0, ppos + 2, ((control - 96_u8) as u32))
+            }
+        }
+        return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+    }
+    let dec: u64 = __zero_std_regex_decode(pattern, ppos)
+    if dec == 0 {
+        return __zero_std_regex_esc_pack(11, 0, ppos, 0)
+    }
+    let cp: u32 = __zero_std_regex_decode_cp(dec)
+    if (cp >= 48_u32 && cp <= 57_u32) || ((cp >= 65_u32 && cp <= 90_u32) || (cp >= 97_u32 && cp <= 122_u32)) {
+        return __zero_std_regex_esc_pack(8, 0, ppos, 0)
+    }
+    return __zero_std_regex_esc_pack(0, 0, ppos + __zero_std_regex_decode_width(dec), cp)
+}
+
+fn __zero_std_regex_res_pack(err: u32, ppos: usize, bpos: usize) -> u64 {
+    return (err as u64) * 281474976710656_u64 + (ppos as u64) * 16777216_u64 + (bpos as u64)
+}
+
+fn __zero_std_regex_res_err(joined: u64) -> u32 {
+    return (joined / 281474976710656_u64) as u32
+}
+
+fn __zero_std_regex_res_ppos(joined: u64) -> usize {
+    return ((joined / 16777216_u64) % 16777216_u64) as usize
+}
+
+fn __zero_std_regex_res_bpos(joined: u64) -> usize {
+    return (joined % 16777216_u64) as usize
+}
+
+fn __zero_std_regex_parse_class(pattern: Span<u8>, start: usize, buffer: MutSpan<u8>, bstart: usize, limit: usize) -> u64 {
+    let plen: usize = std.mem.len(pattern)
+    var ppos: usize = start
+    var negate: u8 = 0
+    if ppos < plen && pattern[ppos] == 94_u8 {
+        negate = 1
+        ppos = ppos + 1
+    }
+    var builtins: u8 = 0
+    var count: usize = 0
+    var bpos: usize = __zero_std_regex_emit_byte(buffer, bstart, limit, 3)
+    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, negate)
+    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 0)
+    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 0)
+    var first: Bool = true
+    while true {
+        if ppos >= plen {
+            return __zero_std_regex_res_pack(8, ppos, bpos)
+        }
+        if pattern[ppos] == 93_u8 && !first {
+            ppos = ppos + 1
+            break
+        }
+        if pattern[ppos] == 93_u8 && first {
+            ppos = ppos + 1
+            break
+        }
+        first = false
+        var lo: u32 = 0
+        var is_builtin: Bool = false
+        var builtin_bit: u8 = 0
+        if pattern[ppos] == 92_u8 {
+            let esc: u64 = __zero_std_regex_parse_escape(pattern, ppos + 1, true)
+            if __zero_std_regex_esc_err(esc) != 0 {
+                return __zero_std_regex_res_pack(__zero_std_regex_esc_err(esc), ppos, bpos)
+            }
+            let kind: u32 = __zero_std_regex_esc_kind(esc)
+            if kind == 0 {
+                lo = __zero_std_regex_esc_value(esc)
+            } else {
+                is_builtin = true
+                if kind == 1 {
+                    builtin_bit = 1
+                } else if kind == 2 {
+                    builtin_bit = 2
+                } else if kind == 3 {
+                    builtin_bit = 4
+                } else if kind == 4 {
+                    builtin_bit = 8
+                } else if kind == 5 {
+                    builtin_bit = 16
+                } else {
+                    builtin_bit = 32
+                }
+            }
+            ppos = __zero_std_regex_esc_ppos(esc)
+        } else {
+            let dec: u64 = __zero_std_regex_decode(pattern, ppos)
+            if dec == 0 {
+                return __zero_std_regex_res_pack(11, ppos, bpos)
+            }
+            lo = __zero_std_regex_decode_cp(dec)
+            ppos = ppos + __zero_std_regex_decode_width(dec)
+        }
+        if is_builtin {
+            if ppos + 1 < plen && (pattern[ppos] == 45_u8 && pattern[ppos + 1] != 93_u8) {
+                return __zero_std_regex_res_pack(8, ppos, bpos)
+            }
+            if (builtins / builtin_bit) % 2_u8 == 0_u8 {
+                builtins = builtins + builtin_bit
+            }
+            continue
+        }
+        var hi: u32 = lo
+        if ppos + 1 < plen && (pattern[ppos] == 45_u8 && pattern[ppos + 1] != 93_u8) {
+            ppos = ppos + 1
+            if pattern[ppos] == 92_u8 {
+                let esc: u64 = __zero_std_regex_parse_escape(pattern, ppos + 1, true)
+                if __zero_std_regex_esc_err(esc) != 0 {
+                    return __zero_std_regex_res_pack(__zero_std_regex_esc_err(esc), ppos, bpos)
+                }
+                if __zero_std_regex_esc_kind(esc) != 0 {
+                    return __zero_std_regex_res_pack(8, ppos, bpos)
+                }
+                hi = __zero_std_regex_esc_value(esc)
+                ppos = __zero_std_regex_esc_ppos(esc)
+            } else {
+                let dec: u64 = __zero_std_regex_decode(pattern, ppos)
+                if dec == 0 {
+                    return __zero_std_regex_res_pack(11, ppos, bpos)
+                }
+                hi = __zero_std_regex_decode_cp(dec)
+                ppos = ppos + __zero_std_regex_decode_width(dec)
+            }
+            if hi < lo {
+                return __zero_std_regex_res_pack(8, ppos, bpos)
+            }
+        }
+        if count >= 255 {
+            return __zero_std_regex_res_pack(10, ppos, bpos)
+        }
+        bpos = __zero_std_regex_emit_u32(buffer, bpos, limit, lo)
+        bpos = __zero_std_regex_emit_u32(buffer, bpos, limit, hi)
+        if bpos == 16777215 {
+            return __zero_std_regex_res_pack(10, ppos, bpos)
+        }
+        count = count + 1
+    }
+    if bpos == 16777215 {
+        return __zero_std_regex_res_pack(10, ppos, bpos)
+    }
+    buffer[bstart + 2] = builtins
+    buffer[bstart + 3] = count as u8
+    return __zero_std_regex_res_pack(0, ppos, bpos)
+}
+
+fn __zero_std_regex_parse_braces(pattern: Span<u8>, start: usize) -> u64 {
+    let plen: usize = std.mem.len(pattern)
+    var ppos: usize = start
+    var low: u64 = 0
+    var low_digits: usize = 0
+    while ppos < plen && (pattern[ppos] >= 48_u8 && pattern[ppos] <= 57_u8) {
+        if low < 1000000_u64 {
+            low = low * 10_u64 + ((pattern[ppos] - 48_u8) as u64)
+        }
+        low_digits = low_digits + 1
+        ppos = ppos + 1
+    }
+    if low_digits == 0 || ppos >= plen {
+        return 200_u64 * 281474976710656_u64
+    }
+    if pattern[ppos] == 125_u8 {
+        return (((ppos + 1) as u64) * 4294967296_u64) + low * 65536_u64 + low
+    }
+    if pattern[ppos] != 44_u8 {
+        return 200_u64 * 281474976710656_u64
+    }
+    ppos = ppos + 1
+    if ppos < plen && pattern[ppos] == 125_u8 {
+        return (((ppos + 1) as u64) * 4294967296_u64) + low * 65536_u64 + 65535_u64
+    }
+    var high: u64 = 0
+    var high_digits: usize = 0
+    while ppos < plen && (pattern[ppos] >= 48_u8 && pattern[ppos] <= 57_u8) {
+        if high < 1000000_u64 {
+            high = high * 10_u64 + ((pattern[ppos] - 48_u8) as u64)
+        }
+        high_digits = high_digits + 1
+        ppos = ppos + 1
+    }
+    if high_digits == 0 || (ppos >= plen || pattern[ppos] != 125_u8) {
+        return 200_u64 * 281474976710656_u64
+    }
+    return (((ppos + 1) as u64) * 4294967296_u64) + low * 65536_u64 + high
+}
+
+fn __zero_std_regex_braces_err(joined: u64) -> u32 {
+    return (joined / 281474976710656_u64) as u32
+}
+
+fn __zero_std_regex_braces_ppos(joined: u64) -> usize {
+    return ((joined / 4294967296_u64) % 65536_u64) as usize
+}
+
+fn __zero_std_regex_braces_low(joined: u64) -> usize {
+    return ((joined / 65536_u64) % 65536_u64) as usize
+}
+
+fn __zero_std_regex_braces_high(joined: u64) -> usize {
+    return (joined % 65536_u64) as usize
+}
+
+fn __zero_std_regex_compile_core(buffer: MutSpan<u8>, pattern: Span<u8>) -> u64 {
+    let plen: usize = std.mem.len(pattern)
+    var limit: usize = std.mem.len(buffer)
+    if limit > 2048 {
+        limit = 2048
+    }
+    var lv_alt: [33]u32 = [0; 33]
+    var lv_atom: [33]u32 = [0; 33]
+    var lv_patch: [33]u32 = [0; 33]
+    var patches: [512]u32 = [0; 512]
+    var patch_count: usize = 0
+    var depth: usize = 0
+    var bpos: usize = __zero_std_regex_emit_byte(buffer, 0, limit, 90)
+    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 82)
+    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 88)
+    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 49)
+    if bpos == 16777215 {
+        return __zero_std_regex_res_pack(10, 0, 0)
+    }
+    lv_alt[0] = 4
+    lv_atom[0] = 16777215_u32
+    lv_patch[0] = 0
+    var ppos: usize = 0
+    while ppos < plen {
+        let byte: u8 = pattern[ppos]
+        if byte == 40_u8 {
+            var consumed: usize = 1
+            if ppos + 1 < plen && pattern[ppos + 1] == 63_u8 {
+                if ppos + 2 >= plen {
+                    return __zero_std_regex_res_pack(8, ppos, bpos)
+                }
+                let kind_byte: u8 = pattern[ppos + 2]
+                if kind_byte == 58_u8 {
+                    consumed = 3
+                } else if kind_byte == 61_u8 || kind_byte == 33_u8 {
+                    return __zero_std_regex_res_pack(2, ppos, bpos)
+                } else if kind_byte == 60_u8 {
+                    if ppos + 3 < plen && (pattern[ppos + 3] == 61_u8 || pattern[ppos + 3] == 33_u8) {
+                        return __zero_std_regex_res_pack(3, ppos, bpos)
+                    }
+                    return __zero_std_regex_res_pack(4, ppos, bpos)
+                } else if kind_byte == 80_u8 {
+                    return __zero_std_regex_res_pack(4, ppos, bpos)
+                } else {
+                    return __zero_std_regex_res_pack(6, ppos, bpos)
+                }
+            }
+            if depth + 1 > 32 {
+                return __zero_std_regex_res_pack(12, ppos, bpos)
+            }
+            depth = depth + 1
+            lv_alt[depth] = bpos as u32
+            lv_atom[depth] = 16777215_u32
+            lv_patch[depth] = patch_count as u32
+            ppos = ppos + consumed
+        } else if byte == 41_u8 {
+            if depth == 0 {
+                return __zero_std_regex_res_pack(8, ppos, bpos)
+            }
+            var index: usize = lv_patch[depth] as usize
+            while index < patch_count {
+                __zero_std_regex_write_u16_at(buffer, patches[index] as usize, bpos)
+                index = index + 1
+            }
+            patch_count = lv_patch[depth] as usize
+            let gstart: u32 = lv_alt[depth]
+            depth = depth - 1
+            lv_atom[depth] = gstart
+            ppos = ppos + 1
+        } else if byte == 124_u8 {
+            let alt_start: usize = lv_alt[depth] as usize
+            if !__zero_std_regex_shift_right(buffer, alt_start, bpos, 5, limit) {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            if !__zero_std_regex_fix_targets(buffer, alt_start + 5, bpos + 5, alt_start, bpos, 5) {
+                return __zero_std_regex_res_pack(8, ppos, bpos)
+            }
+            var index: usize = lv_patch[depth] as usize
+            while index < patch_count {
+                if (patches[index] as usize) >= alt_start {
+                    patches[index] = patches[index] + 5_u32
+                }
+                index = index + 1
+            }
+            buffer[alt_start] = 6
+            __zero_std_regex_write_u16_at(buffer, alt_start + 1, alt_start + 5)
+            __zero_std_regex_write_u16_at(buffer, alt_start + 3, bpos + 8)
+            bpos = bpos + 5
+            bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 5)
+            if bpos == 16777215 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            if patch_count >= 512 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            patches[patch_count] = bpos as u32
+            patch_count = patch_count + 1
+            bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, 65535)
+            if bpos == 16777215 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            lv_atom[depth] = 16777215_u32
+            ppos = ppos + 1
+        } else if byte == 42_u8 || byte == 43_u8 || byte == 63_u8 {
+            if lv_atom[depth] == 16777215_u32 {
+                return __zero_std_regex_res_pack(8, ppos, bpos)
+            }
+            if ppos + 1 < plen && (pattern[ppos + 1] == 63_u8 || pattern[ppos + 1] == 43_u8) {
+                if pattern[ppos + 1] == 63_u8 {
+                    return __zero_std_regex_res_pack(5, ppos, bpos)
+                }
+                return __zero_std_regex_res_pack(8, ppos, bpos)
+            }
+            let atom_start: usize = lv_atom[depth] as usize
+            let frag_end: usize = bpos
+            if byte == 43_u8 {
+                bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 6)
+                bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, atom_start)
+                bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, frag_end + 5)
+                if bpos == 16777215 {
+                    return __zero_std_regex_res_pack(10, ppos, bpos)
+                }
+            } else {
+                if !__zero_std_regex_shift_right(buffer, atom_start, frag_end, 5, limit) {
+                    return __zero_std_regex_res_pack(10, ppos, bpos)
+                }
+                if !__zero_std_regex_fix_targets(buffer, atom_start + 5, frag_end + 5, atom_start, frag_end, 5) {
+                    return __zero_std_regex_res_pack(8, ppos, bpos)
+                }
+                buffer[atom_start] = 6
+                __zero_std_regex_write_u16_at(buffer, atom_start + 1, atom_start + 5)
+                bpos = frag_end + 5
+                if byte == 42_u8 {
+                    __zero_std_regex_write_u16_at(buffer, atom_start + 3, frag_end + 8)
+                    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 5)
+                    bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, atom_start)
+                    if bpos == 16777215 {
+                        return __zero_std_regex_res_pack(10, ppos, bpos)
+                    }
+                } else {
+                    __zero_std_regex_write_u16_at(buffer, atom_start + 3, frag_end + 5)
+                }
+            }
+            lv_atom[depth] = 16777215_u32
+            ppos = ppos + 1
+        } else if byte == 123_u8 {
+            let braces: u64 = __zero_std_regex_parse_braces(pattern, ppos + 1)
+            if __zero_std_regex_braces_err(braces) == 200_u32 {
+                let atom_start: usize = bpos
+                bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 1)
+                bpos = __zero_std_regex_emit_u32(buffer, bpos, limit, 123)
+                if bpos == 16777215 {
+                    return __zero_std_regex_res_pack(10, ppos, bpos)
+                }
+                lv_atom[depth] = atom_start as u32
+                ppos = ppos + 1
+            } else {
+                if lv_atom[depth] == 16777215_u32 {
+                    return __zero_std_regex_res_pack(8, ppos, bpos)
+                }
+                var next_ppos: usize = __zero_std_regex_braces_ppos(braces)
+                if next_ppos < plen && pattern[next_ppos] == 63_u8 {
+                    return __zero_std_regex_res_pack(5, ppos, bpos)
+                }
+                let low: usize = __zero_std_regex_braces_low(braces)
+                let high: usize = __zero_std_regex_braces_high(braces)
+                if low > 255 || (high != 65535 && (high > 255 || high < low)) {
+                    return __zero_std_regex_res_pack(9, ppos, bpos)
+                }
+                let atom_start: usize = lv_atom[depth] as usize
+                let frag_end: usize = bpos
+                let frag_len: usize = frag_end - atom_start
+                var qpatches: [256]u32 = [0; 256]
+                var qcount: usize = 0
+                if high == 65535 {
+                    if low == 0 {
+                        if !__zero_std_regex_shift_right(buffer, atom_start, frag_end, 5, limit) {
+                            return __zero_std_regex_res_pack(10, ppos, bpos)
+                        }
+                        if !__zero_std_regex_fix_targets(buffer, atom_start + 5, frag_end + 5, atom_start, frag_end, 5) {
+                            return __zero_std_regex_res_pack(8, ppos, bpos)
+                        }
+                        buffer[atom_start] = 6
+                        __zero_std_regex_write_u16_at(buffer, atom_start + 1, atom_start + 5)
+                        __zero_std_regex_write_u16_at(buffer, atom_start + 3, frag_end + 8)
+                        bpos = frag_end + 5
+                        bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 5)
+                        bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, atom_start)
+                        if bpos == 16777215 {
+                            return __zero_std_regex_res_pack(10, ppos, bpos)
+                        }
+                    } else {
+                        var copy: usize = 1
+                        var last_start: usize = atom_start
+                        while copy < low {
+                            last_start = bpos
+                            bpos = __zero_std_regex_copy_fragment(buffer, atom_start, frag_end, bpos, limit)
+                            if bpos == 16777215 {
+                                return __zero_std_regex_res_pack(10, ppos, bpos)
+                            }
+                            copy = copy + 1
+                        }
+                        bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 6)
+                        bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, last_start)
+                        bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, bpos + 2)
+                        if bpos == 16777215 {
+                            return __zero_std_regex_res_pack(10, ppos, bpos)
+                        }
+                    }
+                } else if high == 0 {
+                    bpos = atom_start
+                } else {
+                    var copy: usize = 1
+                    while copy < low {
+                        bpos = __zero_std_regex_copy_fragment(buffer, atom_start, frag_end, bpos, limit)
+                        if bpos == 16777215 {
+                            return __zero_std_regex_res_pack(10, ppos, bpos)
+                        }
+                        copy = copy + 1
+                    }
+                    var optional: usize = low
+                    var src_start: usize = atom_start
+                    var src_end: usize = frag_end
+                    if low == 0 {
+                        if !__zero_std_regex_shift_right(buffer, atom_start, frag_end, 5, limit) {
+                            return __zero_std_regex_res_pack(10, ppos, bpos)
+                        }
+                        if !__zero_std_regex_fix_targets(buffer, atom_start + 5, frag_end + 5, atom_start, frag_end, 5) {
+                            return __zero_std_regex_res_pack(8, ppos, bpos)
+                        }
+                        buffer[atom_start] = 6
+                        __zero_std_regex_write_u16_at(buffer, atom_start + 1, atom_start + 5)
+                        __zero_std_regex_write_u16_at(buffer, atom_start + 3, 65535)
+                        qpatches[qcount] = (atom_start + 3) as u32
+                        qcount = qcount + 1
+                        bpos = frag_end + 5
+                        src_start = atom_start + 5
+                        src_end = frag_end + 5
+                        optional = 1
+                    }
+                    while optional < high {
+                        bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 6)
+                        bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, bpos + 4)
+                        if bpos == 16777215 || qcount >= 256 {
+                            return __zero_std_regex_res_pack(10, ppos, bpos)
+                        }
+                        qpatches[qcount] = bpos as u32
+                        qcount = qcount + 1
+                        bpos = __zero_std_regex_emit_u16(buffer, bpos, limit, 65535)
+                        bpos = __zero_std_regex_copy_fragment(buffer, src_start, src_end, bpos, limit)
+                        if bpos == 16777215 {
+                            return __zero_std_regex_res_pack(10, ppos, bpos)
+                        }
+                        optional = optional + 1
+                    }
+                    var qindex: usize = 0
+                    while qindex < qcount {
+                        __zero_std_regex_write_u16_at(buffer, qpatches[qindex] as usize, bpos)
+                        qindex = qindex + 1
+                    }
+                }
+                lv_atom[depth] = 16777215_u32
+                ppos = next_ppos
+            }
+        } else if byte == 91_u8 {
+            let atom_start: usize = bpos
+            let res: u64 = __zero_std_regex_parse_class(pattern, ppos + 1, buffer, bpos, limit)
+            if __zero_std_regex_res_err(res) != 0 {
+                return __zero_std_regex_res_pack(__zero_std_regex_res_err(res), ppos, bpos)
+            }
+            bpos = __zero_std_regex_res_bpos(res)
+            ppos = __zero_std_regex_res_ppos(res)
+            lv_atom[depth] = atom_start as u32
+        } else if byte == 94_u8 {
+            let atom_start: usize = bpos
+            bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 7)
+            if bpos == 16777215 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            lv_atom[depth] = atom_start as u32
+            ppos = ppos + 1
+        } else if byte == 36_u8 {
+            let atom_start: usize = bpos
+            bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 8)
+            if bpos == 16777215 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            lv_atom[depth] = atom_start as u32
+            ppos = ppos + 1
+        } else if byte == 46_u8 {
+            let atom_start: usize = bpos
+            bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 2)
+            if bpos == 16777215 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            lv_atom[depth] = atom_start as u32
+            ppos = ppos + 1
+        } else if byte == 92_u8 {
+            let esc: u64 = __zero_std_regex_parse_escape(pattern, ppos + 1, false)
+            if __zero_std_regex_esc_err(esc) != 0 {
+                return __zero_std_regex_res_pack(__zero_std_regex_esc_err(esc), ppos, bpos)
+            }
+            let kind: u32 = __zero_std_regex_esc_kind(esc)
+            let atom_start: usize = bpos
+            if kind == 0 {
+                var cp: u32 = __zero_std_regex_esc_value(esc)
+                var next_ppos: usize = __zero_std_regex_esc_ppos(esc)
+                if cp >= 55296_u32 && cp <= 56319_u32 {
+                    if next_ppos < plen && pattern[next_ppos] == 92_u8 {
+                        let pair: u64 = __zero_std_regex_parse_escape(pattern, next_ppos + 1, false)
+                        if __zero_std_regex_esc_err(pair) == 0 && __zero_std_regex_esc_kind(pair) == 0 {
+                            let low_cp: u32 = __zero_std_regex_esc_value(pair)
+                            if low_cp >= 56320_u32 && low_cp <= 57343_u32 {
+                                cp = 65536_u32 + (cp - 55296_u32) * 1024_u32 + (low_cp - 56320_u32)
+                                next_ppos = __zero_std_regex_esc_ppos(pair)
+                            }
+                        }
+                    }
+                }
+                bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 1)
+                bpos = __zero_std_regex_emit_u32(buffer, bpos, limit, cp)
+                ppos = next_ppos
+            } else if kind >= 1 && kind <= 6 {
+                bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 3)
+                bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 0)
+                bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, __zero_std_regex_pow2_u8((kind - 1) as usize))
+                bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 0)
+                ppos = __zero_std_regex_esc_ppos(esc)
+            } else {
+                if kind == 7 {
+                    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 9)
+                } else {
+                    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 10)
+                }
+                ppos = __zero_std_regex_esc_ppos(esc)
+            }
+            if bpos == 16777215 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            lv_atom[depth] = atom_start as u32
+        } else {
+            let dec: u64 = __zero_std_regex_decode(pattern, ppos)
+            if dec == 0 {
+                return __zero_std_regex_res_pack(11, ppos, bpos)
+            }
+            let atom_start: usize = bpos
+            bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 1)
+            bpos = __zero_std_regex_emit_u32(buffer, bpos, limit, __zero_std_regex_decode_cp(dec))
+            if bpos == 16777215 {
+                return __zero_std_regex_res_pack(10, ppos, bpos)
+            }
+            lv_atom[depth] = atom_start as u32
+            ppos = ppos + __zero_std_regex_decode_width(dec)
+        }
+    }
+    if depth != 0 {
+        return __zero_std_regex_res_pack(8, ppos, bpos)
+    }
+    var index: usize = 0
+    while index < patch_count {
+        __zero_std_regex_write_u16_at(buffer, patches[index] as usize, bpos)
+        index = index + 1
+    }
+    bpos = __zero_std_regex_emit_byte(buffer, bpos, limit, 4)
+    if bpos == 16777215 {
+        return __zero_std_regex_res_pack(10, ppos, bpos)
+    }
+    return __zero_std_regex_res_pack(0, ppos, bpos)
+}
+
+fn __zero_std_regex_is_digit(cp: u32) -> Bool {
+    return cp >= 48_u32 && cp <= 57_u32
+}
+
+fn __zero_std_regex_is_word(cp: u32) -> Bool {
+    if cp == 4294967295_u32 {
+        return false
+    }
+    return (cp >= 48_u32 && cp <= 57_u32) || ((cp >= 65_u32 && cp <= 90_u32) || (cp >= 97_u32 && cp <= 122_u32) || cp == 95_u32)
+}
+
+fn __zero_std_regex_is_space(cp: u32) -> Bool {
+    if cp == 9_u32 || cp == 10_u32 || (cp == 11_u32 || cp == 12_u32) || (cp == 13_u32 || cp == 32_u32) {
+        return true
+    }
+    if cp == 160_u32 || cp == 5760_u32 || (cp == 8232_u32 || cp == 8233_u32) {
+        return true
+    }
+    if cp >= 8192_u32 && cp <= 8202_u32 {
+        return true
+    }
+    return cp == 8239_u32 || cp == 8287_u32 || (cp == 12288_u32 || cp == 65279_u32)
+}
+
+fn __zero_std_regex_is_line_term(cp: u32) -> Bool {
+    return cp == 10_u32 || cp == 13_u32 || (cp == 8232_u32 || cp == 8233_u32)
+}
+
+fn __zero_std_regex_class_matches(program: Span<u8>, pc: usize, cp: u32) -> Bool {
+    if cp == 4294967295_u32 {
+        return false
+    }
+    let negate: Bool = program[pc + 1] == 1_u8
+    let builtins: u8 = program[pc + 2]
+    let count: usize = program[pc + 3] as usize
+    var matched: Bool = false
+    if (builtins / 1_u8) % 2_u8 == 1_u8 && __zero_std_regex_is_digit(cp) {
+        matched = true
+    }
+    if (builtins / 2_u8) % 2_u8 == 1_u8 && !__zero_std_regex_is_digit(cp) {
+        matched = true
+    }
+    if (builtins / 4_u8) % 2_u8 == 1_u8 && __zero_std_regex_is_word(cp) {
+        matched = true
+    }
+    if (builtins / 8_u8) % 2_u8 == 1_u8 && !__zero_std_regex_is_word(cp) {
+        matched = true
+    }
+    if (builtins / 16_u8) % 2_u8 == 1_u8 && __zero_std_regex_is_space(cp) {
+        matched = true
+    }
+    if (builtins / 32_u8) % 2_u8 == 1_u8 && !__zero_std_regex_is_space(cp) {
+        matched = true
+    }
+    var index: usize = 0
+    while !matched && index < count {
+        let lo: u32 = __zero_std_regex_read_u32(program, pc + 4 + index * 8)
+        let hi: u32 = __zero_std_regex_read_u32(program, pc + 4 + index * 8 + 4)
+        if cp >= lo && cp <= hi {
+            matched = true
+        }
+        index = index + 1
+    }
+    if negate {
+        return !matched
+    }
+    return matched
+}
+
+fn __zero_std_regex_closure(program: Span<u8>, bits: MutSpan<u8>, at_start: Bool, at_end: Bool, prev_cp: u32, cur_cp: u32) -> Bool {
+    let len: usize = std.mem.len(program)
+    var matched: Bool = false
+    var changed: Bool = true
+    while changed {
+        changed = false
+        var pc: usize = 4
+        while pc < len {
+            let il: usize = __zero_std_regex_instr_len(program, pc)
+            if il == 0 {
+                return matched
+            }
+            if __zero_std_regex_bit_get(bits, pc) {
+                let op: u8 = program[pc]
+                if op == 4_u8 {
+                    matched = true
+                } else if op == 5_u8 {
+                    let target: usize = __zero_std_regex_read_u16(program, pc + 1)
+                    if target < len && __zero_std_regex_bit_set(bits, target) {
+                        changed = true
+                    }
+                } else if op == 6_u8 {
+                    let target1: usize = __zero_std_regex_read_u16(program, pc + 1)
+                    let target2: usize = __zero_std_regex_read_u16(program, pc + 3)
+                    if target1 < len && __zero_std_regex_bit_set(bits, target1) {
+                        changed = true
+                    }
+                    if target2 < len && __zero_std_regex_bit_set(bits, target2) {
+                        changed = true
+                    }
+                } else if op == 7_u8 {
+                    if at_start && __zero_std_regex_bit_set(bits, pc + 1) {
+                        changed = true
+                    }
+                } else if op == 8_u8 {
+                    if at_end && __zero_std_regex_bit_set(bits, pc + 1) {
+                        changed = true
+                    }
+                } else if op == 9_u8 {
+                    if __zero_std_regex_is_word(prev_cp) != __zero_std_regex_is_word(cur_cp) && __zero_std_regex_bit_set(bits, pc + 1) {
+                        changed = true
+                    }
+                } else if op == 10_u8 {
+                    if __zero_std_regex_is_word(prev_cp) == __zero_std_regex_is_word(cur_cp) && __zero_std_regex_bit_set(bits, pc + 1) {
+                        changed = true
+                    }
+                }
+            }
+            pc = pc + il
+        }
+    }
+    return matched
+}
+
+fn __zero_std_regex_is_match(program: Span<u8>, text: Span<u8>) -> Bool {
+    let len: usize = std.mem.len(program)
+    if len < 5 || len > 2048 {
+        return false
+    }
+    if program[0] != 90_u8 || program[1] != 82_u8 || (program[2] != 88_u8 || program[3] != 49_u8) {
+        return false
+    }
+    var cur: [256]u8 = [0; 256]
+    var nxt: [256]u8 = [0; 256]
+    let tlen: usize = std.mem.len(text)
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while true {
+        var cur_cp: u32 = 4294967295_u32
+        var width: usize = 0
+        if pos < tlen {
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return false
+            }
+            cur_cp = __zero_std_regex_decode_cp(dec)
+            width = __zero_std_regex_decode_width(dec)
+        }
+        let injected: Bool = __zero_std_regex_bit_set(cur, 4)
+        let reached: Bool = __zero_std_regex_closure(program, cur, pos == 0, pos >= tlen, prev_cp, cur_cp)
+        if reached || (injected && reached) {
+            return true
+        }
+        if pos >= tlen {
+            return false
+        }
+        var slot: usize = 0
+        while slot < 256 {
+            nxt[slot] = 0
+            slot = slot + 1
+        }
+        var pc: usize = 4
+        while pc < len {
+            let il: usize = __zero_std_regex_instr_len(program, pc)
+            if il == 0 {
+                return false
+            }
+            if __zero_std_regex_bit_get(cur, pc) {
+                let op: u8 = program[pc]
+                if op == 1_u8 {
+                    if cur_cp == __zero_std_regex_read_u32(program, pc + 1) {
+                        __zero_std_regex_bit_mark(nxt, pc + il)
+                    }
+                } else if op == 2_u8 {
+                    if !__zero_std_regex_is_line_term(cur_cp) {
+                        __zero_std_regex_bit_mark(nxt, pc + il)
+                    }
+                } else if op == 3_u8 {
+                    if __zero_std_regex_class_matches(program, pc, cur_cp) {
+                        __zero_std_regex_bit_mark(nxt, pc + il)
+                    }
+                }
+            }
+            pc = pc + il
+        }
+        var copy_slot: usize = 0
+        while copy_slot < 256 {
+            cur[copy_slot] = nxt[copy_slot]
+            copy_slot = copy_slot + 1
+        }
+        prev_cp = cur_cp
+        pos = pos + width
+    }
+    return false
+}
+
+fn __zero_std_regex_match_end_at(program: Span<u8>, text: Span<u8>, at_text_start: Bool, initial_prev_cp: u32) -> usize {
+    let len: usize = std.mem.len(program)
+    let no_match: usize = std.mem.len(text) + 1
+    if len < 5 || len > 2048 {
+        return no_match
+    }
+    if program[0] != 90_u8 || program[1] != 82_u8 || (program[2] != 88_u8 || program[3] != 49_u8) {
+        return no_match
+    }
+    var cur: [256]u8 = [0; 256]
+    var nxt: [256]u8 = [0; 256]
+    let tlen: usize = std.mem.len(text)
+    var pos: usize = 0
+    var prev_cp: u32 = initial_prev_cp
+    var best_end: usize = no_match
+    let injected: Bool = __zero_std_regex_bit_set(cur, 4)
+    if !injected {
+        return no_match
+    }
+    while true {
+        var cur_cp: u32 = 4294967295_u32
+        var width: usize = 0
+        if pos < tlen {
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return no_match
+            }
+            cur_cp = __zero_std_regex_decode_cp(dec)
+            width = __zero_std_regex_decode_width(dec)
+        }
+        let reached: Bool = __zero_std_regex_closure(program, cur, at_text_start && pos == 0, pos >= tlen, prev_cp, cur_cp)
+        if reached {
+            best_end = pos
+        }
+        if pos >= tlen {
+            if best_end != no_match {
+                return best_end
+            }
+            return no_match
+        }
+        var slot: usize = 0
+        while slot < 256 {
+            nxt[slot] = 0
+            slot = slot + 1
+        }
+        var pc: usize = 4
+        while pc < len {
+            let il: usize = __zero_std_regex_instr_len(program, pc)
+            if il == 0 {
+                return no_match
+            }
+            if __zero_std_regex_bit_get(cur, pc) {
+                let op: u8 = program[pc]
+                if op == 1_u8 {
+                    if cur_cp == __zero_std_regex_read_u32(program, pc + 1) {
+                        __zero_std_regex_bit_mark(nxt, pc + il)
+                    }
+                } else if op == 2_u8 {
+                    if !__zero_std_regex_is_line_term(cur_cp) {
+                        __zero_std_regex_bit_mark(nxt, pc + il)
+                    }
+                } else if op == 3_u8 {
+                    if __zero_std_regex_class_matches(program, pc, cur_cp) {
+                        __zero_std_regex_bit_mark(nxt, pc + il)
+                    }
+                }
+            }
+            pc = pc + il
+        }
+        var active: Bool = false
+        var active_slot: usize = 0
+        while active_slot < 256 {
+            if nxt[active_slot] != 0_u8 {
+                active = true
+            }
+            active_slot = active_slot + 1
+        }
+        if !active {
+            if best_end != no_match {
+                return best_end
+            }
+            return no_match
+        }
+        var copy_slot: usize = 0
+        while copy_slot < 256 {
+            cur[copy_slot] = nxt[copy_slot]
+            copy_slot = copy_slot + 1
+        }
+        prev_cp = cur_cp
+        pos = pos + width
+    }
+    return no_match
+}
+
+fn __zero_std_regex_prev_cp_before(text: Span<u8>, target: usize) -> u32 {
+    var pos: usize = 0
+    var prev: u32 = 4294967295_u32
+    while pos < target && pos < std.mem.len(text) {
+        let dec: u64 = __zero_std_regex_decode(text, pos)
+        if dec == 0 {
+            return 4294967295_u32
+        }
+        prev = __zero_std_regex_decode_cp(dec)
+        pos = pos + __zero_std_regex_decode_width(dec)
+    }
+    return prev
+}
+
+fn __zero_std_regex_find_index_program(program: Span<u8>, text: Span<u8>) -> usize {
+    let tlen: usize = std.mem.len(text)
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos {
+            return pos
+        }
+        if pos == tlen {
+            return tlen
+        }
+        let dec: u64 = __zero_std_regex_decode(text, pos)
+        if dec == 0 {
+            return tlen
+        }
+        prev_cp = __zero_std_regex_decode_cp(dec)
+        pos = pos + __zero_std_regex_decode_width(dec)
+    }
+    return tlen
+}
+
+fn __zero_std_regex_find_program(program: Span<u8>, text: Span<u8>) -> Maybe<Span<u8>> {
+    let tlen: usize = std.mem.len(text)
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos {
+            return text[pos..pos + end]
+        }
+        if pos == tlen {
+            return null
+        }
+        let dec: u64 = __zero_std_regex_decode(text, pos)
+        if dec == 0 {
+            return null
+        }
+        prev_cp = __zero_std_regex_decode_cp(dec)
+        pos = pos + __zero_std_regex_decode_width(dec)
+    }
+    return null
+}
+
+fn __zero_std_regex_find_count_program(program: Span<u8>, text: Span<u8>) -> usize {
+    let tlen: usize = std.mem.len(text)
+    var count: usize = 0
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos {
+            count = count + 1
+            if end == 0 {
+                if pos == tlen {
+                    return count
+                }
+                let empty_dec: u64 = __zero_std_regex_decode(text, pos)
+                if empty_dec == 0 {
+                    return count
+                }
+                prev_cp = __zero_std_regex_decode_cp(empty_dec)
+                pos = pos + __zero_std_regex_decode_width(empty_dec)
+            } else {
+                pos = pos + end
+                prev_cp = __zero_std_regex_prev_cp_before(text, pos)
+            }
+        } else {
+            if pos == tlen {
+                return count
+            }
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return count
+            }
+            prev_cp = __zero_std_regex_decode_cp(dec)
+            pos = pos + __zero_std_regex_decode_width(dec)
+        }
+    }
+    return count
+}
+
+fn __zero_std_regex_find_nth_index_program(program: Span<u8>, text: Span<u8>, match_index: usize) -> usize {
+    let tlen: usize = std.mem.len(text)
+    var found_index: usize = 0
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos {
+            if found_index == match_index {
+                return pos
+            }
+            found_index = found_index + 1
+            if end == 0 {
+                if pos == tlen {
+                    return tlen
+                }
+                let empty_dec: u64 = __zero_std_regex_decode(text, pos)
+                if empty_dec == 0 {
+                    return tlen
+                }
+                prev_cp = __zero_std_regex_decode_cp(empty_dec)
+                pos = pos + __zero_std_regex_decode_width(empty_dec)
+            } else {
+                pos = pos + end
+                prev_cp = __zero_std_regex_prev_cp_before(text, pos)
+            }
+        } else {
+            if pos == tlen {
+                return tlen
+            }
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return tlen
+            }
+            prev_cp = __zero_std_regex_decode_cp(dec)
+            pos = pos + __zero_std_regex_decode_width(dec)
+        }
+    }
+    return tlen
+}
+
+fn __zero_std_regex_find_nth_program(program: Span<u8>, text: Span<u8>, match_index: usize) -> Maybe<Span<u8>> {
+    let tlen: usize = std.mem.len(text)
+    var found_index: usize = 0
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos {
+            if found_index == match_index {
+                return text[pos..pos + end]
+            }
+            found_index = found_index + 1
+            if end == 0 {
+                if pos == tlen {
+                    return null
+                }
+                let empty_dec: u64 = __zero_std_regex_decode(text, pos)
+                if empty_dec == 0 {
+                    return null
+                }
+                prev_cp = __zero_std_regex_decode_cp(empty_dec)
+                pos = pos + __zero_std_regex_decode_width(empty_dec)
+            } else {
+                pos = pos + end
+                prev_cp = __zero_std_regex_prev_cp_before(text, pos)
+            }
+        } else {
+            if pos == tlen {
+                return null
+            }
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return null
+            }
+            prev_cp = __zero_std_regex_decode_cp(dec)
+            pos = pos + __zero_std_regex_decode_width(dec)
+        }
+    }
+    return null
+}
+
+fn __zero_std_regex_replace_program(buffer: MutSpan<u8>, program: Span<u8>, text: Span<u8>, replacement: Span<u8>) -> Maybe<Span<u8>> {
+    let tlen: usize = std.mem.len(text)
+    var pos: usize = 0
+    var write: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos {
+            if std.mem.len(replacement) > std.mem.len(buffer) - write {
+                return null
+            }
+            var rep_index: usize = 0
+            while rep_index < std.mem.len(replacement) {
+                buffer[write] = replacement[rep_index]
+                write = write + 1
+                rep_index = rep_index + 1
+            }
+            if end == 0 {
+                if pos == tlen {
+                    return buffer[..write]
+                }
+                let empty_dec: u64 = __zero_std_regex_decode(text, pos)
+                if empty_dec == 0 {
+                    return null
+                }
+                let width: usize = __zero_std_regex_decode_width(empty_dec)
+                if width > std.mem.len(buffer) - write {
+                    return null
+                }
+                var byte_index: usize = 0
+                while byte_index < width {
+                    buffer[write] = text[pos + byte_index]
+                    write = write + 1
+                    byte_index = byte_index + 1
+                }
+                prev_cp = __zero_std_regex_decode_cp(empty_dec)
+                pos = pos + width
+            } else {
+                pos = pos + end
+                prev_cp = __zero_std_regex_prev_cp_before(text, pos)
+            }
+        } else {
+            if pos == tlen {
+                return buffer[..write]
+            }
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return null
+            }
+            let width: usize = __zero_std_regex_decode_width(dec)
+            if width > std.mem.len(buffer) - write {
+                return null
+            }
+            var byte_index: usize = 0
+            while byte_index < width {
+                buffer[write] = text[pos + byte_index]
+                write = write + 1
+                byte_index = byte_index + 1
+            }
+            prev_cp = __zero_std_regex_decode_cp(dec)
+            pos = pos + width
+        }
+    }
+    return buffer[..write]
+}
+
+fn __zero_std_regex_split_count_program(program: Span<u8>, text: Span<u8>) -> usize {
+    let tlen: usize = std.mem.len(text)
+    var count: usize = 1
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos && end > 0 {
+            count = count + 1
+            pos = pos + end
+            prev_cp = __zero_std_regex_prev_cp_before(text, pos)
+        } else {
+            if pos == tlen {
+                return count
+            }
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return count
+            }
+            prev_cp = __zero_std_regex_decode_cp(dec)
+            pos = pos + __zero_std_regex_decode_width(dec)
+        }
+    }
+    return count
+}
+
+fn __zero_std_regex_split_program(program: Span<u8>, text: Span<u8>, split_index: usize) -> Maybe<Span<u8>> {
+    let tlen: usize = std.mem.len(text)
+    var field_index: usize = 0
+    var field_start: usize = 0
+    var pos: usize = 0
+    var prev_cp: u32 = 4294967295_u32
+    while pos <= tlen {
+        let end: usize = __zero_std_regex_match_end_at(program, text[pos..], pos == 0, prev_cp)
+        if end <= tlen - pos && end > 0 {
+            if field_index == split_index {
+                return text[field_start..pos]
+            }
+            field_index = field_index + 1
+            pos = pos + end
+            field_start = pos
+            prev_cp = __zero_std_regex_prev_cp_before(text, pos)
+        } else {
+            if pos == tlen {
+                if field_index == split_index {
+                    return text[field_start..tlen]
+                }
+                return null
+            }
+            let dec: u64 = __zero_std_regex_decode(text, pos)
+            if dec == 0 {
+                return null
+            }
+            prev_cp = __zero_std_regex_decode_cp(dec)
+            pos = pos + __zero_std_regex_decode_width(dec)
+        }
+    }
+    return null
+}
+
+fn __zero_std_regex_compile(buffer: MutSpan<u8>, pattern: Span<u8>) -> Maybe<Span<u8>> {
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    return buffer[..__zero_std_regex_res_bpos(res)]
+}
+
+fn __zero_std_regex_compile_status(buffer: MutSpan<u8>, pattern: Span<u8>) -> u32 {
+    return __zero_std_regex_res_err(__zero_std_regex_compile_core(buffer, pattern))
+}
+
+fn __zero_std_regex_compile_error_offset(buffer: MutSpan<u8>, pattern: Span<u8>) -> Maybe<usize> {
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) == 0 {
+        return null
+    }
+    return __zero_std_regex_res_ppos(res)
+}
+
+fn __zero_std_regex_status_name(status: u32) -> String {
+    if status == 0_u32 {
+        return "ok"
+    }
+    if status == 1_u32 {
+        return "unsupported backreference"
+    }
+    if status == 2_u32 {
+        return "unsupported lookahead"
+    }
+    if status == 3_u32 {
+        return "unsupported lookbehind"
+    }
+    if status == 4_u32 {
+        return "unsupported named group"
+    }
+    if status == 5_u32 {
+        return "unsupported lazy quantifier"
+    }
+    if status == 6_u32 {
+        return "unsupported group modifier"
+    }
+    if status == 7_u32 {
+        return "unsupported unicode property escape"
+    }
+    if status == 8_u32 {
+        return "invalid pattern syntax"
+    }
+    if status == 9_u32 {
+        return "invalid quantifier range"
+    }
+    if status == 10_u32 {
+        return "compiled pattern exceeds buffer or 2048-byte program limit"
+    }
+    if status == 11_u32 {
+        return "pattern is not valid utf-8"
+    }
+    if status == 12_u32 {
+        return "group nesting exceeds depth 32"
+    }
+    return "unknown status"
+}
+
+fn __zero_std_regex_matches(pattern: Span<u8>, text: Span<u8>) -> Maybe<Bool> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_is_match(program, text)
+}
+
+fn __zero_std_regex_contains(pattern: Span<u8>, text: Span<u8>) -> Maybe<Bool> {
+    return __zero_std_regex_matches(pattern, text)
+}
+
+fn __zero_std_regex_find_index(pattern: Span<u8>, text: Span<u8>) -> Maybe<usize> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_find_index_program(program, text)
+}
+
+fn __zero_std_regex_find(pattern: Span<u8>, text: Span<u8>) -> Maybe<Span<u8>> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_find_program(program, text)
+}
+
+fn __zero_std_regex_find_count(pattern: Span<u8>, text: Span<u8>) -> Maybe<usize> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_find_count_program(program, text)
+}
+
+fn __zero_std_regex_find_nth_index(pattern: Span<u8>, text: Span<u8>, match_index: usize) -> Maybe<usize> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_find_nth_index_program(program, text, match_index)
+}
+
+fn __zero_std_regex_find_nth(pattern: Span<u8>, text: Span<u8>, match_index: usize) -> Maybe<Span<u8>> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_find_nth_program(program, text, match_index)
+}
+
+fn __zero_std_regex_replace(buffer: MutSpan<u8>, pattern: Span<u8>, text: Span<u8>, replacement: Span<u8>) -> Maybe<Span<u8>> {
+    var storage: [1024]u8 = [0; 1024]
+    let program_buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(program_buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = program_buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_replace_program(buffer, program, text, replacement)
+}
+
+fn __zero_std_regex_split_count(pattern: Span<u8>, text: Span<u8>) -> Maybe<usize> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_split_count_program(program, text)
+}
+
+fn __zero_std_regex_split(pattern: Span<u8>, text: Span<u8>, split_index: usize) -> Maybe<Span<u8>> {
+    var storage: [1024]u8 = [0; 1024]
+    let buffer: MutSpan<u8> = storage
+    let res: u64 = __zero_std_regex_compile_core(buffer, pattern)
+    if __zero_std_regex_res_err(res) != 0 {
+        return null
+    }
+    let program: Span<u8> = buffer[..__zero_std_regex_res_bpos(res)]
+    return __zero_std_regex_split_program(program, text, split_index)
+}

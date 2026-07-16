@@ -57,7 +57,7 @@ export function DocsToc({ headings }: { headings: Heading[] }) {
   return (
     <aside
       aria-label="On this page"
-      className="sticky top-0 hidden h-screen overflow-y-auto py-8 pl-0 pr-4 lg:block"
+      className="sticky top-14 hidden h-[calc(100vh-3.5rem)] overflow-y-auto py-8 pl-0 pr-4 lg:block"
     >
       <p className="mb-3 pl-4 text-xs font-semibold uppercase tracking-[0.05em] text-fg">
         On this page

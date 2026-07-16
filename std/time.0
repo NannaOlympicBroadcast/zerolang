@@ -69,3 +69,292 @@ fn __zero_std_time_as_seconds_floor(value: Duration) -> i64 {
 fn __zero_std_time_is_zero(value: Duration) -> Bool {
     return std.time.asNs(value) == 0
 }
+
+fn __zero_std_time_abs(value: Duration) -> Duration {
+    if std.time.lessThan(value, std.time.zero()) {
+        return std.time.sub(std.time.zero(), value)
+    }
+    return value
+}
+
+fn __zero_std_time_between(start: Duration, end: Duration) -> Duration {
+    if std.time.lessThan(end, start) {
+        return std.time.sub(start, end)
+    }
+    return std.time.sub(end, start)
+}
+
+fn __zero_std_time_has_elapsed(start: Duration, now: Duration, timeout: Duration) -> Bool {
+    if std.time.lessThan(now, start) {
+        return false
+    }
+    let elapsed: Duration = std.time.sub(now, start)
+    return !std.time.lessThan(elapsed, timeout)
+}
+
+fn __zero_std_time_deadline_after(start: Duration, timeout: Duration) -> Duration {
+    return std.time.add(start, timeout)
+}
+
+fn __zero_std_time_remaining_until(deadline: Duration, now: Duration) -> Duration {
+    if !std.time.lessThan(now, deadline) {
+        return std.time.zero()
+    }
+    return std.time.sub(deadline, now)
+}
+
+fn __zero_std_time_deadline_expired(deadline: Duration, now: Duration) -> Bool {
+    return !std.time.lessThan(now, deadline)
+}
+
+fn __zero_std_time_rfc_is_digit(byte: u8) -> Bool {
+    return byte >= 48_u8 && byte <= 57_u8
+}
+
+fn __zero_std_time_rfc_digit(byte: u8) -> u32 {
+    return (byte - 48_u8) as u32
+}
+
+fn __zero_std_time_is_leap_year(year: u32) -> Bool {
+    if year % 4_u32 != 0_u32 {
+        return false
+    }
+    if year % 100_u32 != 0_u32 {
+        return true
+    }
+    return year % 400_u32 == 0_u32
+}
+
+fn __zero_std_time_days_in_month(year: u32, month: u32) -> u32 {
+    if month < 1_u32 || month > 12_u32 {
+        return 0_u32
+    }
+    if month == 2_u32 {
+        if __zero_std_time_is_leap_year(year) {
+            return 29_u32
+        }
+        return 28_u32
+    }
+    if month == 4_u32 || month == 6_u32 || (month == 9_u32 || month == 11_u32) {
+        return 30_u32
+    }
+    return 31_u32
+}
+
+fn __zero_std_time_rfc_date_core(text: Span<u8>) -> u64 {
+    if std.mem.len(text) != 10 {
+        return 0
+    }
+    if text[4] != 45_u8 || text[7] != 45_u8 {
+        return 0
+    }
+    var index: usize = 0
+    while index < 10 {
+        if index != 4 && index != 7 {
+            if !__zero_std_time_rfc_is_digit(text[index]) {
+                return 0
+            }
+        }
+        index = index + 1
+    }
+    let year: u32 = __zero_std_time_rfc_digit(text[0]) * 1000_u32 + __zero_std_time_rfc_digit(text[1]) * 100_u32 + __zero_std_time_rfc_digit(text[2]) * 10_u32 + __zero_std_time_rfc_digit(text[3])
+    let month: u32 = __zero_std_time_rfc_digit(text[5]) * 10_u32 + __zero_std_time_rfc_digit(text[6])
+    let day: u32 = __zero_std_time_rfc_digit(text[8]) * 10_u32 + __zero_std_time_rfc_digit(text[9])
+    let max_day: u32 = __zero_std_time_days_in_month(year, month)
+    if max_day == 0_u32 || (day < 1_u32 || day > max_day) {
+        return 0
+    }
+    return 4294967296_u64 + (year as u64) * 65536_u64 + (month as u64) * 256_u64 + (day as u64)
+}
+
+fn __zero_std_time_rfc_time_core(text: Span<u8>) -> u64 {
+    let len: usize = std.mem.len(text)
+    if len < 9 {
+        return 0
+    }
+    if text[2] != 58_u8 || text[5] != 58_u8 {
+        return 0
+    }
+    var index: usize = 0
+    while index < 8 {
+        if index != 2 && index != 5 {
+            if !__zero_std_time_rfc_is_digit(text[index]) {
+                return 0
+            }
+        }
+        index = index + 1
+    }
+    let hh: u32 = __zero_std_time_rfc_digit(text[0]) * 10_u32 + __zero_std_time_rfc_digit(text[1])
+    let mm: u32 = __zero_std_time_rfc_digit(text[3]) * 10_u32 + __zero_std_time_rfc_digit(text[4])
+    let ss: u32 = __zero_std_time_rfc_digit(text[6]) * 10_u32 + __zero_std_time_rfc_digit(text[7])
+    if hh > 23_u32 || (mm > 59_u32 || ss > 60_u32) {
+        return 0
+    }
+    var pos: usize = 8
+    if text[pos] == 46_u8 {
+        pos = pos + 1
+        var fraction_digits: usize = 0
+        while pos < len && __zero_std_time_rfc_is_digit(text[pos]) {
+            fraction_digits = fraction_digits + 1
+            pos = pos + 1
+        }
+        if fraction_digits == 0 {
+            return 0
+        }
+    }
+    if pos >= len {
+        return 0
+    }
+    var offset_minutes: i64 = 0
+    let marker: u8 = text[pos]
+    if marker == 90_u8 || marker == 122_u8 {
+        if pos + 1 != len {
+            return 0
+        }
+    } else if marker == 43_u8 || marker == 45_u8 {
+        if pos + 6 != len {
+            return 0
+        }
+        if text[pos + 3] != 58_u8 {
+            return 0
+        }
+        if !__zero_std_time_rfc_is_digit(text[pos + 1]) || (!__zero_std_time_rfc_is_digit(text[pos + 2]) || (!__zero_std_time_rfc_is_digit(text[pos + 4]) || !__zero_std_time_rfc_is_digit(text[pos + 5]))) {
+            return 0
+        }
+        let oh: u32 = __zero_std_time_rfc_digit(text[pos + 1]) * 10_u32 + __zero_std_time_rfc_digit(text[pos + 2])
+        let om: u32 = __zero_std_time_rfc_digit(text[pos + 4]) * 10_u32 + __zero_std_time_rfc_digit(text[pos + 5])
+        if oh > 23_u32 || om > 59_u32 {
+            return 0
+        }
+        offset_minutes = (oh as i64) * 60_i64 + (om as i64)
+        if marker == 45_u8 {
+            offset_minutes = 0_i64 - offset_minutes
+        }
+    } else {
+        return 0
+    }
+    if ss == 60_u32 {
+        var normalized: i64 = (hh as i64) * 60_i64 + (mm as i64) - offset_minutes
+        normalized = normalized % 1440_i64
+        if normalized < 0_i64 {
+            normalized = normalized + 1440_i64
+        }
+        if normalized != 1439_i64 {
+            return 0
+        }
+    }
+    return 1099511627776_u64 + (hh as u64) * 4294967296_u64 + (mm as u64) * 16777216_u64 + (ss as u64) * 65536_u64 + ((offset_minutes + 1440_i64) as u64)
+}
+
+fn __zero_std_time_is_rfc3339_date(text: Span<u8>) -> Bool {
+    return __zero_std_time_rfc_date_core(text) != 0
+}
+
+fn __zero_std_time_is_rfc3339_time(text: Span<u8>) -> Bool {
+    return __zero_std_time_rfc_time_core(text) != 0
+}
+
+fn __zero_std_time_rfc_datetime_split(text: Span<u8>) -> usize {
+    let len: usize = std.mem.len(text)
+    if len < 11 {
+        return 0
+    }
+    if text[10] == 84_u8 || text[10] == 116_u8 {
+        return 10
+    }
+    return 0
+}
+
+fn __zero_std_time_is_rfc3339_datetime(text: Span<u8>) -> Bool {
+    let split: usize = __zero_std_time_rfc_datetime_split(text)
+    if split == 0 {
+        return false
+    }
+    if __zero_std_time_rfc_date_core(text[..split]) == 0 {
+        return false
+    }
+    return __zero_std_time_rfc_time_core(text[split + 1..]) != 0
+}
+
+fn __zero_std_time_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    var y: i64 = year
+    if month <= 2_i64 {
+        y = y - 1_i64
+    }
+    var era: i64 = y
+    if era < 0_i64 {
+        era = era - 399_i64
+    }
+    era = era / 400_i64
+    let yoe: i64 = y - era * 400_i64
+    var mp: i64 = month + 9_i64
+    if month > 2_i64 {
+        mp = month - 3_i64
+    }
+    let doy: i64 = (153_i64 * mp + 2_i64) / 5_i64 + day - 1_i64
+    let doe: i64 = yoe * 365_i64 + yoe / 4_i64 - yoe / 100_i64 + doy
+    return era * 146097_i64 + doe - 719468_i64
+}
+
+fn __zero_std_time_parse_rfc3339_datetime_or(text: Span<u8>, fallback: i64) -> i64 {
+    let split: usize = __zero_std_time_rfc_datetime_split(text)
+    if split == 0 {
+        return fallback
+    }
+    let date: u64 = __zero_std_time_rfc_date_core(text[..split])
+    if date == 0 {
+        return fallback
+    }
+    let clock: u64 = __zero_std_time_rfc_time_core(text[split + 1..])
+    if clock == 0 {
+        return fallback
+    }
+    let year: i64 = ((date / 65536_u64) % 65536_u64) as i64
+    let month: i64 = ((date / 256_u64) % 256_u64) as i64
+    let day: i64 = (date % 256_u64) as i64
+    let hh: i64 = ((clock / 4294967296_u64) % 256_u64) as i64
+    let mm: i64 = ((clock / 16777216_u64) % 256_u64) as i64
+    var ss: i64 = ((clock / 65536_u64) % 256_u64) as i64
+    if ss == 60_i64 {
+        ss = 59_i64
+    }
+    let offset_minutes: i64 = ((clock % 65536_u64) as i64) - 1440_i64
+    let days: i64 = __zero_std_time_days_from_civil(year, month, day)
+    return days * 86400_i64 + hh * 3600_i64 + mm * 60_i64 + ss - offset_minutes * 60_i64
+}
+
+fn __zero_std_time_write_i64_unit(buffer: MutSpan<u8>, value: i64, unit: Span<u8>) -> Maybe<Span<u8>> {
+    var digits_storage: [24]u8 = [0_u8; 24]
+    let digits: Maybe<Span<u8>> = std.fmt.i64(digits_storage, value)
+    if !digits.has {
+        return null
+    }
+    let wrote_digits: Maybe<usize> = std.io.writeSpan(buffer, 0, digits.value)
+    if !wrote_digits.has {
+        return null
+    }
+    let wrote_unit: Maybe<usize> = std.io.writeSpan(buffer, wrote_digits.value, unit)
+    if !wrote_unit.has {
+        return null
+    }
+    return buffer[..wrote_unit.value]
+}
+
+fn __zero_std_time_write_duration_ns(buffer: MutSpan<u8>, value: Duration) -> Maybe<Span<u8>> {
+    return __zero_std_time_write_i64_unit(buffer, std.time.asNs(value), "ns")
+}
+
+fn __zero_std_time_write_duration_ms(buffer: MutSpan<u8>, value: Duration) -> Maybe<Span<u8>> {
+    let ns: i64 = std.time.asNs(value)
+    let quotient: i64 = ns / 1000000_i64
+    let remainder: i64 = ns % 1000000_i64
+    var milliseconds: i64 = quotient
+    if ns < 0_i64 && remainder != 0_i64 {
+        milliseconds = quotient - 1_i64
+    }
+    return __zero_std_time_write_i64_unit(buffer, milliseconds, "ms")
+}
+
+fn __zero_std_time_write_duration_seconds(buffer: MutSpan<u8>, value: Duration) -> Maybe<Span<u8>> {
+    return __zero_std_time_write_i64_unit(buffer, std.time.asSecondsFloor(value), "s")
+}

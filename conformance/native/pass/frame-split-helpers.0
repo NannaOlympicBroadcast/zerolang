@@ -1,0 +1,20 @@
+fn fillChunk(tag: u8) -> usize {
+    var chunk: [65536]u8 = [0; 65536]
+    chunk[0] = tag
+    chunk[65535] = tag
+    var count: usize = 0
+    if chunk[0] == tag && chunk[65535] == tag {
+        count = 65536
+    }
+    return count
+}
+
+pub fn main(world: World) -> Void raises {
+    var total: usize = 0
+    total = total + fillChunk(1_u8)
+    total = total + fillChunk(2_u8)
+    total = total + fillChunk(3_u8)
+    if total == 196608 {
+        check world.out.write("frame split helpers ok\n")
+    }
+}

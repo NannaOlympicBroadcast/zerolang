@@ -1,0 +1,30 @@
+use http_util
+
+pub fn listDeals(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if tenantOk(request) {
+        return jsonResponse(response, 200_u16, "{\"deals\":[{\"id\":42,\"name\":\"Expansion\",\"amount\":120000},{\"id\":43,\"name\":\"Renewal\",\"amount\":45000}]}")
+    }
+    return badRequest(response, "tenant")
+}
+
+pub fn createDeal(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if bodyIsJson(request, 256) && bodyHasU32(request, "account_id", 256) {
+        return jsonResponse(response, 201_u16, "{\"deal\":{\"id\":44,\"name\":\"New deal\",\"account_id\":1,\"amount\":10000},\"created\":true}")
+    }
+    return badRequest(response, "json")
+}
+
+pub fn readDeal(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"deal\":{\"id\":42,\"name\":\"Expansion\",\"stage\":\"proposal\",\"amount\":120000}}")
+}
+
+pub fn updateDeal(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if bodyIsJson(request, 256) {
+        return jsonResponse(response, 200_u16, "{\"deal\":{\"id\":42,\"stage\":\"won\",\"amount\":120000},\"updated\":true}")
+    }
+    return badRequest(response, "json")
+}
+
+pub fn deleteDeal(response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"deal\":{\"id\":42},\"deleted\":true}")
+}

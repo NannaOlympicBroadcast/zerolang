@@ -5,7 +5,11 @@ use payload
 pub fn main(world: World) -> Void raises [NotFound, TooLarge, Io] {
     let fs: Fs = std.fs.host()
     var path_storage: [96]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    let path: String = check std.path.join(path_storage, outputDir(), outputName())
+    let joined: Maybe<String> = std.path.join(path_storage, outputDir(), outputName())
+    if !joined.has {
+        raise TooLarge
+    }
+    let path: String = joined.value
     var payload_storage: [32]u8 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     let payload_len: usize = writePayload(payload_storage)
     var created: owned<File> = check std.fs.createOrRaise(fs, path)

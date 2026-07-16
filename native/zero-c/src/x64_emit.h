@@ -53,6 +53,9 @@ void z_x64_emit_cmp_base_index_u8(ZBuf *buf, unsigned base_reg, unsigned index_r
 void z_x64_emit_byte_copy_min_loop(ZBuf *buf);
 void z_x64_emit_byte_fill_loop(ZBuf *buf);
 void z_x64_emit_byte_eq_loop(ZBuf *buf);
+void z_x64_emit_vec_lookup_loop(ZBuf *buf, bool contains);
+void z_x64_emit_vec_insert_unique_loop(ZBuf *buf);
+void z_x64_emit_vec_remove_value_loop(ZBuf *buf);
 void z_x64_emit_crc32_bytes_loop(ZBuf *buf, unsigned ptr_reg, unsigned len_reg);
 void z_x64_emit_load_base_index_scale_disp_reg(ZBuf *buf, unsigned dst_reg, unsigned base_reg, unsigned index_reg, unsigned scale, unsigned disp, bool wide);
 void z_x64_emit_lea_base_index_scale_disp_reg(ZBuf *buf, unsigned dst_reg, unsigned base_reg, unsigned index_reg, unsigned scale, unsigned disp);
@@ -108,6 +111,7 @@ void z_x64_emit_bool_from_nonnegative_rax(ZBuf *buf);
 void z_x64_emit_prologue(ZBuf *buf, unsigned stack_size);
 void z_x64_emit_epilogue(ZBuf *buf);
 void z_x64_emit_mov_eax_u32(ZBuf *buf, uint32_t value);
+void z_x64_emit_align_rsp_16(ZBuf *buf);
 void z_x64_emit_ud2(ZBuf *buf);
 void z_x64_emit_syscall(ZBuf *buf);
 void z_x64_emit_sub_rsp(ZBuf *buf, unsigned amount);

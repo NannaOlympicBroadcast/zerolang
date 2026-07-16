@@ -1,4 +1,7 @@
-## Status
+## When To Use std.math
+
+In Zerolang, use `std.math` for pure fixed-width integer helpers, checked/saturating
+arithmetic, and small number-theory routines.
 
 Runnable today:
 

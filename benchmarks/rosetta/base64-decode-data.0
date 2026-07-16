@@ -14,12 +14,21 @@ fn b64(c: u8) -> u8 {
     return 63
 }
 
-fn firstByte(a: u8, b: u8) -> u8 {
+fn decodeByte0(a: u8, b: u8) -> u8 {
     return b64(a) * 4 + b64(b) / 16
 }
 
+fn decodeByte1(b: u8, c: u8) -> u8 {
+    return (b64(b) % 16) * 16 + b64(c) / 4
+}
+
+fn decodeByte2(c: u8, d: u8) -> u8 {
+    return (b64(c) % 4) * 64 + b64(d)
+}
+
 pub fn main(world: World) -> Void raises {
-    if firstByte(84, 87) == 77 {
+    let ok: Bool = decodeByte0(84, 87) == 77 && decodeByte1(87, 70) == 97 && decodeByte2(70, 117) == 110
+    if ok {
         check world.out.write("base64 decode ok\n")
     }
 }

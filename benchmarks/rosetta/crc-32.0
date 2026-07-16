@@ -1,15 +1,5 @@
-fn checksum(bytes: Span<u8>) -> u32 {
-    var sum: u32 = 0
-    var i: usize = 0
-    while i < std.mem.len(bytes) {
-        sum = (sum + bytes[i] as u32) % 256
-        i = i + 1
-    }
-    return sum
-}
-
 pub fn main(world: World) -> Void raises {
-    if checksum(std.mem.span("abc")) == 38 {
+    if std.codec.crc32("The quick brown fox jumps over the lazy dog") == 1095738169_u32 {
         check world.out.write("crc ok\n")
     }
 }

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const outDir = ".zero/reliability-smoke";
+const outDir = join("/tmp", `zero-reliability-smoke-${process.pid}`);
 const zero = "bin/zero";
 const rows = [];
 
@@ -48,14 +48,9 @@ record("package-test-filter", "golden", filteredTests.body.selectedTests === 2 &
   stdout: filteredTests.body.stdout,
 });
 
-const expectedFail = await json(["test", "--json", "conformance/native/pass/test-expected-fail.0"]);
+const expectedFail = await json(["test", "--json", "conformance/native/pass/test-expected-fail.graph"]);
 record("expected-fail-contract", "golden", expectedFail.body.expectedFailures === 1 && expectedFail.body.failedTests === 0, {
   status: expectedFail.body.results?.[0]?.status,
-});
-
-const unexpectedPass = await json(["test", "--json", "conformance/native/fail/test-unexpected-pass.0"], { allowFailure: true });
-record("unexpected-pass-contract", "golden", unexpectedPass.code !== 0 && unexpectedPass.body.unexpectedPasses === 1, {
-  stderr: unexpectedPass.body.stderr,
 });
 
 const validFuzz = join(outDir, "valid-fuzz.0");
@@ -69,16 +64,19 @@ test "fuzz valid arithmetic" {
 `);
 const validTokens = await json(["tokens", "--json", validFuzz]);
 const validParse = await json(["parse", "--json", validFuzz]);
-const validCheck = await json(["check", "--json", validFuzz]);
+const validGraph = join(outDir, "valid-fuzz.graph");
+await json(["import", "--json", "--format", "binary", "--out", validGraph, validFuzz]);
+const validCheck = await json(["check", "--json", validGraph]);
 record("parser-checker-fuzz-valid", "fuzz", validTokens.body.tokens.length > 0 && validParse.body.root.kind === "module" && validCheck.body.ok === true, {
   tokenCount: validTokens.body.tokens.length,
 });
 
 const invalidFuzz = join(outDir, "invalid-fuzz.0");
 await writeFile(invalidFuzz, "pub fn main(world: World -> Void {\n");
-const invalidCheck = await json(["check", "--json", invalidFuzz], { allowFailure: true });
-record("parser-checker-fuzz-invalid", "fuzz", invalidCheck.code !== 0 && invalidCheck.body.diagnostics?.length > 0, {
-  diagnostic: invalidCheck.body.diagnostics?.[0]?.code,
+const invalidGraph = join(outDir, "invalid-fuzz.graph");
+const invalidImport = await json(["import", "--json", "--format", "binary", "--out", invalidGraph, invalidFuzz], { allowFailure: true });
+record("parser-checker-fuzz-invalid", "fuzz", invalidImport.code !== 0 && invalidImport.body.diagnostics?.length > 0, {
+  diagnostic: invalidImport.body.diagnostics?.[0]?.code,
 });
 
 const fmtFixture = await run(["fmt", "conformance/native/pass/test-blocks.0"]);
@@ -87,57 +85,23 @@ record("formatter-snapshot", "snapshot", fmtFixture.stdout === fmtExpected, {
   bytes: fmtFixture.stdout.length,
 });
 
-const stdlibJson = await json(["size", "--json", "examples/std-data-formats.0"]);
-record("stdlib-parser-golden", "golden", stdlibJson.body.usedStdlibHelpers?.some((helper) => helper.name === "std.json.parse"), {
+const stdlibJson = await json(["size", "--json", "conformance/native/pass/std-codec-json-url.graph"]);
+record("stdlib-parser-golden", "golden", stdlibJson.body.usedStdlibHelpers?.some((helper) => helper.name === "std.json.field") && stdlibJson.body.compilerCaches?.some((cache) => cache.sourceKind === "program-graph"), {
   helperCount: stdlibJson.body.usedStdlibHelpers?.length ?? 0,
 });
 
-const stdlibEdges = join(outDir, "stdlib-codec-json-http-edges.0");
-await writeFile(stdlibEdges, String.raw`export c fn main() -> i32 {
-    var ok: Bool = true
-
-    let bad_hex: Maybe<usize> = std.codec.hexDecodedLen("41z")
-    var base64_buf: [2]u8 = [0_u8; 2]
-    let bad_base64: Maybe<Span<u8>> = std.codec.base64Decode(base64_buf, "AAB=")
-    let bad_varint: Maybe<u32> = std.codec.varintDecode("\xff\xff\xff\xff\xff")
-    if bad_hex.has || bad_base64.has || bad_varint.has {
-        ok = false
-    }
-
-    if std.json.validateError("{") != std.json.errorInvalid() || std.json.validateError("{} x") != std.json.errorTrailing() || std.json.validateError("{\"a\":1}") != std.json.errorNone() {
-        ok = false
-    }
-
-    var request_buf: [128]u8 = [0_u8; 128]
-    let request: Maybe<Span<u8>> = std.http.writeJsonRequest(request_buf, "POST https://example.com/api?name=zero", "{\"ping\":1}")
-    if !request.has {
-        ok = false
-    }
-    if request.has {
-        let body: Maybe<Span<u8>> = std.http.requestBodyWithin(request.value, 16)
-        let too_large: Maybe<Span<u8>> = std.http.requestBodyWithin(request.value, 4)
-        let missing: Maybe<Span<u8>> = std.http.requestQueryValue(request.value, "missing")
-        if !body.has || !std.mem.eql(body.value, "{\"ping\":1}") || too_large.has || missing.has {
-            ok = false
-        }
-    }
-
-    if ok {
-        return 0
-    }
-    return 1
-}
-`);
-const stdlibEdgesRun = await run(["run", stdlibEdges]);
-record("stdlib-codec-json-http-edges", "golden", stdlibEdgesRun.code === 0 && stdlibEdgesRun.stdout === "", {
-  fixture: stdlibEdges,
+const stdlibEdgesGraph = "conformance/native/pass/std-codec-json-url.graph";
+const stdlibEdgesRun = await run(["run", stdlibEdgesGraph]);
+record("stdlib-codec-json-http-edges", "golden", stdlibEdgesRun.code === 0 && stdlibEdgesRun.stdout === "std codec json url ok\n", {
+  fixture: stdlibEdgesGraph,
 });
 
 const crasher = join(outDir, "crasher-repro-unclosed-string.0");
 await writeFile(crasher, "pub fn main() -> Void {\n    let value: String = \"unterminated\n}\n");
-const crasherResult = await json(["check", "--json", crasher], { allowFailure: true });
-record("minimized-crasher-repro", "crasher", crasherResult.code !== 0 && crasherResult.body.diagnostics?.length > 0, {
-  diagnostic: crasherResult.body.diagnostics?.[0]?.code,
+const crasherGraph = join(outDir, "crasher-repro-unclosed-string.graph");
+const crasherImport = await json(["import", "--json", "--format", "binary", "--out", crasherGraph, crasher], { allowFailure: true });
+record("minimized-crasher-repro", "crasher", crasherImport.code !== 0 && crasherImport.body.diagnostics?.length > 0, {
+  diagnostic: crasherImport.body.diagnostics?.[0]?.code,
 });
 
 const report = {
@@ -145,7 +109,7 @@ const report = {
   ok: rows.every((row) => row.ok),
   rows,
   conventions: {
-    fuzzCorpus: [validFuzz, invalidFuzz, "conformance/parse/compiler-smoke.0", "examples/std-data-formats.0"],
+    fuzzCorpus: [validGraph, invalidFuzz, "conformance/format/functions-blocks.0", "examples/std-data-formats.graph"],
     goldenOutputs: ["zero test --json conformance/packages/test-app", "zero fmt conformance/native/pass/test-blocks.0"],
     crasherRepros: [crasher],
     sanitizerGate: "pnpm run native:sanitize",

@@ -20,6 +20,36 @@ function pathToUri(path) {
   return pathToFileURL(path).href;
 }
 
+function graphSidecarPath(path) {
+  return path.endsWith(".0") ? `${path.slice(0, -2)}.graph` : null;
+}
+
+function diagnosticsFromBody(body) {
+  return (body?.diagnostics ?? []).map((diag) => ({
+    range: {
+      start: { line: Math.max(0, diag.line - 1), character: Math.max(0, diag.column - 1) },
+      end: { line: Math.max(0, diag.line - 1), character: Math.max(0, diag.column) },
+    },
+    severity: 1,
+    code: diag.code,
+    source: "zero",
+    message: diag.message,
+    data: { repair: diag.repair, fixSafety: diag.fixSafety },
+  }));
+}
+
+async function importProjectionSidecar(path) {
+  const sidecar = graphSidecarPath(path);
+  if (!sidecar) return null;
+  const result = await execFileAsync(zero, ["import", "--json", "--format", "binary", "--out", sidecar, path]).catch((error) => error);
+  if (!result.stdout) return null;
+  try {
+    return JSON.parse(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
 function positionAt(text, offset) {
   const prefix = text.slice(0, offset);
   const lines = prefix.split("\n");
@@ -119,32 +149,28 @@ async function compilerDiagnostics(uri, text) {
   const path = uriToPath(uri);
   try {
     await writeFile(path, text);
-    const result = await execFileAsync(zero, ["check", "--json", path]).catch((error) => error);
+    const sidecar = graphSidecarPath(path);
+    const imported = await importProjectionSidecar(path);
+    if (imported && imported.ok === false) return diagnosticsFromBody(imported);
+    const input = sidecar && imported ? sidecar : path;
+    const result = await execFileAsync(zero, ["check", "--json", input]).catch((error) => error);
     if (!result.stdout) return simpleDiagnostics(uri, text);
     const body = JSON.parse(result.stdout);
-    const diagnostics = (body.diagnostics ?? []).map((diag) => ({
-      range: {
-        start: { line: Math.max(0, diag.line - 1), character: Math.max(0, diag.column - 1) },
-        end: { line: Math.max(0, diag.line - 1), character: Math.max(0, diag.column) },
-      },
-      severity: 1,
-      code: diag.code,
-      source: "zero",
-      message: diag.message,
-      data: { repair: diag.repair, fixSafety: diag.fixSafety },
-    }));
-    return diagnostics;
+    return diagnosticsFromBody(body);
   } catch {
     return simpleDiagnostics(uri, text);
   }
 }
 
 async function compilerFacts(path) {
+  const sidecar = graphSidecarPath(path);
+  const imported = await importProjectionSidecar(path);
+  const input = sidecar && imported ? sidecar : path;
   const [graphResult, sizeResult, memResult, docResult] = await Promise.all([
-    execFileAsync(zero, ["graph", "--json", path]).catch((error) => error),
-    execFileAsync(zero, ["size", "--json", path]).catch((error) => error),
-    execFileAsync(zero, ["mem", "--json", path]).catch((error) => error),
-    execFileAsync(zero, ["doc", "--json", path]).catch((error) => error),
+    execFileAsync(zero, ["inspect", "--json", input]).catch((error) => error),
+    execFileAsync(zero, ["size", "--json", input]).catch((error) => error),
+    execFileAsync(zero, ["mem", "--json", input]).catch((error) => error),
+    execFileAsync(zero, ["doc", "--json", input]).catch((error) => error),
   ]);
   const parseBody = (result) => {
     if (!result.stdout) return null;
@@ -477,7 +503,14 @@ async function selfTest() {
   assert(definition({ textDocument: { uri }, position: { line: 0, character: 9 } }).uri === uri);
   assert(references({ textDocument: { uri }, position: { line: 0, character: 9 } }).length >= 1);
   assert(rename({ textDocument: { uri }, position: { line: 0, character: 9 }, newName: "sum" }).changes[uri].length >= 1);
-  const actions = await codeActions({ textDocument: { uri: pathToUri("conformance/native/fail/mem-copy-immutable-dst.0") }, context: { diagnostics: [] } });
+  const mutableFixPath = join(dir, "mutable-fix.0");
+  const mutableFixUri = pathToUri(mutableFixPath);
+  const mutableFixText = "pub fn main() -> Void {\n    let dst: [2]u8 = [0_u8; 2]\n    let src: [2]u8 = [1_u8; 2]\n    std.mem.copy(dst, src)\n}\n";
+  await writeFile(mutableFixPath, mutableFixText);
+  const mutableNotifications = [];
+  await didOpen({ textDocument: { uri: mutableFixUri, text: mutableFixText, version: 1 } }, (method, params) => mutableNotifications.push({ method, params }));
+  const mutableDiagnostics = mutableNotifications.find((item) => item.method === "textDocument/publishDiagnostics")?.params?.diagnostics ?? [];
+  const actions = await codeActions({ textDocument: { uri: mutableFixUri }, context: { diagnostics: mutableDiagnostics } });
   assert(actions.some((action) => action.data.id === "make-binding-mutable"));
   const targetActions = await codeActions({
     textDocument: { uri },

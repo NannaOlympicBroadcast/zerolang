@@ -1,0 +1,12 @@
+use http_util
+
+pub fn listActivities(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"activities\":[{\"id\":77,\"type\":\"call\",\"account_id\":1},{\"id\":78,\"type\":\"email\",\"account_id\":1}]}")
+}
+
+pub fn createActivity(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    if bodyIsJson(request, 256) && bodyHasU32(request, "account_id", 256) {
+        return jsonResponse(response, 201_u16, "{\"activity\":{\"id\":102,\"kind\":\"note\",\"account_id\":1},\"created\":true}")
+    }
+    return badRequest(response, "json")
+}

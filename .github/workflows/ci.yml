@@ -5,13 +5,25 @@ on:
   push:
     branches:
       - main
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+    inputs:
+      validation_depth:
+        description: Validation depth to run
+        required: true
+        default: fast
+        type: choice
+        options:
+          - fast
+          - deep
 
 permissions:
   contents: read
 
 jobs:
-  build-and-test:
-    name: Build & Test
+  conformance-suite:
+    name: Conformance Suite
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,71 +37,334 @@ jobs:
           corepack enable
           corepack prepare pnpm@11.1.3 --activate
 
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
-
-      - name: Build native compiler
-        run: make -C native/zero-c
-
-      - name: Verify embedded skill data
-        run: |
-          node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/embed-skill-data.mts
-          git diff --exit-code native/zero-c/src/embedded_skills.inc
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
 
       - run: pnpm install --frozen-lockfile
 
-      - name: Smoke test
-        run: pnpm run check
-
       - name: Conformance suite
+        env:
+          ZERO_VALIDATION_PHASES: graph-input-policy,native-contracts,provenance-guardrails,type-core-smoke,mir-verifier-smoke,program-graph-smoke,canonical-text-smoke,examples-gate,conformance-run
+          ZERO_VALIDATION_JOBS: "4"
+          ZERO_CONFORMANCE_CHECK_JOBS: "4"
         run: pnpm run conformance:local
 
-      - name: Native tests
+  native-preflight:
+    name: Native Preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Native preflight
+        env:
+          ZERO_NATIVE_TEST_PHASES: preflight
+          ZERO_NATIVE_TEST_SCOPE: fast
         run: pnpm run native:test:local
 
-      - name: Rosetta tasks
-        run: pnpm run rosetta:local
+  native-runtime-cases:
+    name: Native Runtime Cases (${{ matrix.shard }}/2)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Stdlib contracts
-        run: pnpm run stdlib:contracts
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Native tests
+        env:
+          ZERO_NATIVE_TEST_PHASES: cases
+          ZERO_NATIVE_TEST_SCOPE: fast
+          ZERO_NATIVE_TEST_SHARD: "${{ matrix.shard }}/2"
+        run: pnpm run native:test:local
+
+  native-metadata-reports:
+    name: Native Metadata Reports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Native metadata and reports
+        env:
+          ZERO_NATIVE_TEST_PHASES: metadata-and-reports
+        run: pnpm run native:test:local
+
+  native-direct-backend-artifacts:
+    name: Native Direct Backend Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Native direct backend artifacts
+        env:
+          ZERO_NATIVE_TEST_PHASES: direct-backend-artifacts
+        run: pnpm run native:test:local
+
+  native-sanitizer-smoke:
+    name: Native Sanitizer Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
 
       - name: Native sanitizer smoke
         run: pnpm run native:sanitize
 
-      - name: TypeScript tests
-        run: pnpm run test:zero
+  command-contract-snapshots:
+    name: Command Contract Snapshots
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-      - name: Docs tests
-        run: pnpm run docs:test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
 
-      - name: Extension tests
-        run: pnpm run extension:test
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - name: Build native compiler
+        run: make -C native/zero-c
 
       - name: Command contract snapshots
         run: pnpm run command-contracts:local
 
-      - name: Benchmark smoke
+  graph-build-perf:
+    name: Graph Build Perf
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Graph build perf report
+        env:
+          ZERO_GRAPH_BUILD_PERF_CASES: hello-artifact,stdlib-heavy-artifact
+        run: |
+          mkdir -p .zero
+          set +e
+          pnpm run graph:perf:budgets > .zero/graph-build-perf.json
+          status=$?
+          cat .zero/graph-build-perf.json
+          exit $status
+
+  deep-conformance-suite:
+    name: Deep Conformance Suite
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.validation_depth == 'deep' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Deep conformance suite
+        env:
+          ZERO_VALIDATION_JOBS: "4"
+          ZERO_CONFORMANCE_CHECK_JOBS: "4"
+        run: pnpm run conformance:local
+
+  deep-native-preflight:
+    name: Deep Native Preflight
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.validation_depth == 'deep' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Deep native preflight
+        env:
+          ZERO_NATIVE_TEST_PHASES: preflight
+          ZERO_NATIVE_TEST_SCOPE: deep
+        run: pnpm run native:test:local
+
+  deep-native-runtime-cases:
+    name: Deep Native Runtime Cases (${{ matrix.shard }}/6)
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.validation_depth == 'deep' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Deep native tests
+        env:
+          ZERO_NATIVE_TEST_PHASES: cases
+          ZERO_NATIVE_TEST_SCOPE: deep
+          ZERO_NATIVE_TEST_SHARD: "${{ matrix.shard }}/6"
+        run: pnpm run native:test:local
+
+  deep-graph-build-perf:
+    name: Deep Graph Build Perf
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.validation_depth == 'deep' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Deep graph build perf report
+        run: |
+          mkdir -p .zero
+          set +e
+          pnpm run graph:perf:budgets > .zero/deep-graph-build-perf.json
+          status=$?
+          cat .zero/deep-graph-build-perf.json
+          exit $status
+
+  workspace-checks:
+    name: Workspace Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Enable pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.3 --activate
+
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Workspace checks
         env:
           VERCEL_OIDC_TOKEN: ${{ secrets.VERCEL_OIDC_TOKEN }}
-        run: |
-          if [[ -n "${VERCEL_OIDC_TOKEN:-}" ]]; then
-            ZERO_BENCH_RUNS=1 pnpm run bench
-          else
-            ZERO_BENCH_RUNS=1 pnpm run bench:local
-          fi
-
-      - name: Cross-target smoke
-        run: |
-          bin/zero check --target linux-musl-x64 examples/memory-package
-          bin/zero build --emit obj --target linux-musl-x64 examples/direct-obj-add.0 --out .zero/out/direct-obj-add-linux-musl.o
-          bin/zero build --target linux-musl-x64 examples/hello.0 --out .zero/out/hello-linux-musl
-          bin/zero build --target win32-x64.exe examples/hello.0 --out .zero/out/hello-win32
-
-      - name: Release artifact build smoke
-        run: |
-          mkdir -p .zero/ci-release
-          node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/embed-skill-data.mts
-          ZIG_GLOBAL_CACHE_DIR=.zero/zig-global-cache ZIG_LOCAL_CACHE_DIR=.zero/zig-local-cache zig cc -target x86_64-linux-musl -std=c11 -D_POSIX_C_SOURCE=200809L -Os -Inative/zero-c/include native/zero-c/src/*.c -o .zero/ci-release/zero-linux-musl-x64
-          ./.zero/ci-release/zero-linux-musl-x64 --version
-          ./.zero/ci-release/zero-linux-musl-x64 skills list --json
+        run: pnpm run workspace:checks

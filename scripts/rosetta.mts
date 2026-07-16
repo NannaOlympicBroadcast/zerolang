@@ -39,10 +39,10 @@ function canRunTarget(targetName: string) {
     (targetName === "darwin-x64" && process.platform === "darwin" && (process.arch === "x64" || spawnSync("arch", ["-x86_64", "/usr/bin/true"]).status === 0));
 }
 
-function expectedObjectEmissionPath(targetName: string) {
-  if (targetName === "linux-musl-x64") return "direct-elf64-exe";
-  if (targetName === "darwin-arm64") return "direct-macho64-exe";
-  if (targetName === "darwin-x64") return "direct-macho-x64-exe";
+function expectedObjectEmissionPaths(targetName: string) {
+  if (targetName === "linux-musl-x64") return new Set(["direct-elf64-exe", "direct-elf64-object"]);
+  if (targetName === "darwin-arm64") return new Set(["direct-macho64-exe", "direct-macho64-object"]);
+  if (targetName === "darwin-x64") return new Set(["direct-macho-x64-exe", "direct-macho-x64-object"]);
   fail(`unsupported Rosetta target: ${targetName}`);
 }
 
@@ -94,24 +94,31 @@ function validateCases(cases: RosettaCase[]) {
     if (entry.source !== `benchmarks/rosetta/${entry.slug}.0`) bad.push(`${entry.id}: source must be benchmarks/rosetta/${entry.slug}.0`);
     if (dirname(entry.source) !== "benchmarks/rosetta") bad.push(`${entry.id}: source must be a flat .0 file`);
     if (!existsSync(entry.source)) bad.push(`${entry.id}: missing source ${entry.source}`);
+    if (!existsSync(graphInputForSource(entry.source))) bad.push(`${entry.id}: missing graph sidecar ${graphInputForSource(entry.source)}`);
     if (typeof entry.expectedStdout !== "string") bad.push(`${entry.id}: expectedStdout must be a string`);
     if (typeof entry.expectedStderr !== "string") bad.push(`${entry.id}: expectedStderr must be a string`);
   }
   if (bad.length > 0) fail(`Rosetta manifest validation failed:\n${bad.slice(0, 40).join("\n")}`);
 }
 
+function graphInputForSource(source: string) {
+  return source.endsWith(".0") ? `${source.slice(0, -2)}.graph` : source;
+}
+
 function buildCase(entry: RosettaCase) {
   const out = join(outDir, entry.slug);
-  const args = ["build", "--json", "--emit", "exe", "--target", target, entry.source, "--out", out];
+  const input = graphInputForSource(entry.source);
+  const args = ["build", "--json", "--emit", "exe", "--target", target, input, "--out", out];
   const result = spawnSync("bin/zero", args, { encoding: "utf8", maxBuffer: 20_000_000 });
   if (result.status !== 0) return { ok: false, out, failure: commandFailure("bin/zero", args, result) };
   const body = JSON.parse(result.stdout);
   if (body.generatedCBytes !== 0) {
     return { ok: false, out, failure: { diagnostic: `expected generatedCBytes=0, got ${body.generatedCBytes}` } };
   }
-  const expectedPath = expectedObjectEmissionPath(target);
-  if (body.objectBackend?.objectEmission?.path !== expectedPath) {
-    return { ok: false, out, failure: { diagnostic: `expected ${expectedPath}, got ${body.objectBackend?.objectEmission?.path ?? "<missing>"}` } };
+  const emissionPath = body.objectBackend?.objectEmission?.path ?? "<missing>";
+  const expectedPaths = expectedObjectEmissionPaths(target);
+  if (!expectedPaths.has(emissionPath)) {
+    return { ok: false, out, failure: { diagnostic: `expected one of ${[...expectedPaths].join(", ")}, got ${emissionPath}` } };
   }
   return { ok: true, out };
 }

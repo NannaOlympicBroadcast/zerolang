@@ -1,0 +1,377 @@
+fn __zero_std_inet_ipv4_core(text: Span<u8>) -> u64 {
+    let len: usize = std.mem.len(text)
+    var pos: usize = 0
+    var octet_index: usize = 0
+    var value: u32 = 0
+    while octet_index < 4 {
+        if pos >= len {
+            return 0
+        }
+        var digits: usize = 0
+        var octet: u32 = 0
+        var leading_zero: Bool = false
+        while pos < len && (text[pos] >= 48_u8 && text[pos] <= 57_u8) {
+            if digits == 0 && text[pos] == 48_u8 {
+                leading_zero = true
+            }
+            if digits >= 3 {
+                return 0
+            }
+            octet = octet * 10_u32 + ((text[pos] - 48_u8) as u32)
+            digits = digits + 1
+            pos = pos + 1
+        }
+        if digits == 0 || octet > 255_u32 {
+            return 0
+        }
+        if leading_zero && digits > 1 {
+            return 0
+        }
+        value = value * 256_u32 + octet
+        octet_index = octet_index + 1
+        if octet_index < 4 {
+            if pos >= len || text[pos] != 46_u8 {
+                return 0
+            }
+            pos = pos + 1
+        }
+    }
+    if pos != len {
+        return 0
+    }
+    return 4294967296_u64 + (value as u64)
+}
+
+fn __zero_std_inet_parse_ipv4(text: Span<u8>) -> Maybe<u32> {
+    let core: u64 = __zero_std_inet_ipv4_core(text)
+    if core == 0 {
+        return null
+    }
+    return (core % 4294967296_u64) as u32
+}
+
+fn __zero_std_inet_ipv4_to_bytes(buffer: MutSpan<u8>, value: u32) -> Maybe<Span<u8>> {
+    if std.mem.len(buffer) < 4 {
+        return null
+    }
+    buffer[0] = (value / 16777216_u32) as u8
+    buffer[1] = ((value / 65536_u32) % 256_u32) as u8
+    buffer[2] = ((value / 256_u32) % 256_u32) as u8
+    buffer[3] = (value % 256_u32) as u8
+    return buffer[..4]
+}
+
+fn __zero_std_inet_write_ipv4(buffer: MutSpan<u8>, value: u32) -> Maybe<Span<u8>> {
+    var writer: FixedWriter = std.io.fixedWriter(buffer, 0_usize)
+    let a: u32 = value / 16777216_u32
+    let b: u32 = (value / 65536_u32) % 256_u32
+    let c: u32 = (value / 256_u32) % 256_u32
+    let d: u32 = value % 256_u32
+    if std.fmt.writeU32(&mut writer, a) && (std.io.fixedWriterWriteByte(&mut writer, 46_u8) && std.fmt.writeU32(&mut writer, b)) && (std.io.fixedWriterWriteByte(&mut writer, 46_u8) && std.fmt.writeU32(&mut writer, c)) && (std.io.fixedWriterWriteByte(&mut writer, 46_u8) && std.fmt.writeU32(&mut writer, d)) {
+        return std.io.fixedWriterView(&writer)
+    }
+    return null
+}
+
+fn __zero_std_inet_is_ipv4(text: Span<u8>) -> Bool {
+    return __zero_std_inet_ipv4_core(text) != 0
+}
+
+fn __zero_std_inet_is_ipv4_unspecified(value: u32) -> Bool {
+    return value == 0_u32
+}
+
+fn __zero_std_inet_is_ipv4_loopback(value: u32) -> Bool {
+    return value / 16777216_u32 == 127_u32
+}
+
+fn __zero_std_inet_is_ipv4_private(value: u32) -> Bool {
+    let first: u32 = value / 16777216_u32
+    let second: u32 = (value / 65536_u32) % 256_u32
+    if first == 10_u32 {
+        return true
+    }
+    if first == 172_u32 && (second >= 16_u32 && second <= 31_u32) {
+        return true
+    }
+    return first == 192_u32 && second == 168_u32
+}
+
+fn __zero_std_inet_is_ipv4_link_local(value: u32) -> Bool {
+    let first: u32 = value / 16777216_u32
+    let second: u32 = (value / 65536_u32) % 256_u32
+    return first == 169_u32 && second == 254_u32
+}
+
+fn __zero_std_inet_is_ipv4_multicast(value: u32) -> Bool {
+    let first: u32 = value / 16777216_u32
+    return first >= 224_u32 && first <= 239_u32
+}
+
+fn __zero_std_inet_hex_value(byte: u8) -> u32 {
+    if byte >= 48_u8 && byte <= 57_u8 {
+        return (byte - 48_u8) as u32
+    }
+    if byte >= 97_u8 && byte <= 102_u8 {
+        return (byte - 87_u8) as u32
+    }
+    if byte >= 65_u8 && byte <= 70_u8 {
+        return (byte - 55_u8) as u32
+    }
+    return 4294967295_u32
+}
+
+fn __zero_std_inet_parse_ipv6(buffer: MutSpan<u8>, text: Span<u8>) -> Maybe<Span<u8>> {
+    if std.mem.len(buffer) < 16 {
+        return null
+    }
+    let len: usize = std.mem.len(text)
+    if len == 0 {
+        return null
+    }
+    var head: [8]u32 = [0; 8]
+    var tail: [8]u32 = [0; 8]
+    var head_count: usize = 0
+    var tail_count: usize = 0
+    var seen_gap: Bool = false
+    var pos: usize = 0
+    if text[0] == 58_u8 {
+        if len < 2 || text[1] != 58_u8 {
+            return null
+        }
+        seen_gap = true
+        pos = 2
+    }
+    while pos < len {
+        var token_end: usize = pos
+        var has_dot: Bool = false
+        while token_end < len && text[token_end] != 58_u8 {
+            if text[token_end] == 46_u8 {
+                has_dot = true
+            }
+            token_end = token_end + 1
+        }
+        if token_end == pos {
+            return null
+        }
+        if has_dot {
+            if token_end != len {
+                return null
+            }
+            let v4: u64 = __zero_std_inet_ipv4_core(text[pos..len])
+            if v4 == 0 {
+                return null
+            }
+            let quad: u32 = (v4 % 4294967296_u64) as u32
+            if seen_gap {
+                if tail_count + 2 > 8 {
+                    return null
+                }
+                tail[tail_count] = quad / 65536_u32
+                tail[tail_count + 1] = quad % 65536_u32
+                tail_count = tail_count + 2
+            } else {
+                if head_count + 2 > 8 {
+                    return null
+                }
+                head[head_count] = quad / 65536_u32
+                head[head_count + 1] = quad % 65536_u32
+                head_count = head_count + 2
+            }
+            pos = len
+            break
+        }
+        if token_end - pos > 4 {
+            return null
+        }
+        var group: u32 = 0
+        var scan: usize = pos
+        while scan < token_end {
+            let digit: u32 = __zero_std_inet_hex_value(text[scan])
+            if digit == 4294967295_u32 {
+                return null
+            }
+            group = group * 16_u32 + digit
+            scan = scan + 1
+        }
+        if seen_gap {
+            if tail_count + 1 > 8 {
+                return null
+            }
+            tail[tail_count] = group
+            tail_count = tail_count + 1
+        } else {
+            if head_count + 1 > 8 {
+                return null
+            }
+            head[head_count] = group
+            head_count = head_count + 1
+        }
+        pos = token_end
+        if pos < len {
+            pos = pos + 1
+            if pos < len && text[pos] == 58_u8 {
+                if seen_gap {
+                    return null
+                }
+                seen_gap = true
+                pos = pos + 1
+                if pos == len {
+                    break
+                }
+            } else if pos == len {
+                return null
+            }
+        }
+    }
+    let total: usize = head_count + tail_count
+    if seen_gap {
+        if total > 7 {
+            return null
+        }
+    } else {
+        if total != 8 {
+            return null
+        }
+    }
+    var groups: [8]u32 = [0; 8]
+    var index: usize = 0
+    while index < head_count {
+        groups[index] = head[index]
+        index = index + 1
+    }
+    var tail_index: usize = 0
+    while tail_index < tail_count {
+        groups[8 - tail_count + tail_index] = tail[tail_index]
+        tail_index = tail_index + 1
+    }
+    var out_index: usize = 0
+    while out_index < 8 {
+        buffer[out_index * 2] = (groups[out_index] / 256_u32) as u8
+        buffer[out_index * 2 + 1] = (groups[out_index] % 256_u32) as u8
+        out_index = out_index + 1
+    }
+    return buffer[..16]
+}
+
+fn __zero_std_inet_is_ipv6(text: Span<u8>) -> Bool {
+    var storage: [16]u8 = [0; 16]
+    let buffer: MutSpan<u8> = storage
+    let parsed: Maybe<Span<u8>> = __zero_std_inet_parse_ipv6(buffer, text)
+    return parsed.has
+}
+
+fn __zero_std_inet_is_ip(text: Span<u8>) -> Bool {
+    return __zero_std_inet_is_ipv4(text) || __zero_std_inet_is_ipv6(text)
+}
+
+fn __zero_std_inet_parse_ip(buffer: MutSpan<u8>, text: Span<u8>) -> Maybe<Span<u8>> {
+    let ipv4: Maybe<u32> = __zero_std_inet_parse_ipv4(text)
+    if ipv4.has {
+        return __zero_std_inet_ipv4_to_bytes(buffer, ipv4.value)
+    }
+    return __zero_std_inet_parse_ipv6(buffer, text)
+}
+
+fn __zero_std_inet_is_ipv6_unspecified(bytes: Span<u8>) -> Bool {
+    if std.mem.len(bytes) != 16 {
+        return false
+    }
+    var index: usize = 0
+    while index < 16 {
+        if bytes[index] != 0_u8 {
+            return false
+        }
+        index = index + 1
+    }
+    return true
+}
+
+fn __zero_std_inet_is_ipv6_loopback(bytes: Span<u8>) -> Bool {
+    if std.mem.len(bytes) != 16 {
+        return false
+    }
+    var index: usize = 0
+    while index < 15 {
+        if bytes[index] != 0_u8 {
+            return false
+        }
+        index = index + 1
+    }
+    return bytes[15] == 1_u8
+}
+
+fn __zero_std_inet_is_ipv6_multicast(bytes: Span<u8>) -> Bool {
+    return std.mem.len(bytes) == 16 && bytes[0] == 255_u8
+}
+
+fn __zero_std_inet_is_ipv6_link_local(bytes: Span<u8>) -> Bool {
+    return std.mem.len(bytes) == 16 && (bytes[0] == 254_u8 && (bytes[1] >= 128_u8 && bytes[1] <= 191_u8))
+}
+
+fn __zero_std_inet_is_ipv6_private(bytes: Span<u8>) -> Bool {
+    return std.mem.len(bytes) == 16 && (bytes[0] == 252_u8 || bytes[0] == 253_u8)
+}
+
+fn __zero_std_inet_is_ipv6_unique_local(bytes: Span<u8>) -> Bool {
+    return __zero_std_inet_is_ipv6_private(bytes)
+}
+
+fn __zero_std_inet_is_ipv6_mapped_ipv4(bytes: Span<u8>) -> Bool {
+    if std.mem.len(bytes) != 16 {
+        return false
+    }
+    var index: usize = 0
+    while index < 10 {
+        if bytes[index] != 0_u8 {
+            return false
+        }
+        index = index + 1
+    }
+    return bytes[10] == 255_u8 && bytes[11] == 255_u8
+}
+
+fn __zero_std_inet_ipv6_mapped_ipv4(bytes: Span<u8>) -> Maybe<u32> {
+    if !__zero_std_inet_is_ipv6_mapped_ipv4(bytes) {
+        return null
+    }
+    return (bytes[12] as u32) * 16777216_u32 + (bytes[13] as u32) * 65536_u32 + (bytes[14] as u32) * 256_u32 + (bytes[15] as u32)
+}
+
+fn __zero_std_inet_is_hostname(text: Span<u8>) -> Bool {
+    let len: usize = std.mem.len(text)
+    if len == 0 || len > 253 {
+        return false
+    }
+    var pos: usize = 0
+    var label_len: usize = 0
+    while pos < len {
+        let byte: u8 = text[pos]
+        if byte == 46_u8 {
+            if label_len == 0 {
+                return false
+            }
+            if text[pos - 1] == 45_u8 {
+                return false
+            }
+            label_len = 0
+        } else {
+            if label_len == 0 && byte == 45_u8 {
+                return false
+            }
+            let is_alnum: Bool = (byte >= 48_u8 && byte <= 57_u8) || ((byte >= 65_u8 && byte <= 90_u8) || (byte >= 97_u8 && byte <= 122_u8))
+            if !is_alnum && byte != 45_u8 {
+                return false
+            }
+            label_len = label_len + 1
+            if label_len > 63 {
+                return false
+            }
+        }
+        pos = pos + 1
+    }
+    if label_len == 0 {
+        return false
+    }
+    return text[len - 1] != 45_u8
+}

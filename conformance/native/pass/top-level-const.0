@@ -2,10 +2,23 @@ const answer: i32 = 42
 
 const byte: u8 = 7_u8
 
+const stride: usize = 12
+
+const scale = 3
+
+const fast: Bool = true
+
+const wide: usize = stride * 2
+
+fn scaled(value: i32) -> i32 {
+    return value * scale
+}
+
 pub fn main(world: World) -> Void raises {
     let value: i32 = answer
     let small: u8 = byte
-    if value == 42 && small == 7_u8 {
+    let total: usize = stride * 3
+    if value == 42 && small == 7_u8 && total == 36 && scaled(4) == 12 && fast && wide == 24 {
         check world.out.write("const ok\n")
     } else {
         check world.out.write("const broke\n")

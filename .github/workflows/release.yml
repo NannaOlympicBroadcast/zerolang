@@ -74,9 +74,8 @@ jobs:
         with:
           node-version: 24
 
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.1
+      - name: Install pinned Zig
+        run: bash scripts/install-zig.sh
 
       - name: Extract changelog entry
         run: |
@@ -94,12 +93,13 @@ jobs:
         run: |
           mkdir -p /tmp/zero-release
           node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/embed-skill-data.mts
+          build_hash="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
           build_asset() {
             target="$1"
             name="$2"
             echo "Building $name (target: $target)..."
-            zig cc -target "$target" -std=c11 -D_POSIX_C_SOURCE=200809L -Os -Inative/zero-c/include native/zero-c/src/*.c -o "/tmp/zero-release/$name"
+            zig cc -target "$target" -std=c11 -D_POSIX_C_SOURCE=200809L -DZERO_BUILD_HASH="\"$build_hash\"" -Os -Inative/zero-c/include native/zero-c/src/*.c -o "/tmp/zero-release/$name"
             chmod 755 "/tmp/zero-release/$name"
           }
 

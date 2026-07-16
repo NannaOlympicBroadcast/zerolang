@@ -21,6 +21,12 @@ typedef struct {
   char *name;
   char *type;
   char *path;
+  char *function;
+  char *left;
+  char *right;
+  char *arg0;
+  char *arg1;
+  char *call;
   size_t order;
   int line_value;
   int column_value;
@@ -39,6 +45,8 @@ typedef struct {
   bool fallible_value;
   bool export_c_value;
   bool ok;
+  bool has_call_sites;
+  size_t call_sites_updated;
   char code[16];
   char message[160];
 } ZProgramGraphPatchOpResult;
@@ -54,10 +62,18 @@ typedef struct {
   ZProgramGraphPatchOpResult *operations;
   size_t operation_len;
   size_t operation_cap;
+  int line;
+  bool format_error;
 } ZProgramGraphPatchResult;
-
 bool z_program_graph_patch_apply_operation(ZProgramGraph *graph, ZProgramGraphPatchResult *result, ZProgramGraphPatchOpResult *op);
+const char *const *z_program_graph_patch_operation_examples(void);
+const char *const *z_program_graph_patch_authoring_operation_examples(void);
+const char *const *z_program_graph_patch_node_operation_examples(void);
+const char *z_program_graph_patch_minimal_file_example(void);
+char *z_graph_patch_read_patch_text_source(size_t *out_len, ZDiag *diag);
 bool z_program_graph_apply_patch_text(const char *label, const char *text, size_t text_len, ZProgramGraph *graph, ZProgramGraphPatchResult *result, ZDiag *diag);
 bool z_program_graph_apply_patch_file(const char *path, ZProgramGraph *graph, ZProgramGraphPatchResult *result, ZDiag *diag);
+bool z_program_graph_apply_replace_fn_body_file(const char *function_name, const char *path, const char *expect_graph_hash, ZProgramGraph *graph, ZProgramGraphPatchResult *result, ZDiag *diag);
+bool z_program_graph_apply_replace_in_fn(const char *function_name, const char *old_inline, const char *old_file, const char *new_inline, const char *new_file, const char *expect_graph_hash, ZProgramGraph *graph, ZProgramGraphPatchResult *result, ZDiag *diag);
 void z_program_graph_patch_result_free(ZProgramGraphPatchResult *result);
 #endif

@@ -14,11 +14,14 @@ typedef struct {
 typedef enum {
   Z_PROGRAM_GRAPH_INPUT_UNKNOWN = 0, Z_PROGRAM_GRAPH_INPUT_SOURCE,
   Z_PROGRAM_GRAPH_INPUT_ARTIFACT, Z_PROGRAM_GRAPH_INPUT_SOURCE_OR_ARTIFACT,
+  Z_PROGRAM_GRAPH_INPUT_PATH,
 } ZProgramGraphInputMode;
 
 bool z_program_graph_command_kind_is_known(const char *kind);
 ZProgramGraphInputMode z_program_graph_command_input_mode(const char *kind);
+bool z_program_graph_command_can_use_repository_store(const char *kind);
 bool z_program_graph_command_kind_supports_out(const char *kind);
 ZProgramGraphOutputContract z_program_graph_command_output_contract(const char *kind);
+void z_program_graph_print_command_help(void);
 
 #endif

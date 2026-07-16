@@ -38,21 +38,34 @@ values for ordinary `expect` statements.
 ## Run
 
 ```sh
-zero test conformance/native/pass/test-blocks.0
-zero test --filter addition conformance/native/pass/test-blocks.0
+zero test conformance/native/pass/test-blocks.graph
+zero test --filter addition conformance/native/pass/test-blocks.graph
 zero test conformance/packages/test-app
 ```
 
 Use `--filter` for a narrow loop. The filter matches test names by substring.
 
-For normal agent edits, patch the backing `.0` source and run `zero test`. When an agent is explicitly validating a derived ProgramGraph artifact, use the graph test surface:
+For packages, normal `zero test [package]` compiles from `zero.graph` and can
+run before `.0` projections exist:
 
 ```sh
-zero graph test .zero/agent/app.program-graph
-zero graph test --filter addition .zero/agent/app.program-graph
+zero patch --op 'addTest name="addition works" call="add" arg0="2" arg1="3" expect="5" type="i32"'
+zero test
+zero test --filter addition
 ```
 
-Run normal `zero test` after persisting the accepted change to source text.
+Prefer `addTest` for one pure function call with literal arguments. Use
+`addTestBody name="..." ... end` only when the test needs custom body rows.
+Test labels are display names, not callable function names; do not rename them
+to `__zero_test_*`.
+If `zero test` reports an unknown function for a display label, do not rename
+the label to chase runner internals. Delete the malformed custom test and
+recreate simple pure coverage with `addTest`, or use behavior smoke checks for
+effectful paths.
+
+If another tool hands you a derived ProgramGraph artifact, `zero test` can
+validate it. Do not create a standalone graph artifact for the ordinary package
+test loop; test the package path so the compiler reads `zero.graph` directly.
 
 ## JSON Fields
 

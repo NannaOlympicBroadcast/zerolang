@@ -1,0 +1,5 @@
+use http_util
+
+pub fn searchCrm(request: Span<u8>, response: MutSpan<u8>) -> Maybe<Span<u8>> {
+    return jsonResponse(response, 200_u16, "{\"results\":[{\"type\":\"account\",\"id\":1,\"label\":\"Acme\"},{\"type\":\"deal\",\"id\":42,\"label\":\"Expansion\"}]}")
+}

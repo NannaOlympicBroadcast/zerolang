@@ -16,7 +16,7 @@ static void metadata_append_json_string(ZBuf *buf, const char *value) {
 }
 
 const char *z_llvm_backend_lifecycle_json_text(void) {
-  return "{\"stability\":\"experimental\",\"defaultEligible\":false,\"releaseEligible\":false,\"shipEligible\":false,\"fallbackEligible\":false,\"supportedReleaseFamily\":\"direct\",\"reason\":\"LLVM is explicit experimental build/run/IR only; direct emitters remain the supported release path\"}";
+  return "{\"stability\":\"experimental\",\"defaultEligible\":false,\"releaseEligible\":false,\"fallbackEligible\":false,\"supportedReleaseFamily\":\"direct\",\"reason\":\"LLVM is explicit experimental build/run/IR only; direct emitters remain the supported release path\"}";
 }
 
 void z_append_llvm_backend_lifecycle_json(ZBuf *buf) {

@@ -1,78 +1,17 @@
 import { ArrowRightIcon, LogoIcon } from "@/components/icons";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { ButtonLink } from "@/components/button";
 import { InstallCopy } from "@/components/install-copy";
+import { HomeChatViewport } from "@/components/home-chat-viewport";
+import { ChatToolRuns } from "@/components/home-chat-tools";
+import { LoopDiagram } from "@/components/loop-diagram";
+import { highlight } from "@/lib/highlight";
 import { pageMetadata } from "@/lib/page-metadata";
 
 export const metadata = pageMetadata("");
 
-const PILLARS = [
-  {
-    metric: "Graph",
-    label: "first",
-    title: "Semantic edit surface",
-    description:
-      "Agents can inspect checked ProgramGraph facts and submit graph edits instead of only patching source text ranges.",
-  },
-  {
-    metric: "Source",
-    label: "truth",
-    title: "Human-readable storage",
-    description:
-      ".0 source stays the durable representation: reviewable, auditable, formatted, and regular enough to behave like program data.",
-  },
-  {
-    metric: "Small",
-    label: "systems",
-    title: "Tight runtime goals",
-    description:
-      "Token efficiency, low memory usage, fast startup, fast builds, low runtime latency, and zero dependencies remain design constraints.",
-  },
-];
-
-const FEATURES = [
-  { title: "Experimental by design", description: "Today's syntax and APIs are not a contract. Breaking changes and removed compatibility paths are expected when a clearer agent-facing design wins." },
-  { title: "Safe environments only", description: "Security vulnerabilities should be expected. Run and develop zerolang in isolated environments, not production systems or sensitive infrastructure." },
-  { title: "Source-backed graph", description: "The ProgramGraph is derived from source. Graph artifacts are inspection and interchange data, not the primary project files." },
-  { title: "Checked graph edits", description: "Graph patches can target semantic nodes with graph-hash and field-value preconditions before source is written." },
-  { title: "Semantic facts", description: "The compiler can expose node IDs, resolved types, effects, ownership facts, capabilities, helper use, and module edges." },
-  { title: "Regular source", description: "The syntax should stay boring enough to index, compare, format, audit, and regenerate while still reading like normal code." },
-  { title: "Version-matched skills", description: "The compiler ships language, graph, diagnostics, build, testing, package, and stdlib guides that match the binary in use." },
-  { title: "Explicit effects", description: "Outside-world access, fallibility, ownership, and resource use should stay visible to both readers and tools." },
-  { title: "Direct CLI surface", description: "Agents can use compiler commands for checks, graph inspection, patching, size reports, explanations, and repair plans." },
-];
-
-const WHY_GRAPH = [
-  {
-    title: "Semantic navigation",
-    description:
-      "Agents should be able to start from a symbol, diagnostic, call, capability, module, or node ID and gather the relevant semantic slice without reading the whole file.",
-  },
-  {
-    title: "Precise edits",
-    description:
-      "Graph edits target compiler nodes and fields, with graph-hash and expected-value checks, instead of relying only on line ranges or matching source text.",
-  },
-  {
-    title: "Validated refactors",
-    description:
-      "Refactors can be represented as operations on resolved program structure: rename this function node, replace this resolved callee, update these related references.",
-  },
-  {
-    title: "Shorter feedback loop",
-    description:
-      "A graph patch can validate, lower, write, format, reparse, and check through the compiler instead of leaving agents to chain text edits and cleanup commands.",
-  },
-];
-
-const CODE_EXAMPLE = `<span class="hl-keyword">fn</span> <span class="hl-variable">answer</span>() -> <span class="hl-type">i32</span> {
-    <span class="hl-keyword">return</span> <span class="hl-number">40</span> + <span class="hl-number">2</span>
-}
-
-<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> <span class="hl-variable">main</span>(world: <span class="hl-type">World</span>) -> <span class="hl-type">Void</span> <span class="hl-keyword">raises</span> {
-    <span class="hl-keyword">if</span> <span class="hl-variable">answer</span>() == <span class="hl-number">42</span> {
-        <span class="hl-keyword">check</span> world.out.<span class="hl-variable">write</span>(<span class="hl-string">"math works\\n"</span>)
-    }
+const CODE_EXAMPLE = `<span class="hl-keyword">pub</span> <span class="hl-keyword">fn</span> <span class="hl-variable">main</span>(world: <span class="hl-type">World</span>) -> <span class="hl-type">Void</span> <span class="hl-keyword">raises</span> {
+    <span class="hl-keyword">check</span> world.out.<span class="hl-variable">write</span>(<span class="hl-string">"hello from zero\\n"</span>)
 }`;
 
 const GRAPH_EXAMPLE = `zero-graph v1
@@ -86,27 +25,230 @@ node #expr_c403020c MethodCall name:"write" type:"Void"
 node #expr_653eeb6e Literal type:"String" value:"hello from zero\\n"
 edge #expr_c403020c arg #expr_653eeb6e order:0`;
 
-const PATCH_EXAMPLE = `zero graph patch examples/hello.0 \\
+const PATCH_EXAMPLE = `zero patch \\
   --expect-graph-hash graph:a7f7e6899a73f3b4 \\
-  --op 'set node="#expr_653eeb6e" field="value" expect="hello from zero\\n" value="hello graph\\n"'`;
+  --op 'set node="#expr_653eeb6e" \\
+    field="value" \\
+    expect="hello from zero\\n" \\
+    value="hello graph\\n"'`;
 
-function CodeWindow({ title, html, children }: { title: string; html?: string; children?: ReactNode }) {
+const CONSTRAINTS = [
+  "Token efficiency",
+  "Low memory",
+  "Fast startup",
+  "Fast builds",
+  "Low latency",
+  "Zero dependencies",
+];
+
+const ARCHITECTURE_STEPS = [
+  {
+    label: "Human",
+    title: "Asks for an outcome",
+    body: "Build a CRM API, add auth, or fix a failing route",
+  },
+  {
+    label: "Agent",
+    title: "Uses Graph",
+    body: "Symbols, calls, types, effects, node IDs, and graph hashes",
+  },
+  {
+    label: "Compiler",
+    title: "Checks patches",
+    body: "Shape, type, stale-state, and repository metadata checks",
+  },
+  {
+    label: "Human",
+    title: "Reviews projection",
+    body: "Readable .0 projections stay available for review and rare manual edits",
+  },
+];
+
+/* ─── Primitives ──────────────────────────────────── */
+
+function GridGlow() {
   return (
-    <div className="overflow-hidden rounded-lg border border-border bg-code-bg shadow-card">
-      <div className="flex items-center gap-3 border-b border-border bg-surface px-4 py-3">
-        <div className="flex gap-1.5">
-          <span className="h-2.5 w-2.5 rounded-full bg-border" />
-          <span className="h-2.5 w-2.5 rounded-full bg-border" />
-          <span className="h-2.5 w-2.5 rounded-full bg-border" />
-        </div>
-        <span className="font-mono text-xs font-medium text-muted">{title}</span>
-      </div>
-      <pre className="m-0 overflow-x-auto p-6 text-sm leading-7">
-        <code className="text-code-fg">
-          {html ? <span dangerouslySetInnerHTML={{ __html: html }} /> : children}
-        </code>
-      </pre>
+    <div aria-hidden className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
+      <div
+        className="absolute inset-0 opacity-[0.4] dark:opacity-[0.25]"
+        style={{
+          backgroundImage:
+            "linear-gradient(to right, var(--color-border) 1px, transparent 1px), linear-gradient(to bottom, var(--color-border) 1px, transparent 1px)",
+          backgroundSize: "64px 64px",
+          maskImage:
+            "radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 75%)",
+          WebkitMaskImage:
+            "radial-gradient(ellipse 80% 60% at 50% 0%, #000 30%, transparent 75%)",
+        }}
+      />
     </div>
+  );
+}
+
+function SectionHeader({
+  title,
+  description,
+}: {
+  title: string;
+  description: string;
+}) {
+  return (
+    <div className="mb-12 max-w-[44rem]">
+      <h2 className="m-0 max-w-[14ch] text-[clamp(2.25rem,6vw,4.25rem)] font-semibold leading-[0.98] tracking-[-0.045em]">
+        {title}
+      </h2>
+      <p className="mt-6 max-w-[34rem] text-pretty text-[1.0625rem] leading-[1.65] text-muted">
+        {description}
+      </p>
+    </div>
+  );
+}
+
+function VisualGlow({ className = "", children }: { className?: string; children: ReactNode }) {
+  return <div className={className}>{children}</div>;
+}
+
+function Panel({ className = "", children }: { className?: string; children: ReactNode }) {
+  return (
+    <div
+      className={`relative overflow-hidden rounded-2xl border border-fg/30 ${className}`}
+      style={{ boxShadow: "0 1px 0 0 color-mix(in srgb, var(--color-fg) 4%, transparent)" }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function WindowBar({ title }: { title: string }) {
+  return (
+    <div className="relative flex items-center border-b border-fg/30 px-4 py-3">
+      <div className="flex gap-1.5">
+        <span className="h-2.5 w-2.5 rounded-full bg-border" />
+        <span className="h-2.5 w-2.5 rounded-full bg-border" />
+        <span className="h-2.5 w-2.5 rounded-full bg-border" />
+      </div>
+      <span className="absolute left-1/2 -translate-x-1/2 font-mono text-xs font-medium text-muted">
+        {title}
+      </span>
+    </div>
+  );
+}
+
+function CodeWindow({
+  title,
+  html,
+  className = "",
+}: {
+  title: string;
+  html: string;
+  className?: string;
+}) {
+  return (
+    <Panel className={`bg-bg ${className}`}>
+      <WindowBar title={title} />
+      <pre className="m-0 overflow-x-auto bg-bg p-5 text-[0.8125rem] leading-[1.7]">
+        <code className="text-code-fg" dangerouslySetInnerHTML={{ __html: html }} />
+      </pre>
+    </Panel>
+  );
+}
+
+function ArchitectureDiagram() {
+  return (
+    <div className="mt-12 w-full text-left">
+      <div className="grid grid-cols-1 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-2 lg:grid-cols-4">
+        {ARCHITECTURE_STEPS.map((item, index) => (
+          <div
+            key={item.title}
+            className="group relative flex flex-col bg-bg p-7 transition-colors duration-200 hover:bg-surface-muted"
+          >
+            <div className="mb-7 flex items-center gap-2.5">
+              <span className="flex h-6 w-6 items-center justify-center rounded-md border border-border font-mono text-[0.6875rem] tabular-nums text-muted transition-colors group-hover:border-fg/40 group-hover:text-fg">
+                {index + 1}
+              </span>
+              <span className="font-mono text-[0.6875rem] font-semibold uppercase tracking-[0.16em] text-muted">
+                {item.label}
+              </span>
+            </div>
+            <h2 className="m-0 text-[1.0625rem] font-semibold leading-snug tracking-[-0.02em] text-fg">
+              {item.title}
+            </h2>
+            <p className="m-0 mt-2.5 text-[0.8125rem] leading-[1.65] text-muted">
+              {item.body}
+            </p>
+            <span
+              aria-hidden
+              className="pointer-events-none absolute right-0 top-1/2 z-10 hidden -translate-y-1/2 translate-x-[calc(50%+1px)] lg:flex"
+            >
+              {index < ARCHITECTURE_STEPS.length - 1 ? (
+                <span className="flex h-6 w-6 items-center justify-center rounded-full border border-border bg-bg text-muted">
+                  <ArrowRightIcon width={12} height={12} />
+                </span>
+              ) : null}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ─── Chat mockup ─────────────────────────────────── */
+
+function chatRevealStyle(delay: string): CSSProperties {
+  return { "--chat-delay": delay } as CSSProperties;
+}
+
+function ChatMockup() {
+  return (
+    <HomeChatViewport>
+      <Panel className="home-chat-shell bg-bg shadow-card">
+        <WindowBar title="your agent" />
+
+        <div className="flex flex-col gap-5 p-5 sm:p-6">
+          <div className="home-chat-reveal flex justify-end" style={chatRevealStyle("80ms")}>
+            <div className="max-w-[82%] rounded-2xl rounded-br-md bg-fg px-4 py-2.5 text-[0.875rem] leading-relaxed text-bg">
+build hello world in zerolang
+            </div>
+          </div>
+
+          <div
+            className="home-chat-reveal max-w-[92%] text-[0.875rem] leading-[1.65] text-fg"
+            style={chatRevealStyle("360ms")}
+          >
+            I&apos;ll set up the package, patch the graph, and run it.
+          </div>
+
+          <ChatToolRuns startDelayMs={640} />
+
+          <div
+            className="home-chat-reveal max-w-[92%] text-[0.875rem] leading-[1.65] text-fg"
+            style={chatRevealStyle("1320ms")}
+          >
+            Done. <code className="home-chat-code">zero.graph</code> validated at{" "}
+            <code className="home-chat-code">graph:a7f7e689</code> with symbol{" "}
+            <code className="home-chat-code">main</code>. It prints:
+          </div>
+
+          <div
+            className="home-chat-reveal home-chat-output rounded-lg border border-border bg-code-bg px-4 py-3 font-mono text-[0.8125rem] text-code-fg"
+            style={chatRevealStyle("1520ms")}
+          >
+            hello from zero
+          </div>
+        </div>
+      </Panel>
+    </HomeChatViewport>
+  );
+}
+
+/* ─── Section wrapper ─────────────────────────────── */
+
+function Section({ children }: { children: ReactNode }) {
+  return (
+    <section className="relative z-10 mx-auto w-[min(100%-3rem,var(--container-content))] border-t border-border py-[clamp(5rem,11vh,8rem)]">
+      {children}
+    </section>
   );
 }
 
@@ -114,100 +256,130 @@ export default function HomePage() {
   return (
     <div className="relative min-h-screen overflow-hidden">
       <main>
-        <section className="relative z-10 mx-auto flex max-w-[52rem] flex-col items-center px-6 pb-16 pt-[clamp(4rem,12vh,8rem)] text-center">
-          <div className="mb-6 inline-flex items-center rounded-full border border-border bg-surface px-3 py-1 text-[0.8125rem] font-medium text-muted">
-            Experimental
-          </div>
-          <h1 className="m-0 text-[clamp(2rem,5vw,3.75rem)] font-bold leading-[1.15] tracking-[-0.045em]">
-            The programming language
-            <br />
-            for agents
-          </h1>
-          <p className="mt-6 max-w-[42rem] text-[clamp(1rem,2vw,1.1875rem)] leading-[1.65] text-muted">
-            zerolang is an experimental graph-first programming language where agents work with semantic program structure instead of raw source text.
-          </p>
-          <InstallCopy />
-          <p className="mt-4 max-w-[36rem] text-sm leading-relaxed text-muted">
-            Expect breaking changes. Run it in a safe environment, not against production systems.
-          </p>
-        </section>
-
-        <section className="relative z-10 mx-auto grid w-[min(100%-3rem,var(--container-content))] grid-cols-1 gap-px overflow-hidden rounded-lg border border-border bg-border md:grid-cols-3">
-          {PILLARS.map((p) => (
-            <div key={p.title} className="flex flex-col gap-3 bg-bg p-8">
-              <div className="mb-2 flex flex-col gap-0.5">
-                <span className="font-mono text-2xl font-bold tracking-[-0.03em] text-fg">{p.metric}</span>
-                <span className="text-xs font-medium uppercase tracking-[0.04em] text-muted">{p.label}</span>
-              </div>
-              <h3 className="m-0 text-base font-semibold tracking-[-0.01em]">{p.title}</h3>
-              <p className="m-0 text-sm leading-relaxed text-muted">{p.description}</p>
+        {/* Hero */}
+        <section className="relative overflow-hidden px-6 pb-24 pt-[clamp(4rem,11vh,7rem)]">
+          <GridGlow />
+          <div className="relative z-10 mx-auto flex max-w-[54rem] flex-col items-center text-center">
+            <div className="mb-7 inline-flex items-center rounded-full border border-border bg-surface/70 px-3.5 py-1 font-mono text-[0.6875rem] uppercase tracking-[0.16em] text-muted backdrop-blur">
+              Experimental
             </div>
-          ))}
-        </section>
-
-        <section className="relative z-10 mx-auto w-[min(100%-3rem,var(--container-content))] border-t border-border py-[clamp(4rem,8vh,6rem)]">
-          <div className="mx-auto mb-10 max-w-[48rem] text-center">
-            <p className="mb-2 text-[0.8125rem] font-semibold uppercase tracking-[0.04em] text-blue">Why graph</p>
-            <h2 className="mb-4 text-[clamp(1.5rem,4vw,2.25rem)] font-bold leading-[1.15] tracking-[-0.035em]">
-              Source is the artifact.
+            <h1 className="m-0 text-[clamp(2.5rem,7vw,5rem)] font-semibold leading-[0.98] tracking-[-0.05em]">
+              The Programming
               <br />
-              The graph is the work surface.
+              Language for Agents
+            </h1>
+            <p className="mt-7 max-w-[40rem] text-pretty text-[clamp(1.0625rem,2vw,1.25rem)] leading-[1.6] text-muted">
+              A programming language where the graph is the program. Humans ask
+              for outcomes. Agents query the program graph, submit checked
+              edits, and prove the result.
+            </p>
+            <InstallCopy />
+            <ArchitectureDiagram />
+            <p className="mt-5 max-w-[34rem] text-[0.8125rem] leading-relaxed text-muted">
+              Expect breaking changes. Run it in a safe environment, not against
+              production systems.
+            </p>
+          </div>
+        </section>
+
+        {/* 01 — Chat */}
+        <Section>
+          <SectionHeader
+            title="Start with a request."
+            description="The expected workflow is a normal conversation. The graph discipline lives in the agent skills and compiler commands, not in stiff human prompts."
+          />
+          <VisualGlow className="mx-auto max-w-[40rem]">
+            <ChatMockup />
+          </VisualGlow>
+        </Section>
+
+        {/* 02 — Loop */}
+        <Section>
+          <SectionHeader
+            title="Tighter agent loop."
+            description="A traditional loop writes text, then runs tools to learn what the edit meant. Zerolang puts the compiler in the loop, so an edit is a checked change to the graph."
+          />
+          <LoopDiagram />
+        </Section>
+
+        {/* 03 — Patch */}
+        <Section>
+          <SectionHeader
+            title="Checked by default."
+            description="Graph patches target semantic nodes and fields, guarded by graph hashes and expected values. Stale or invalid edits fail before they touch the store."
+          />
+          <VisualGlow className="grid grid-cols-1 gap-5 lg:grid-cols-[1.4fr_1fr]">
+            <CodeWindow title="zero patch" html={highlight(PATCH_EXAMPLE, "sh")} />
+            <Panel className="bg-bg">
+              <dl className="m-0 divide-y divide-border/50 font-mono text-[0.8125rem]">
+                {[
+                  ["graph hash", "graph:b3c1d04f"],
+                  ["node", "#expr_653eeb6e"],
+                  ["field", "value"],
+                  ["symbols", "main"],
+                  ["projection", "src/main.0"],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex items-center justify-between gap-4 px-5 py-3">
+                    <dt className="text-muted">{k}</dt>
+                    <dd className="m-0 truncate text-code-fg">{v}</dd>
+                  </div>
+                ))}
+              </dl>
+            </Panel>
+          </VisualGlow>
+        </Section>
+
+        {/* 04 — Graph */}
+        <Section>
+          <SectionHeader
+            title="The program database."
+            description="Readable text stays useful for review. The compiler-owned graph is the program database agents edit and the compiler consumes."
+          />
+          <VisualGlow className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+            <CodeWindow title="zero query · graph" html={highlight(GRAPH_EXAMPLE, "zero-graph")} />
+            <CodeWindow title="src/main.0 · projection" html={CODE_EXAMPLE} />
+          </VisualGlow>
+        </Section>
+
+        {/* 04 — Constraints */}
+        <Section>
+          <SectionHeader
+            title="Built for runtime constraints."
+            description="The graph model should reduce guessing without relaxing the runtime goals. Zerolang still aims to stay small, fast, explicit, and dependency-free."
+          />
+          <VisualGlow>
+            <div className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border md:grid-cols-3">
+              {CONSTRAINTS.map((c) => (
+                <div
+                  key={c}
+                  className="flex items-center gap-3 bg-bg px-6 py-7 text-[0.9375rem] font-medium tracking-[-0.01em] transition-colors hover:bg-surface-muted"
+                >
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-fg/30" />
+                  {c}
+                </div>
+              ))}
+            </div>
+          </VisualGlow>
+        </Section>
+
+        {/* CTA */}
+        <section className="relative z-10 border-t border-border">
+          <div className="mx-auto flex w-[min(100%-3rem,var(--container-content))] flex-col items-center px-6 py-[clamp(6rem,14vh,9rem)] text-center">
+            <h2 className="m-0 text-[clamp(2rem,6vw,3.5rem)] font-semibold leading-[1.02] tracking-[-0.045em]">
+              Explore with us.
             </h2>
-            <p className="m-0 text-[1.0625rem] leading-[1.65] text-muted">
-              Source text is good for humans and review, but it is a weak interface for program understanding. Agents need to gather focused context, know what a call resolves to, avoid stale edits, change related structure, and get validation before source is written.
+            <p className="mx-auto mt-6 max-w-[38rem] text-pretty text-[1.0625rem] leading-[1.6] text-muted">
+              Start with the getting started guide, then read the graph architecture
+              and compile-path pages to see why the program database matters.
             </p>
-          </div>
-          <div className="grid grid-cols-1 gap-px overflow-hidden rounded-lg border border-border bg-border md:grid-cols-2">
-            {WHY_GRAPH.map((item) => (
-              <div key={item.title} className="bg-bg p-8">
-                <h3 className="m-0 text-base font-semibold tracking-[-0.01em]">{item.title}</h3>
-                <p className="mt-3 mb-0 text-sm leading-relaxed text-muted">{item.description}</p>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="relative z-10 mx-auto w-[min(100%-3rem,var(--container-content))] border-t border-border py-[clamp(4rem,8vh,6rem)]">
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-            <CodeWindow title="main.0" html={CODE_EXAMPLE} />
-            <CodeWindow title="zero graph dump">
-              {GRAPH_EXAMPLE}
-            </CodeWindow>
-          </div>
-          <div className="mt-6">
-            <CodeWindow title="zero graph patch">
-              {PATCH_EXAMPLE}
-            </CodeWindow>
-          </div>
-        </section>
-
-        <section className="relative z-10 mx-auto w-[min(100%-3rem,var(--container-content))] border-t border-border py-[clamp(4rem,8vh,6rem)]">
-          <div className="mx-auto mb-12 max-w-[48rem] text-center">
-            <p className="mb-2 text-[0.8125rem] font-semibold uppercase tracking-[0.04em] text-blue">Direction</p>
-            <h2 className="mb-4 text-[clamp(1.5rem,4vw,2.25rem)] font-bold leading-[1.15] tracking-[-0.035em]">Source as data. Graph as interface.</h2>
-            <p className="m-0 leading-[1.65] text-muted">
-              The language is still designed under systems constraints: token efficiency, low memory usage, fast startup, fast builds, low runtime latency, and zero dependencies. The graph work does not replace readable source; it gives agents a checked structure and a tighter write, validate, check, and format loop.
-            </p>
-          </div>
-          <div className="grid grid-cols-1 gap-px overflow-hidden rounded-lg border border-border bg-border md:grid-cols-2 lg:grid-cols-3">
-            {FEATURES.map((f) => (
-              <div key={f.title} className="flex flex-col gap-3 bg-bg p-8 transition hover:bg-surface-muted">
-                <h3 className="m-0 text-[0.9375rem] font-semibold tracking-[-0.01em]">{f.title}</h3>
-                <p className="m-0 text-sm leading-relaxed text-muted">{f.description}</p>
-              </div>
-            ))}
-          </div>
-        </section>
-
-        <section className="relative z-10 border-t border-border px-6 py-[clamp(5rem,12vh,8rem)] text-center">
-          <h2 className="mb-3 text-[clamp(1.75rem,5vw,2.75rem)] font-bold leading-[1.1] tracking-[-0.04em]">Explore with us.</h2>
-          <p className="mx-auto mb-8 max-w-[36rem] text-[1.0625rem] leading-relaxed text-muted">
-            Install the compiler, run an example, inspect the graph, and test the edit loop. The most useful feedback is what helps agents work with less guessing.
-          </p>
-          <div className="flex flex-wrap items-center justify-center gap-3">
-            <ButtonLink href="/getting-started" variant="primary" size="lg">
-              Get started <ArrowRightIcon />
-            </ButtonLink>
+            <div className="mt-9 flex flex-wrap items-center justify-center gap-3">
+              <ButtonLink href="/getting-started" variant="primary" size="lg">
+                Get started <ArrowRightIcon />
+              </ButtonLink>
+              <ButtonLink href="/concepts/graph-architecture" variant="default" size="lg">
+                Graph architecture <ArrowRightIcon />
+              </ButtonLink>
+            </div>
           </div>
         </section>
       </main>
@@ -218,7 +390,9 @@ export default function HomePage() {
             <LogoIcon width="14" height="12" />
             <span>zerolang</span>
           </div>
-          <p className="m-0 text-[0.8125rem] text-muted">Experimental graph-first language design.</p>
+          <p className="m-0 text-[0.8125rem] text-muted">
+            Experimental graph-first language design.
+          </p>
         </div>
       </footer>
     </div>

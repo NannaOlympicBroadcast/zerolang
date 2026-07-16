@@ -18,6 +18,7 @@ const workerMode = args.includes("--worker");
 const modeArg = flagValue("--mode");
 const mode = modeArg ?? process.env.ZERO_BENCH_MODE ?? "local";
 const runCount = Number.parseInt(process.env.ZERO_BENCH_RUNS ?? "5", 10);
+const budgetMode = process.env.ZERO_BENCH_BUDGET ?? "off";
 const directZeroMinimum = 18;
 
 const cases = [
@@ -52,7 +53,7 @@ const languages = [
   {
     name: "zero",
     tool: "bin/zero",
-    build: (benchCase) => ["bin/zero", ["build", "--json", "--emit", "exe", "--target", directZeroTarget(), sourcePath(benchCase, "zero", ".0"), "--out", `.zero/bench/zero-${benchCase.name}`]],
+    build: (benchCase) => ["bin/zero", ["build", "--json", "--emit", "exe", "--target", directZeroTarget(), graphInputPath(sourcePath(benchCase, "zero", ".0")), "--out", `.zero/bench/zero-${benchCase.name}`]],
     exe: (benchCase) => `.zero/bench/zero-${benchCase.name}`,
   },
 ];
@@ -101,6 +102,13 @@ function flagValue(name) {
 function sourcePath(benchCase, language, extension) {
   if (benchCase.sources?.[language]) return benchCase.sources[language];
   return `benchmarks/${language}/${benchCase.name}${extension}`;
+}
+
+function graphInputPath(path) {
+  if (!path.endsWith(".0")) return path;
+  const graph = `${path.slice(0, -2)}.graph`;
+  if (!existsSync(graph)) throw new Error(`${path}: missing graph sidecar ${graph}; benchmark compiler input must be graph-backed`);
+  return graph;
 }
 
 function directZeroTarget() {
@@ -198,6 +206,13 @@ function median(values) {
   if (values.length === 0) return null;
   const sorted = [...values].sort((left, right) => left - right);
   return sorted[Math.floor(sorted.length / 2)];
+}
+
+function envNumber(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function allJobs() {
@@ -477,6 +492,7 @@ function buildReport(results, environment, runner) {
   };
   const typedReport = report as any;
   typedReport.trendSummary = buildBenchmarkTrendSummary(report);
+  typedReport.budgets = evaluateBenchmarkBudgets(typedReport);
   return typedReport;
 }
 
@@ -522,6 +538,129 @@ function buildBenchmarkTrendSummary(report) {
       objectEmissionPath: row.objectEmissionPath ?? null,
     })),
   };
+}
+
+function benchmarkBudgets() {
+  return [
+    {
+      name: "baseline startup median",
+      case: "baseline-hello",
+      metric: "runMedianMs",
+      max: envNumber("ZERO_BENCH_BASELINE_STARTUP_MAX_MS", 250),
+      unit: "ms",
+    },
+    {
+      name: "hello startup median",
+      case: "hello",
+      metric: "runMedianMs",
+      max: envNumber("ZERO_BENCH_HELLO_STARTUP_MAX_MS", 250),
+      unit: "ms",
+    },
+    {
+      name: "json startup median",
+      case: "json",
+      metric: "runMedianMs",
+      max: envNumber("ZERO_BENCH_JSON_STARTUP_MAX_MS", 250),
+      unit: "ms",
+    },
+    {
+      name: "parse startup median",
+      case: "parse",
+      metric: "runMedianMs",
+      max: envNumber("ZERO_BENCH_PARSE_STARTUP_MAX_MS", 500),
+      unit: "ms",
+    },
+    {
+      name: "baseline executable size",
+      case: "baseline-hello",
+      metric: "artifactBytes",
+      max: envNumber("ZERO_BENCH_BASELINE_ARTIFACT_MAX_BYTES", 131072),
+      unit: "bytes",
+    },
+    {
+      name: "hello executable size",
+      case: "hello",
+      metric: "artifactBytes",
+      max: envNumber("ZERO_BENCH_HELLO_ARTIFACT_MAX_BYTES", 131072),
+      unit: "bytes",
+    },
+    {
+      name: "parse executable size",
+      case: "parse",
+      metric: "artifactBytes",
+      max: envNumber("ZERO_BENCH_PARSE_ARTIFACT_MAX_BYTES", 262144),
+      unit: "bytes",
+    },
+    {
+      name: "baseline compressed executable size",
+      case: "baseline-hello",
+      metric: "compressedArtifactBytes",
+      max: envNumber("ZERO_BENCH_BASELINE_COMPRESSED_ARTIFACT_MAX_BYTES", 32768),
+      unit: "bytes",
+    },
+    {
+      name: "hello compressed executable size",
+      case: "hello",
+      metric: "compressedArtifactBytes",
+      max: envNumber("ZERO_BENCH_HELLO_COMPRESSED_ARTIFACT_MAX_BYTES", 32768),
+      unit: "bytes",
+    },
+    {
+      name: "parse compressed executable size",
+      case: "parse",
+      metric: "compressedArtifactBytes",
+      max: envNumber("ZERO_BENCH_PARSE_COMPRESSED_ARTIFACT_MAX_BYTES", 65536),
+      unit: "bytes",
+    },
+  ];
+}
+
+function evaluateBenchmarkBudgets(report) {
+  const mode = budgetMode === "fail" || budgetMode === "warn" || budgetMode === "off" ? budgetMode : "off";
+  if (mode === "off") {
+    return { schemaVersion: 1, mode, status: "off", ok: true, overCount: 0, skippedCount: 0, items: [] };
+  }
+  const items = benchmarkBudgets().map((budget) => {
+    const result = report.results.find((item) => item.language === "zero" && item.case === budget.case);
+    if (!result) return { ...budget, status: "skipped", actual: null, reason: "case not selected" };
+    if (result.status !== "ok") return { ...budget, status: "skipped", actual: null, reason: `case status ${result.status}` };
+    const actual = result[budget.metric];
+    if (typeof actual !== "number") return { ...budget, status: "skipped", actual: null, reason: "metric missing" };
+    const overBy = Number(Math.max(0, actual - budget.max).toFixed(3));
+    const unitSuffix = budget.unit === "ms" ? "Ms" : "Bytes";
+    return {
+      ...budget,
+      status: actual <= budget.max ? "ok" : "over",
+      actual,
+      [`actual${unitSuffix}`]: actual,
+      [`max${unitSuffix}`]: budget.max,
+      [`overBy${unitSuffix}`]: overBy,
+      ratio: Number((actual / budget.max).toFixed(3)),
+    };
+  });
+  const overCount = items.filter((item) => item.status === "over").length;
+  const skippedCount = items.filter((item) => item.status === "skipped").length;
+  const problemCount = overCount + skippedCount;
+  return {
+    schemaVersion: 1,
+    mode,
+    status: problemCount === 0 ? "ok" : mode === "fail" ? "fail" : "warn",
+    ok: problemCount === 0,
+    overCount,
+    skippedCount,
+    items,
+  };
+}
+
+function writeBenchmarkBudgetMessages(budget) {
+  if (!budget || budget.mode === "off") return;
+  for (const item of budget.items ?? []) {
+    if (item.status === "over") {
+      process.stderr.write(`benchmark budget ${budget.status}: ${item.name} ${item.actual} ${item.unit} > ${item.max} ${item.unit} (${item.metric})\n`);
+    } else if (item.status === "skipped") {
+      process.stderr.write(`benchmark budget ${budget.status}: ${item.name} skipped (${item.reason})\n`);
+    }
+  }
 }
 
 function assertBenchmarkGuardrails(report) {
@@ -673,6 +812,7 @@ function assertBenchmarkTrendSummary(report) {
 
 function writeReport(report) {
   report.trendSummary = buildBenchmarkTrendSummary(report);
+  report.budgets = evaluateBenchmarkBudgets(report);
   const output = JSON.stringify(report, null, 2);
   const outputPath = join(outDir, "latest.json");
   const trendDir = join(outDir, "trends");
@@ -685,6 +825,8 @@ function writeReport(report) {
   writeFileSync(join(trendDir, "summary.md"), trendMarkdownReport(report.trendSummary));
 
   try {
+    writeBenchmarkBudgetMessages(report.budgets);
+    if (report.budgets?.status === "fail") throw new Error(`benchmark budgets failed: ${report.budgets.overCount} over budget`);
     assertBenchmarkGuardrails(report);
     assertDirectBenchmarks(report);
     assertBenchmarkCoverage(report);
